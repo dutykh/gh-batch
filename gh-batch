@@ -9,8 +9,8 @@
 # License:   LGPL-2.1-or-later, see the LICENSE file of the distribution.
 #
 # Dependencies: bash (3.2+) and git (2.30+). Optional: gh, the GitHub CLI, for
-# cloning an account, for the public marks and for the remote checks of
-# "doctor".
+# cloning an account and its organisations, for the public marks and for the
+# remote checks of "doctor".
 #
 # The file is also a GitHub CLI extension: "gh extension install
 # dutykh/gh-batch" gives the same commands as "gh batch ...".
@@ -28,7 +28,7 @@ set -uo pipefail
 
 : "${HOME:=/}"
 
-GH_BATCH_VERSION="1.1.0"
+GH_BATCH_VERSION="1.2.0"
 PROG="gh-batch"
 
 TAB=$(printf '\t')
@@ -81,6 +81,7 @@ ROOTS_ABS=()              # the folders searched, as absolute paths
 ALL_REPOS=()              # every repository found, before --only and --except
 AROUND=()
 OWNERS=()                 # clone: the accounts or organisations named
+OPT_ORGS=""               # clone: --orgs or --no-orgs
 INTO=""
 MANIFEST_IN=""
 SINCE=""
@@ -95,6 +96,11 @@ C_BRANCH=()
 C_MARK=()
 C_SIZE=()
 C_NOTES=()
+C_OWNERS=()               # clone: the owners read, as GitHub spells them
+ORG_LIST=()               # clone: the organisations of the account
+FOLDER=""                 # clone: the folder of an owner under the destination
+WHY=""                    # clone: why a folder cannot be used
+HELD=""                   # clone: the folder where clones of an owner already are
 C_LISTED=0
 C_WANTED=0
 C_PRESENT=0
@@ -118,6 +124,7 @@ DIVERGED="report"
 COMMIT=0                  # commit pending changes before the push
 COMMIT_FORCED=0           # the choice came from the command line or the environment
 CONFIRM=1                 # ask once before committing or pushing
+ORGS=1                    # clone reads the organisations of the account too
 MESSAGE="Work in progress, %d (%h)"
 MACHINE_NAME=""
 MAX_FILE_MB=50
@@ -130,6 +137,7 @@ SRC_timeout="default"
 SRC_diverged="default"
 SRC_commit="default"
 SRC_confirm="default"
+SRC_orgs="default"
 SRC_message="default"
 SRC_machine="default"
 SRC_maxfile="default"
@@ -152,6 +160,13 @@ CFG_maxfilesize=""
 CFG_maxnewfiles=""
 CFG_notify=""
 CFG_notifyon=""
+CFG_orgs=""
+CFG_OWNERS=()             # the owners that have settings of their own, in lower case
+CFG_OWNER_FOLDER=()       # gh-batch.OWNER.folder of each, empty when it has none
+CFG_OWNER_SKIP=()         # gh-batch.OWNER.skip of each: 1, 0, or empty when it has none
+OWNER_I=0
+S_folder=""               # the settings of the owner last looked up
+S_skip=0
 
 REPOS=()                  # the repositories found, as absolute paths
 NAMES=()                  # their names for display, relative to the folder searched
@@ -163,6 +178,7 @@ STATE_DIR=""
 LOCKED=0
 STOP=0                    # a signal asked the run to stop
 HARD=0                    # a second signal: stop at once
+ASKING=0                  # a question waits for its answer
 ISOLATE="none"            # how a child gets its own process group: setm, perl, none
 USER_SSH=0                # the caller chose the ssh command through the environment
 FETCH_PORCELAIN=0         # git is new enough for "fetch --porcelain"
@@ -251,6 +267,24 @@ plural() {
     fi
 }
 
+enumerate() {
+    # enumerate WORD ... -> "a", "a and b", "a, b and c"
+    local text="" i=1 word
+    for word in "$@"; do
+        if [ "$i" -eq 1 ]; then
+            text=$word
+        elif [ "$i" -eq "$#" ]; then
+            text="$text and $word"
+        else
+            text="$text, $word"
+        fi
+        i=$(( i + 1 ))
+    done
+    printf '%s' "$text"
+}
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
 # In the two functions below the tilde is a character of the text, written
 # by the user or shown to him, and not a path for the shell to expand.
 # shellcheck disable=SC2088
@@ -323,14 +357,60 @@ age_text() {
 # gh-batch.*", then the defaults
 # ---------------------------------------------------------------------------
 
+owner_line() {
+    # owner_line OWNER -> OWNER_I, the place of an owner (in lower case) in
+    # the table of the settings that owners have; a new line when it has none.
+    OWNER_I=0
+    while [ "$OWNER_I" -lt "${#CFG_OWNERS[@]}" ]; do
+        [ "${CFG_OWNERS[$OWNER_I]}" = "$1" ] && return 0
+        OWNER_I=$(( OWNER_I + 1 ))
+    done
+    CFG_OWNERS+=("$1")
+    CFG_OWNER_FOLDER+=("")
+    CFG_OWNER_SKIP+=("")
+    return 0
+}
+
+owner_setting() {
+    # owner_setting OWNER -> S_folder and S_skip, what the settings say of an
+    # owner: gh-batch.OWNER.folder and gh-batch.OWNER.skip. GitHub does not
+    # tell the cases of a name apart, and neither does this.
+    local low i=0
+    S_folder=""; S_skip=0
+    [ "${#CFG_OWNERS[@]}" -gt 0 ] || return 0
+    low=$(lower "$1")
+    while [ "$i" -lt "${#CFG_OWNERS[@]}" ]; do
+        if [ "${CFG_OWNERS[$i]}" = "$low" ]; then
+            S_folder=${CFG_OWNER_FOLDER[$i]}
+            [ "${CFG_OWNER_SKIP[$i]}" = "1" ] && S_skip=1
+            return 0
+        fi
+        i=$(( i + 1 ))
+    done
+    return 0
+}
+
 load_settings() {
-    local line key val
+    local line key val owner
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         key=${line%% *}
         val=""
         case "$line" in *" "*) val=${line#* } ;; esac
         case "$key" in
+            gh-batch.?*.folder)
+                # The owner is the middle of the key, which git prints as it
+                # was typed; a later value replaces an earlier one.
+                owner=${key#gh-batch.}
+                owner_line "$(lower "${owner%.folder}")"
+                CFG_OWNER_FOLDER[OWNER_I]=$val
+                ;;
+            gh-batch.?*.skip)
+                owner=${key#gh-batch.}
+                owner_line "$(lower "${owner%.skip}")"
+                if truthy "$val"; then CFG_OWNER_SKIP[OWNER_I]=1; else CFG_OWNER_SKIP[OWNER_I]=0; fi
+                ;;
+            gh-batch.orgs)      CFG_orgs=${val:-true} ;;
             gh-batch.root)      CFG_ROOTS+=("$(expand_tilde "$val")") ;;
             gh-batch.exclude)   CFG_EXCLUDE+=("$val") ;;
             gh-batch.depth)     CFG_depth=$val ;;
@@ -391,6 +471,9 @@ resolve_settings() {
     pick GH_BATCH_CONFIRM "$CFG_confirm" true ""
     SRC_confirm=$SRC
     if truthy "$VAL"; then CONFIRM=1; else CONFIRM=0; fi
+    pick GH_BATCH_ORGS "$CFG_orgs" true "$OPT_ORGS"
+    SRC_orgs=$SRC
+    if truthy "$VAL"; then ORGS=1; else ORGS=0; fi
     pick GH_BATCH_MESSAGE "$CFG_message" "Work in progress, %d (%h)" "$OPT_MESSAGE"
     MESSAGE=$VAL; SRC_message=$SRC
     pick GH_BATCH_MACHINE "$CFG_machine" "" ""
@@ -466,6 +549,14 @@ cleanup() {
 }
 
 on_signal() {
+    # A question is put before anything is changed: an interrupt that comes
+    # while it waits ends the run there, without waiting for the answer.
+    if [ "$ASKING" -eq 1 ]; then
+        ASKING=0
+        printf '\n' >&2
+        put "Nothing was done."
+        exit "$EX_INTERRUPT"
+    fi
     [ "$STOP" -eq 1 ] && HARD=1
     STOP=1
     [ -n "$TMP" ] && [ -d "$TMP" ] && : > "$TMP/stop"
@@ -1067,6 +1158,13 @@ progress_show() {
 progress_clear() {
     [ "$PROGRESS" -eq 1 ] || return 0
     printf '\r\033[K' >&2
+}
+
+progress_note() {
+    # progress_note TEXT: what a question to GitHub is about, shown while
+    # the answer is awaited and wiped by progress_clear.
+    [ "$PROGRESS" -eq 1 ] || return 0
+    printf '\r\033[K  %s%s%s' "$C_DIM" "$1" "$C_OFF" >&2
 }
 
 put() {
@@ -2879,6 +2977,14 @@ asks() {
     [ "$YES" -eq 0 ] && [ "$CONFIRM" -eq 1 ]
 }
 
+answered() {
+    # answered -> 0 when somebody can answer a question on the standard
+    # input. GH_BATCH_TTY says so of a pipe, so that the questions can be
+    # exercised without a terminal.
+    [ -n "${GH_BATCH_TTY:-}" ] && return 0
+    [ -t 0 ]
+}
+
 show_before_asking() {
     # show_before_asking FUNCTION: print the list of what is about to be
     # done. Whoever is asked must see it, even with --quiet; and a run that
@@ -2897,15 +3003,20 @@ show_before_asking() {
 confirmed() {
     # One question for the whole run. Without a terminal there is nobody to
     # ask: the run then needs --yes.
-    local answer=""
+    local answer="" since
     if [ "$YES" -eq 1 ] || [ "$CONFIRM" -eq 0 ]; then
         return 0
     fi
-    if [ ! -t 0 ]; then
+    if ! answered; then
         die "$EX_USAGE" "this run changes repositories: confirm it at a terminal, or add --yes"
     fi
     printf '%sProceed?%s [Y/n] ' "$C_BOLD" "$C_OFF" >&2
+    ASKING=1
+    since=$SECONDS
     IFS= read -r answer || answer="n"
+    # The time spent waiting for the answer is not time that the run took.
+    RUN_START=$(( RUN_START + SECONDS - since ))
+    ASKING=0
     [ "$STOP" -eq 1 ] && return 1
     case "$answer" in
         ""|[Yy]|[Yy][Ee][Ss]) return 0 ;;
@@ -3042,17 +3153,25 @@ clone_destination() {
 
 known_slugs() {
     # The GitHub names of every repository already under the destination,
-    # whatever its folder: one line "name<US>index" per remote, in $TMP/known.
-    local i=0 name url slug
+    # whatever its folder: one line "name<US>index<US>remote<US>folder" per
+    # remote, in $TMP/known. The folder is the one that holds the
+    # repository, relative to the destination; a dot stands for the
+    # destination itself.
+    local i=0 name url slug folder
     : > "$TMP/known"
     while [ "$i" -lt "${#REPOS[@]}" ]; do
         REPO=${REPOS[$i]}
         GIT=(git -C "$REPO")
+        folder="."
+        case "${NAMES[$i]}" in
+            */*) folder=${NAMES[$i]%/*} ;;
+        esac
         while IFS= read -r name; do
             [ -n "$name" ] || continue
             for url in "$(g remote get-url "$name" 2>/dev/null)" "$(g config --get "remote.$name.url" 2>/dev/null)"; do
                 slug=$(github_slug "$url")
-                [ -n "$slug" ] && printf '%s%s%s\n' "$slug" "$US" "$i" >> "$TMP/known"
+                [ -n "$slug" ] &&
+                    printf '%s%s%s%s%s%s%s\n' "$slug" "$US" "$i" "$US" "$name" "$US" "$folder" >> "$TMP/known"
             done
         done <<EOF
 $(g remote 2>/dev/null)
@@ -3064,11 +3183,261 @@ EOF
 
 is_known() {
     # is_known SLUG -> 0 when a repository under the destination has it
-    local slug index
-    while IFS=$US read -r slug index; do
+    local slug
+    while IFS=$US read -r slug _; do
         [ "$slug" = "$1" ] && return 0
     done < "$TMP/known"
     return 1
+}
+
+clones_folder() {
+    # clones_folder OWNER -> HELD, the folder under the destination that
+    # holds the most clones of repositories of OWNER (a name in lower case),
+    # the first one found when two hold as many: a dot for the destination
+    # itself, nothing when no clone of OWNER is here. A clone is one whose
+    # remote "origin" is of OWNER: a fork kept elsewhere, which only names
+    # the repository it was forked from, says nothing of where OWNER lives.
+    local owner="$1" slug index remote folder other seen="" folders="" n best=0
+    HELD=""
+    while IFS=$US read -r slug index remote folder; do
+        [ "$remote" = "origin" ] || continue
+        case "$slug" in
+            "$owner"/*) ;;
+            *)          continue ;;
+        esac
+        # The address of a remote is listed in its two forms: once is enough.
+        case "$seen " in
+            *" $index "*) continue ;;
+        esac
+        seen="$seen $index"
+        folders="$folders$folder$NL"
+    done < "$TMP/known"
+    [ -n "$folders" ] || return 0
+    while IFS= read -r folder; do
+        [ -n "$folder" ] || continue
+        n=0
+        while IFS= read -r other; do
+            [ "$other" = "$folder" ] && n=$(( n + 1 ))
+        done <<EOF
+$folders
+EOF
+        if [ "$n" -gt "$best" ]; then
+            best=$n
+            HELD=$folder
+        fi
+    done <<EOF
+$folders
+EOF
+    return 0
+}
+
+tidy_folder() {
+    # tidy_folder TEXT -> FOLDER, the folder of an owner as a path relative
+    # to the destination, empty for the destination itself. Returns 1, with
+    # the reason in WHY, when the text names no folder that can hold clones.
+    local text rest part parts=0 path
+    FOLDER=""; WHY=""
+    text=$(expand_tilde "$1")
+    case "$text" in
+        *[[:cntrl:]]*)
+            WHY="its name holds a control character"
+            return 1
+            ;;
+    esac
+    case "$text" in
+        "$DEST"|"$DEST"/) text="." ;;
+        "$DEST"/*)        text=${text#"$DEST"/} ;;
+        /*)
+            WHY="it lies outside $(short_path "$DEST")"
+            return 1
+            ;;
+    esac
+    rest=$text
+    while [ -n "$rest" ]; do
+        part=${rest%%/*}
+        case "$rest" in
+            */*) rest=${rest#*/} ;;
+            *)   rest="" ;;
+        esac
+        case "$part" in
+            ""|.) continue ;;
+            ..)
+                WHY="it leaves $(short_path "$DEST")"
+                return 1
+                ;;
+            .*|node_modules)
+                WHY="a hidden folder and node_modules are never searched for repositories"
+                return 1
+                ;;
+        esac
+        FOLDER="$FOLDER${FOLDER:+/}$part"
+        parts=$(( parts + 1 ))
+    done
+    # The clones must stay within the levels that the other commands search.
+    if [ "$parts" -ge "$DEPTH" ]; then
+        WHY="it is too deep: repositories are searched $(plural "$DEPTH" level) below $(short_path "$DEST") (gh-batch.depth)"
+        return 1
+    fi
+    path=$DEST
+    rest=$FOLDER
+    while [ -n "$rest" ]; do
+        part=${rest%%/*}
+        case "$rest" in
+            */*) rest=${rest#*/} ;;
+            *)   rest="" ;;
+        esac
+        path="$path/$part"
+        if [ -e "$path/.git" ]; then
+            WHY="$(short_path "$path") is a git repository itself"
+            return 1
+        fi
+        if [ -e "$path" ] && [ ! -d "$path" ]; then
+            WHY="$(short_path "$path") exists and is not a folder"
+            return 1
+        fi
+    done
+    return 0
+}
+
+may_ask() {
+    # may_ask -> 0 when this run can put a question about an organisation:
+    # somebody answers, and the run neither only looks nor writes for a
+    # program.
+    asks && answered && [ "$DRY_RUN" -eq 0 ] && [ "$PORCELAIN" -eq 0 ]
+}
+
+organisation_title() {
+    # organisation_title LOGIN -> the organisation as a question names it:
+    # the name it shows on GitHub when it has one, then its login. The name
+    # is a text of somebody else: its control characters are dropped.
+    local name
+    name=$(GH_PROMPT_DISABLED=1 gh api "orgs/$1" --jq '.name // ""' 2>/dev/null | tr -d '\000-\037\177' | cut -c 1-60)
+    if [ -n "$name" ] && [ "$name" != "$1" ]; then
+        printf '%s (%s)' "$name" "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+keep_setting() {
+    # keep_setting KEY VALUE: write an answer into the settings of git, and
+    # show the command that did it, which is also the one that changes it.
+    # A value that begins with a dash would be read as an option.
+    local value="$2"
+    case "$value" in
+        -*) value="./$value" ;;
+    esac
+    if git config --global "$1" "$value" 2>/dev/null; then
+        printf '%s(kept: git config --global %s %s)%s\n' "$C_DIM" "$1" "$value" "$C_OFF" >&2
+    else
+        warn "the answer could not be written into the settings of git: it holds for this run only"
+    fi
+    return 0
+}
+
+ask_folder() {
+    # ask_folder OWNER PROPOSED MISSING -> FOLDER: the one question about an
+    # organisation that the account brought with it, put before anything is
+    # cloned. Enter takes the folder proposed, a minus sign leaves the
+    # organisation out, and the answer is kept in the settings of git, so
+    # that the question does not return. Returns 1 when the organisation is
+    # left out.
+    local owner="$1" proposed="$2" missing="$3" shown="$2" verb="are" answer ended since
+    [ "$missing" -eq 1 ] && verb="is"
+    [ "$proposed" = "." ] && shown=". for $(short_path "$DEST") itself"
+    printf '%s of the organisation %s %s missing here.\n' \
+        "$(plural "$missing" repository)" "$(organisation_title "$owner")" "$verb" >&2
+    while :; do
+        printf '%sFolder for the organisation under %s%s [%s], or - to leave it out: ' \
+            "$C_BOLD" "$(short_path "$DEST")" "$C_OFF" "$shown" >&2
+        answer=""
+        ended=0
+        ASKING=1
+        since=$SECONDS
+        IFS= read -r answer || [ -n "$answer" ] || ended=1
+        RUN_START=$(( RUN_START + SECONDS - since ))
+        ASKING=0
+        # The end of the input is no answer, and neither is what follows an
+        # interrupt: the run ends there, with nothing changed.
+        if [ "$ended" -eq 1 ] || [ "$STOP" -eq 1 ]; then
+            printf '\n' >&2
+            put "Nothing was done."
+            exit "$EX_OK"
+        fi
+        answer=${answer#"${answer%%[![:space:]]*}"}
+        answer=${answer%"${answer##*[![:space:]]}"}
+        [ -n "$answer" ] || answer=$proposed
+        if [ "$answer" = "-" ]; then
+            keep_setting "gh-batch.$owner.skip" true
+            printf '\n' >&2
+            return 1
+        fi
+        if tidy_folder "$answer"; then
+            keep_setting "gh-batch.$owner.folder" "${FOLDER:-.}"
+            printf '\n' >&2
+            return 0
+        fi
+        printf 'This folder cannot be used: %s.\n' "$WHY" >&2
+    done
+}
+
+place_owner() {
+    # place_owner OWNER KIND MISSING -> FOLDER, the folder under the
+    # destination that receives the repositories of an owner, empty for the
+    # destination itself. The setting gh-batch.OWNER.folder decides. Without
+    # it the folder is the one where clones of the owner already are, else
+    # its name; and an organisation that the account brought with it (KIND
+    # is "org") is asked for once, where somebody can answer. Returns 1 when
+    # the answer leaves the organisation out, and 2, with the reason in WHY,
+    # when the folder cannot be used.
+    local owner="$1" kind="$2" missing="$3" proposed="$1"
+    FOLDER=""; WHY=""
+    owner_setting "$owner"
+    if [ -n "$S_folder" ]; then
+        tidy_folder "$S_folder" && return 0
+        WHY="the folder '$S_folder' of gh-batch.$owner.folder cannot be used, $WHY"
+        return 2
+    fi
+    # Forcing one folder per owner means the name of each, wherever its
+    # clones happen to be.
+    if [ "$LAYOUT" = "auto" ]; then
+        clones_folder "$(lower "$owner")"
+        [ -n "$HELD" ] && proposed=$HELD
+    fi
+    if [ "$kind" = "org" ] && may_ask; then
+        ask_folder "$owner" "$proposed" "$missing"
+        return "$?"
+    fi
+    tidy_folder "$proposed" && return 0
+    WHY="the folder '$proposed' cannot be used, $WHY: git config --global gh-batch.$owner.folder NAME chooses another"
+    return 2
+}
+
+organisations() {
+    # organisations ACCOUNT -> ORG_LIST, the organisations that the account
+    # belongs to, as GitHub spells them, without those that the setting
+    # gh-batch.ORG.skip leaves out.
+    local login
+    ORG_LIST=()
+    progress_note "reading the organisations of $1"
+    if ! GH_PROMPT_DISABLED=1 gh api user/orgs --paginate --jq '.[].login' > "$TMP/orgs" 2> "$TMP/orgs.err"; then
+        progress_clear
+        warn "GitHub did not give the organisations of $1, which are left out: $(last_line "$TMP/orgs.err")"
+        return 0
+    fi
+    progress_clear
+    while IFS= read -r login || [ -n "$login" ]; do
+        case "$login" in
+            ""|.*|-*|*[!A-Za-z0-9._-]*) continue ;;
+        esac
+        owner_setting "$login"
+        if [ "$S_skip" -eq 1 ]; then
+            [ "$VERBOSE" -eq 1 ] && C_NOTES+=("the organisation $login is left out by gh-batch.$login.skip")
+            continue
+        fi
+        ORG_LIST+=("$login")
+    done < "$TMP/orgs"
+    return 0
 }
 
 moved_here() {
@@ -3093,8 +3462,7 @@ EOF
 clone_candidate() {
     # clone_candidate NAME ADDRESS TARGET SLUG SIZE_KB MARK BRANCH: decide
     # whether the repository is cloned, is present, or cannot be placed.
-    local name="$1" url="$2" target="$3" slug="$4" size="$5" mark="$6" branch="$7" parent
-    parent=${target%/*}
+    local name="$1" url="$2" target="$3" slug="$4" size="$5" mark="$6" branch="$7" above
     if [ -e "$target/.git" ]; then
         if [ -z "$slug" ] || moved_here "$target" "$slug"; then
             C_PRESENT=$(( C_PRESENT + 1 ))
@@ -3112,11 +3480,16 @@ clone_candidate() {
             return 0
         fi
     fi
-    if [ "$parent" != "$DEST" ] && [ -e "$parent/.git" ]; then
-        C_NOTES+=("$name is not cloned: the folder $(short_path "$parent") is a repository itself")
-        C_BLOCKED=$(( C_BLOCKED + 1 ))
-        return 0
-    fi
+    # No folder between the destination and the clone may be a repository.
+    above=${target%/*}
+    while [ "${#above}" -gt "${#DEST}" ]; do
+        if [ -e "$above/.git" ]; then
+            C_NOTES+=("$name is not cloned: the folder $(short_path "$above") is a repository itself")
+            C_BLOCKED=$(( C_BLOCKED + 1 ))
+            return 0
+        fi
+        above=${above%/*}
+    done
     REPOS+=("$target")
     NAMES+=("$name")
     C_URL+=("$url")
@@ -3139,19 +3512,35 @@ matches_selection() {
 }
 
 read_account() {
-    # read_account OWNER SELF PROTOCOL: list the repositories of an owner on
-    # GitHub and sort them into present, to clone, and impossible to place.
-    local owner="$1" self="$2" protocol="$3" lines=0
-    local slug fork archived private size pushed https ssh name low low_owner target url mark
+    # read_account OWNER SELF PROTOCOL KIND: list the repositories of an
+    # owner on GitHub and sort them into present, to clone, and impossible
+    # to place. KIND is "org" for an organisation that the account brought
+    # with it: it may be left out, and a refusal of GitHub to list it does
+    # not stop the others. KIND is "named" for the account itself and for an
+    # owner named on the command line.
+    local owner="$1" self="$2" protocol="$3" kind="$4" lines=0 wanted=0 present=0 missing=0 rc
+    local slug fork archived private size pushed https ssh name spelled="" folder="" target url mark
+    progress_note "reading the repositories of $owner"
     GH_PROMPT_DISABLED=1 gh repo list "$owner" --limit 4000 \
         --json nameWithOwner,isFork,isArchived,isPrivate,diskUsage,pushedAt,url,sshUrl \
         --jq '.[] | [.nameWithOwner, (.isFork|tostring), (.isArchived|tostring), (.isPrivate|tostring), (.diskUsage|tostring), (.pushedAt // ""), .url, .sshUrl] | join("\u001f")' \
-        > "$TMP/list" 2> "$TMP/list.err" ||
-        die "$EX_ENV" "GitHub did not give the repositories of $owner: $(last_line "$TMP/list.err")"
+        > "$TMP/list" 2> "$TMP/list.err"
+    rc=$?
+    progress_clear
+    if [ "$rc" -ne 0 ]; then
+        [ "$kind" = "org" ] ||
+            die "$EX_ENV" "GitHub did not give the repositories of $owner: $(last_line "$TMP/list.err")"
+        C_NOTES+=("the organisation $owner is left out: GitHub did not give its repositories ($(last_line "$TMP/list.err"))")
+        ATTENTION=1
+        return 0
+    fi
+
+    # First what is missing, whatever its place: the folder of the owner is
+    # needed, and asked for, only when something is to be cloned.
+    : > "$TMP/missing"
     while IFS=$US read -r slug fork archived private size pushed https ssh; do
         [ -n "$slug" ] || continue
         lines=$(( lines + 1 ))
-        C_LISTED=$(( C_LISTED + 1 ))
         name=${slug#*/}
         case "$slug" in
             */*) ;;
@@ -3163,32 +3552,68 @@ read_account() {
                 continue
                 ;;
         esac
+        case "$name" in
+            .|..|.git)
+                warn "the name $slug cannot be the name of a folder and is left out"
+                continue
+                ;;
+        esac
+        spelled=${slug%%/*}
         [ "$NO_FORKS" -eq 1 ] && [ "$fork" = "true" ] && continue
         [ "$NO_ARCHIVED" -eq 1 ] && [ "$archived" = "true" ] && continue
         if [ -n "$SINCE" ] && [ "${pushed%%T*}" \< "$SINCE" ]; then
             continue
         fi
         matches_selection "$name" || continue
-        C_WANTED=$(( C_WANTED + 1 ))
-        low=$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')
-        if is_known "$low"; then
-            C_PRESENT=$(( C_PRESENT + 1 ))
+        wanted=$(( wanted + 1 ))
+        if is_known "$(lower "$slug")"; then
+            present=$(( present + 1 ))
             continue
         fi
-        low_owner=$(printf '%s' "${slug%%/*}" | tr '[:upper:]' '[:lower:]')
-        if [ "$LAYOUT" = "flat" ] || { [ "$LAYOUT" = "auto" ] && [ "$low_owner" = "$self" ]; }; then
-            target="$DEST/$name"
-        else
-            target="$DEST/${slug%%/*}/$name"
-            name=$slug
+        missing=$(( missing + 1 ))
+        printf '%s%s%s%s%s%s%s%s%s\n' "$slug" "$US" "$private" "$US" "$size" "$US" "$https" "$US" "$ssh" >> "$TMP/missing"
+    done < "$TMP/list"
+    [ "$lines" -ge 4000 ] &&
+        warn "$owner has 4000 repositories or more: only the first 4000 were read"
+    [ -n "$spelled" ] || spelled=$owner
+
+    # The account itself goes to the top of the destination and any other
+    # owner into a folder of its own; --flat and --by-owner make one rule
+    # for all.
+    if [ "$missing" -gt 0 ] && [ "$LAYOUT" != "flat" ]; then
+        if [ "$LAYOUT" = "owner" ] || [ "$(lower "$spelled")" != "$self" ]; then
+            place_owner "$spelled" "$kind" "$missing"
+            case "$?" in
+                0)  folder=$FOLDER ;;
+                1)  return 0 ;;
+                *)
+                    [ "$kind" = "org" ] ||
+                        die "$EX_USAGE" "the repositories of $spelled cannot be placed: $WHY"
+                    C_NOTES+=("the organisation $spelled is left out: $WHY")
+                    ATTENTION=1
+                    return 0
+                    ;;
+            esac
+        fi
+    fi
+
+    C_OWNERS+=("$spelled")
+    C_LISTED=$(( C_LISTED + lines ))
+    C_WANTED=$(( C_WANTED + wanted ))
+    C_PRESENT=$(( C_PRESENT + present ))
+    while IFS=$US read -r slug private size https ssh; do
+        [ -n "$slug" ] || continue
+        name=${slug#*/}
+        target="$DEST/$name"
+        if [ -n "$folder" ]; then
+            target="$DEST/$folder/$name"
+            name="$folder/$name"
         fi
         if [ "$protocol" = "ssh" ] && [ -n "$ssh" ]; then url=$ssh; else url=$https; fi
         mark="private"
         [ "$private" = "false" ] && mark="PUBLIC"
-        clone_candidate "$name" "$url" "$target" "$low" "$size" "$mark" ""
-    done < "$TMP/list"
-    [ "$lines" -ge 4000 ] &&
-        warn "$owner has 4000 repositories or more: only the first 4000 were read"
+        clone_candidate "$name" "$url" "$target" "$(lower "$slug")" "$size" "$mark" ""
+    done < "$TMP/missing"
     return 0
 }
 
@@ -3345,7 +3770,7 @@ show_clone_plan() {
 }
 
 cmd_clone() {
-    local owners=() owner self="" protocol="https" i saved_only=() saved_except=() note
+    local owner self="" protocol="https" i saved_only=() saved_except=() note parent last=""
     local present_repos=() present_names=()
     setup_colour
     setup_run
@@ -3377,7 +3802,7 @@ cmd_clone() {
     known_slugs
 
     REPOS=(); NAMES=()
-    C_URL=(); C_BRANCH=(); C_MARK=(); C_SIZE=(); C_NOTES=()
+    C_URL=(); C_BRANCH=(); C_MARK=(); C_SIZE=(); C_NOTES=(); C_OWNERS=()
     C_LISTED=0; C_WANTED=0; C_PRESENT=0; C_BLOCKED=0; C_TOTAL_KB=0
     if [ -n "$MANIFEST_IN" ]; then
         [ "${#OWNERS[@]}" -eq 0 ] || die "$EX_USAGE" "give either owners or --manifest FILE, not both"
@@ -3387,18 +3812,23 @@ cmd_clone() {
         have gh || die "$EX_ENV" "the GitHub CLI (gh) is needed to read an account: https://cli.github.com"
         self=$(GH_PROMPT_DISABLED=1 gh api user --jq .login 2>"$TMP/list.err" | tr '[:upper:]' '[:lower:]')
         [ -n "$self" ] || die "$EX_ENV" "gh is not logged in to GitHub (gh auth login): $(last_line "$TMP/list.err")"
-        if [ "${#OWNERS[@]}" -gt 0 ]; then
-            owners=("${OWNERS[@]}")
-        else
-            owners=("$self")
-        fi
         protocol=$(GH_PROMPT_DISABLED=1 gh config get git_protocol 2>/dev/null)
-        note=""
-        for owner in "${owners[@]}"; do
-            read_account "$owner" "$self" "$protocol"
-            note="$note${note:+, }$owner"
-        done
-        note="$(plural "$C_LISTED" repository) of $note on GitHub"
+        if [ "${#OWNERS[@]}" -gt 0 ]; then
+            for owner in "${OWNERS[@]}"; do
+                read_account "$owner" "$self" "$protocol" named
+            done
+        else
+            # Nobody is named: the account, then the organisations it
+            # belongs to.
+            read_account "$self" "$self" "$protocol" named
+            if [ "$ORGS" -eq 1 ]; then
+                organisations "$self"
+                for owner in ${ORG_LIST[@]+"${ORG_LIST[@]}"}; do
+                    read_account "$owner" "$self" "$protocol" org
+                done
+            fi
+        fi
+        note="$(plural "$C_LISTED" repository) of $(enumerate ${C_OWNERS[@]+"${C_OWNERS[@]}"}) on GitHub"
     fi
     fit_names
 
@@ -3437,9 +3867,17 @@ cmd_clone() {
                 exit "$EX_OK"
             fi
             [ "$PORCELAIN" -eq 0 ] && put ""
+            # What a run that died left behind, in every folder that is
+            # about to receive a clone.
             sweep_leftovers "$DEST"
-            for owner in ${owners[@]+"${owners[@]}"}; do
-                [ -d "$DEST/$owner" ] && sweep_leftovers "$DEST/$owner"
+            i=0
+            while [ "$i" -lt "${#REPOS[@]}" ]; do
+                parent=${REPOS[$i]%/*}
+                if [ "$parent" != "$last" ] && [ -d "$parent" ]; then
+                    sweep_leftovers "$parent"
+                fi
+                last=$parent
+                i=$(( i + 1 ))
             done
             [ "$JOBS" -gt 4 ] && [ "$SRC_jobs" = "default" ] && JOBS=4
             pool do_clone clone render
@@ -3852,7 +4290,7 @@ doctor_around() {
         done
         [ "$n" -gt 0 ] &&
             AROUND+=("$(plural "$n" file) directly in $(short_path "$root") belong to no repository")
-        for entry in "$root"/.gh-batch-clone.* "$root"/*/.gh-batch-clone.*; do
+        for entry in "$root"/.gh-batch-clone.* "$root"/*/.gh-batch-clone.* "$root"/*/*/.gh-batch-clone.*; do
             [ -d "$entry" ] || continue
             AROUND+=("$(short_path "$entry") is the leftover of an interrupted clone: the next clone removes it")
         done
@@ -3915,7 +4353,7 @@ _gh_batch() {
     case "${COMP_WORDS[1]}" in
         pull|fetch) options="$options --diverged --notify" ;;
         push|sync)  options="$options --commit --no-commit --message --set-upstream --diverged --notify" ;;
-        clone)      options="$options --into --manifest --update --since --no-forks --no-archived --flat --by-owner" ;;
+        clone)      options="$options --into --manifest --update --since --no-forks --no-archived --no-orgs --flat --by-owner" ;;
         status)     options="$options --long" ;;
         log)        options="$options --since --until --author --all-authors --long" ;;
         exec)       options="$options --dirty --clean --ahead --behind" ;;
@@ -3974,6 +4412,7 @@ _gh_batch() {
                 '--commit[commit pending changes before the push]' \
                 '--no-commit[push only what is committed already]' \
                 '--into[the folder that receives the clones]:folder:_files -/' \
+                '--no-orgs[clone the account without its organisations]' \
                 '--manifest[a layout file]:file:_files' \
                 '*:folder:_files -/'
             ;;
@@ -4037,7 +4476,7 @@ setting_row() {
 }
 
 cmd_config() {
-    local root
+    local root i=0
     setup_colour
     printf '%s%s %s%s, settings in force\n\n' "$C_TITLE" "$PROG" "$GH_BATCH_VERSION" "$C_OFF"
     if [ -n "${GH_BATCH_ROOT:-}" ]; then
@@ -4064,7 +4503,17 @@ cmd_config() {
     for root in ${CFG_EXCLUDE[@]+"${CFG_EXCLUDE[@]}"}; do
         setting_row "exclude" "$root" "git config"
     done
+    setting_row "orgs" "$( [ "$ORGS" -eq 1 ] && printf 'true' || printf 'false' )" "$SRC_orgs"
+    # What the settings say of single owners, for "clone".
+    while [ "$i" -lt "${#CFG_OWNERS[@]}" ]; do
+        [ -n "${CFG_OWNER_FOLDER[$i]}" ] &&
+            setting_row "folder" "${CFG_OWNERS[$i]} in ${CFG_OWNER_FOLDER[$i]}" "git config"
+        [ "${CFG_OWNER_SKIP[$i]}" = "1" ] &&
+            setting_row "skip" "${CFG_OWNERS[$i]}" "git config"
+        i=$(( i + 1 ))
+    done
     printf '\n%sA setting is changed with: git config --global gh-batch.NAME VALUE%s\n' "$C_DIM" "$C_OFF"
+    printf '%sThe folder of an owner, for clone: git config --global gh-batch.OWNER.folder NAME%s\n' "$C_DIM" "$C_OFF"
     printf '%sThe record of what the tool moved is kept in %s%s\n' "$C_DIM" "$(short_path "$STATE_DIR")" "$C_OFF"
     exit "$EX_OK"
 }
@@ -4089,8 +4538,9 @@ COMMANDS
   push        push every repository that has new commits, after committing
               what is pending when asked to (the evening command)
   sync        pull, then push
-  clone       clone what is missing: a whole GitHub account, or the entries
-              of a layout file written by "list --manifest"
+  clone       clone what is missing: a whole GitHub account with its
+              organisations, or the entries of a layout file written by
+              "list --manifest"
   status      what is pending in every repository, without touching the network
   fetch       look at the servers, change no file, say what pull would do
   log         the commits of today, or of a period, across the repositories
@@ -4246,12 +4696,20 @@ $PROG clone --manifest FILE [options]
 Clone the repositories that are missing under the destination folder.
 
 In the first form the list comes from GitHub, through gh: every repository
-of the account that gh is logged in to, or of the owners named (accounts or
-organisations). A repository counts as present when one of the clones under
-the destination has it as a remote, whatever the name and the depth of its
-folder, also when it was renamed or transferred since. The missing ones are
-cloned into DEST/name for the account itself and DEST/owner/name for any
-other owner.
+of the account that gh is logged in to and of the organisations it belongs
+to, or of the owners named (accounts or organisations). A repository counts
+as present when one of the clones under the destination has it as a remote,
+whatever the name and the depth of its folder, also when it was renamed or
+transferred since. The missing ones are cloned into DEST/name for the
+account itself and DEST/folder/name for any other owner.
+
+The folder of an owner is the one that gh-batch.OWNER.folder names, else
+the one where its clones already are, else its name on GitHub. The first
+time an organisation of the account has something to clone, its folder is
+asked for, before the list: Enter takes the folder proposed, a minus sign
+leaves the organisation out, and the answer is kept in the settings of git.
+With --yes, with --dry-run or without a terminal nothing is asked and the
+folder proposed is taken.
 
 In the second form the list is a layout file, as "$PROG list --manifest"
 writes it: each repository returns to the folder it had, on its branch. No
@@ -4271,11 +4729,21 @@ OPTIONS
       --since DATE     only the repositories pushed since DATE (2026-01-31)
       --no-forks       leave the forks out
       --no-archived    leave the archived repositories out
+      --no-orgs        the account only, without its organisations
       --flat           DEST/name for every owner
-      --by-owner       DEST/owner/name for every owner
+      --by-owner       DEST/folder/name for every owner, the account too,
+                       the folder being the name of the owner unless
+                       gh-batch.OWNER.folder names another
   -y, --yes            do not ask for the confirmation
   -n, --dry-run        show the list and clone nothing
   and the common options, see: $PROG help
+
+SETTINGS (git config --global)
+  gh-batch.orgs false          never read the organisations of the account
+  gh-batch.OWNER.folder NAME   the folder of an owner under the destination;
+                               a dot is the destination itself
+  gh-batch.OWNER.skip true     leave this organisation out, unless it is
+                               named on the command line
 EOF
 }
 
@@ -4430,9 +4898,10 @@ $PROG config
 Print the settings in force and where each comes from: the command line,
 the environment (GH_BATCH_ROOT, GH_BATCH_JOBS, GH_BATCH_DEPTH,
 GH_BATCH_TIMEOUT, GH_BATCH_DIVERGED, GH_BATCH_COMMIT, GH_BATCH_CONFIRM,
-GH_BATCH_MESSAGE, GH_BATCH_MACHINE, GH_BATCH_MAX_FILE_SIZE,
+GH_BATCH_ORGS, GH_BATCH_MESSAGE, GH_BATCH_MACHINE, GH_BATCH_MAX_FILE_SIZE,
 GH_BATCH_MAX_NEW_FILES, GH_BATCH_NOTIFY, GH_BATCH_NOTIFY_ON),
-"git config --global gh-batch.*", or the default.
+"git config --global gh-batch.*", or the default. The settings of single
+owners, gh-batch.OWNER.folder and gh-batch.OWNER.skip, are listed too.
 EOF
 }
 
@@ -4507,6 +4976,8 @@ parse_options() {
             --days=*)       DOCTOR_DAYS=${1#*=}; shift ;;
             --in)           need_value "$@"; ARGS+=("$2"); shift 2 ;;
             --in=*)         ARGS+=("${1#*=}"); shift ;;
+            --orgs)         OPT_ORGS="true"; shift ;;
+            --no-orgs)      OPT_ORGS="false"; shift ;;
             --no-forks)     NO_FORKS=1; shift ;;
             --no-archived)  NO_ARCHIVED=1; shift ;;
             --flat)         LAYOUT="flat"; shift ;;

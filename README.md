@@ -6,7 +6,7 @@ Whoever keeps their work in many git repositories, on more than one machine, rep
 
 It is careful by construction. A conflict is never left inside a repository: the attempt is undone, the repository is exactly as it was, and you are told which files conflict. A push is never forced. Nothing is committed unless you asked for it, and before the evening run commits or pushes anything it shows the full list and waits for one confirmation.
 
-The tool is one bash file. It needs bash 3.2 or newer and git 2.30 or newer, and it runs on Linux and macOS. The GitHub CLI `gh` is optional: it is used to clone a whole account, to mark the public repositories, and for one part of the health check.
+The tool is one bash file. It needs bash 3.2 or newer and git 2.30 or newer, and it runs on Linux and macOS. The GitHub CLI `gh` is optional: it is used to clone a whole account with its organisations, to mark the public repositories, and for one part of the health check.
 
 The repository is at
 
@@ -86,6 +86,8 @@ Proceed? [Y/n]
 3 repositories: 3 cloned.
 ```
 
+The organisations that the account belongs to are read with it, and the repositories of each go to a folder of their own, which is asked for once.
+
 ## Installation
 
 There are three ways, and they can coexist.
@@ -127,7 +129,7 @@ Without that setting, every command works on the folders named on its command li
 | `pull` | Fetch every repository and bring it forward. |
 | `push` | Push every repository that has new commits, after committing what is pending when asked to. |
 | `sync` | Pull, then push. |
-| `clone` | Clone what is missing: a whole GitHub account, or the entries of a layout file. |
+| `clone` | Clone what is missing: a whole GitHub account with its organisations, or the entries of a layout file. |
 | `status` | Show what is pending in every repository, without touching the network. |
 | `fetch` | Look at the servers, change no file, say what `pull` would do. |
 | `log` | List the commits of today, or of a period, across the repositories. |
@@ -218,16 +220,36 @@ The command `gh-batch sync` runs the pull, prints its summary, then runs the pus
 
 ### clone
 
-In its first form the list comes from GitHub, through `gh`: every repository of the account that `gh` is logged in to, or of the owners named on the command line (accounts or organisations).
+In its first form the list comes from GitHub, through `gh`: every repository of the account that `gh` is logged in to and of the organisations it belongs to, or of the owners named on the command line (accounts or organisations).
 
 ```bash
-gh-batch clone                      # everything of your account that is missing
-gh-batch clone my-organisation      # the same for an organisation
+gh-batch clone                      # what is missing of your account and of its organisations
+gh-batch clone --no-orgs            # of your account alone
+gh-batch clone my-organisation      # of one owner alone, account or organisation
 gh-batch clone --since 2026-01-01   # only what was pushed this year
 gh-batch clone --update             # and pull what is present already
 ```
 
-A repository counts as present when one of the clones under the destination has it as a remote, whatever the name and the depth of its folder, and also when it was renamed or transferred on GitHub since. The missing ones go to `DEST/name` for the account itself and to `DEST/owner/name` for any other owner; `--flat` and `--by-owner` force one layout for all. The destination is `--into DIR`, else the folder of `gh-batch.root`; a mass clone never falls back on the current folder. The filters are `--only GLOB`, `--except GLOB`, `--since DATE`, `--no-forks` and `--no-archived`.
+A repository counts as present when one of the clones under the destination has it as a remote, whatever the name and the depth of its folder, and also when it was renamed or transferred on GitHub since. The missing ones go to `DEST/name` for the account itself and to `DEST/folder/name` for any other owner; `--flat` puts every owner at the top, and `--by-owner` gives the account a folder too. The destination is `--into DIR`, else the folder of `gh-batch.root`; a mass clone never falls back on the current folder. The filters are `--only GLOB`, `--except GLOB`, `--since DATE`, `--no-forks` and `--no-archived`.
+
+**The folder of an organisation** is asked for once. The first time an organisation of the account has something to clone, the tool proposes a folder, the one where clones of that organisation already are, else its name on GitHub, and waits: Enter takes it, another name replaces it, and a minus sign leaves the organisation out. The answer is kept in git's configuration, so the question does not return.
+
+```text
+$ gh-batch clone
+3 repositories of the organisation Hydrodynamics Laboratory (hydro-lab) are missing here.
+Folder for the organisation under ~/workspace [hydro-lab], or - to leave it out: lab
+(kept: git config --global gh-batch.hydro-lab.folder lab)
+
+gh-batch clone: 8 repositories of ada and hydro-lab on GitHub; 5 already under ~/workspace, 3 to clone
+
+Plan: clone 3 repositories into ~/workspace (about 14 MB)
+  lab/flume-data      private  12 MB
+  lab/group-meetings  private  under 1 MB
+  lab/wave-tank       PUBLIC   2 MB
+Proceed? [Y/n]
+```
+
+The same choices can be typed by hand: `gh-batch.OWNER.folder NAME` names the folder of an owner, and holds also when that owner is named on the command line; `gh-batch.OWNER.skip true` leaves an organisation out until it is named. A folder is a path below the destination, no deeper than the other commands search (`a/b` at most with the default depth of three), and a dot stands for the destination itself. With `--yes`, with `--dry-run` or without a terminal nothing is asked and the folder proposed is taken. The setting `gh-batch.orgs false` keeps `clone` to the account alone, as `--no-orgs` does for one run. An organisation that GitHub refuses to list is named in the report and does not stop the others.
 
 Four repositories are cloned at a time. Each clone is made under a temporary name beside its place and renamed when it is complete, so an interrupted run leaves nothing half-made, and the leftover of a run that died is removed by the next one. A folder that exists and is not the repository is never touched: it is named in the report. Large files kept with git-lfs are downloaded in a second step, so that a failed download cannot lose the clone.
 
@@ -329,7 +351,7 @@ The command `list` prints the names of the repositories found, their full paths 
 
 ## What gh-batch never does
 
-It never forces a push, never deletes a branch or a file of yours, never resets a repository, never cleans a working tree, never drops a stash and never skips a hook. It never leaves a conflict, a half-finished rebase or a half-finished merge behind. It never commits unless the option or the setting says so, and then never a repository that opted out. It never pushes a branch onto a branch of another name unless git itself was configured to do so. It never asks a question in the middle of a run: git is run so that a missing password is an error, not a prompt, and the one confirmation comes before anything is changed. A test of the suite reads the source and fails if a forced push, a hard reset or a cleaning command ever appears in it.
+It never forces a push, never deletes a branch or a file of yours, never resets a repository, never cleans a working tree, never drops a stash and never skips a hook. It never leaves a conflict, a half-finished rebase or a half-finished merge behind. It never commits unless the option or the setting says so, and then never a repository that opted out. It never pushes a branch onto a branch of another name unless git itself was configured to do so. It never asks a question in the middle of a run: git is run so that a missing password is an error, not a prompt, and its own questions, the folder of an organisation met for the first time and the one confirmation, come before anything is changed. A test of the suite reads the source and fails if a forced push, a hard reset or a cleaning command ever appears in it.
 
 ## Settings
 
@@ -351,6 +373,14 @@ The settings live in git's own configuration, so there is no new file to learn. 
 | `gh-batch.exclude` | none | A pattern of names to leave out of every command; it may be given several times. |
 | `gh-batch.notify` | none | A command that receives the report on its standard input. |
 | `gh-batch.notifyOn` | `never` | When to send it: `never`, `attention` or `always`. |
+| `gh-batch.orgs` | `true` | Whether `clone` reads the organisations of the account too. |
+
+Two settings concern one owner on GitHub, an account or an organisation, whose name stands in the middle of the key; `clone` writes them when it has asked, and they can be typed by hand.
+
+| Setting | Meaning |
+|---|---|
+| `gh-batch.OWNER.folder NAME` | The folder below the destination where `clone` puts the repositories of that owner; a dot for the destination itself. |
+| `gh-batch.OWNER.skip true` | `clone` leaves that organisation out, unless it is named on the command line. |
 
 Three settings belong inside a repository, where they are typed without `--global`.
 
@@ -360,7 +390,7 @@ Three settings belong inside a repository, where they are typed without `--globa
 | `gh-batch.pullOnly true` | It is updated, never committed or pushed. |
 | `gh-batch.commit false` | It is never committed automatically, whatever the option or the general setting. |
 
-The command line wins over the environment, which wins over the configuration. The environment variables are `GH_BATCH_ROOT`, `GH_BATCH_JOBS`, `GH_BATCH_DEPTH`, `GH_BATCH_TIMEOUT`, `GH_BATCH_DIVERGED`, `GH_BATCH_COMMIT`, `GH_BATCH_CONFIRM`, `GH_BATCH_MESSAGE`, `GH_BATCH_MACHINE`, `GH_BATCH_MAX_FILE_SIZE`, `GH_BATCH_MAX_NEW_FILES`, `GH_BATCH_NOTIFY` and `GH_BATCH_NOTIFY_ON`.
+The command line wins over the environment, which wins over the configuration. The environment variables are `GH_BATCH_ROOT`, `GH_BATCH_JOBS`, `GH_BATCH_DEPTH`, `GH_BATCH_TIMEOUT`, `GH_BATCH_DIVERGED`, `GH_BATCH_COMMIT`, `GH_BATCH_CONFIRM`, `GH_BATCH_ORGS`, `GH_BATCH_MESSAGE`, `GH_BATCH_MACHINE`, `GH_BATCH_MAX_FILE_SIZE`, `GH_BATCH_MAX_NEW_FILES`, `GH_BATCH_NOTIFY` and `GH_BATCH_NOTIFY_ON`.
 
 ## Reading the report
 

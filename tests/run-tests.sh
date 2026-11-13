@@ -74,7 +74,7 @@ world() {
     export GH_BATCH_STATE_DIR="$WORLD/state"
     export GH_STUB_DIR="$WORLD/gh"
     mkdir -p "$GH_STUB_DIR"
-    unset GIT_SSH_COMMAND GH_BATCH_ROOT GH_BATCH_ISOLATE GH_BATCH_HIDE GIT_TEST_ASSUME_DIFFERENT_OWNER 2>/dev/null || true
+    unset GIT_SSH_COMMAND GH_BATCH_ROOT GH_BATCH_ISOLATE GH_BATCH_HIDE GH_BATCH_TTY GIT_TEST_ASSUME_DIFFERENT_OWNER 2>/dev/null || true
     base_config
 }
 
@@ -175,6 +175,17 @@ operation_in_progress() {
 
 gb() {
     OUTPUT=$("$GB" "$@" 2>&1)
+    RC=$?
+    return 0
+}
+
+asked() {
+    # asked ANSWERS ARGS...: the tool with somebody at the keyboard, who
+    # types the lines of ANSWERS, written as printf reads them.
+    local answers="$1"
+    shift
+    printf '%b' "$answers" > "$WORLD/answers"
+    OUTPUT=$(GH_BATCH_TTY=1 "$GB" "$@" 2>&1 < "$WORLD/answers")
     RC=$?
     return 0
 }
@@ -1404,6 +1415,291 @@ if describe "clone: without gh"; then
     gb clone --into "$A" --yes
     check "clone: a gh that is not logged in is reported" "got rc=$RC: $OUTPUT" \
         "$( [ "$RC" -eq 3 ] && contains "$OUTPUT" "logged in" && echo 0 || echo 1 )"
+fi
+
+# --- clone: the organisations of the account ------------------------------------------
+organisation() {
+    # organisation LOGIN [TITLE]: the account of the stub gh belongs to one
+    # more organisation, which shows the name TITLE on GitHub.
+    printf '%s\n' "$1" >> "$GH_STUB_DIR/orgs"
+    if [ -n "${2:-}" ]; then
+        mkdir -p "$GH_STUB_DIR/titles"
+        printf '%s\n' "$2" > "$GH_STUB_DIR/titles/$1"
+    fi
+}
+
+settings() {
+    # settings -> what the tool finds of its own in the settings of git
+    git config --global --get-regexp '^gh-batch\.' 2>/dev/null
+    return 0
+}
+
+if describe "clone: the organisations of the account"; then
+    world
+    account me
+    listed me mine
+    organisation Lab
+    organisation guild
+    listed Lab tool
+    listed Lab data
+    listed guild craft false false false
+    gb clone --into "$A" --dry-run
+    check "clone: the organisations of the account are read with it" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "4 repositories of me, Lab and guild on GitHub; 0 already under" && contains "$OUTPUT" "Lab/tool" && contains "$OUTPUT" "guild/craft" && contains "$OUTPUT" "PUBLIC" && [ -z "$(entries "$A")" ] && echo 0 || echo 1 )"
+    mkdir -p "$A/Lab/.gh-batch-clone.stale.999999"
+    gb clone --into "$A" --yes
+    check "clone: the account at the top, each organisation in the folder of its name" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ -d "$A/mine/.git" ] && [ -d "$A/Lab/tool/.git" ] && [ -d "$A/Lab/data/.git" ] && [ -d "$A/guild/craft/.git" ] && [ ! -e "$A/tool" ] && contains "$OUTPUT" "4 cloned" && echo 0 || echo 1 )"
+    check "clone: the leftover of a dead run is removed from the folder of an organisation" "found: $(entries "$A/Lab")" \
+        "$( [ "$(entries "$A/Lab")" = "data tool " ] && echo 0 || echo 1 )"
+    check "clone: a run that asks nothing writes no setting" "settings: $(settings)" \
+        "$( [ -z "$(settings)" ] && echo 0 || echo 1 )"
+    gb clone --into "$A" --yes
+    check "clone: a second run finds nothing missing in the organisations either" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "4 already under" && contains "$OUTPUT" "Nothing is missing" && echo 0 || echo 1 )"
+    : > "$GH_STUB_DIR/calls"
+    gb clone --into "$WORLD/alone" --yes --no-orgs
+    check "clone --no-orgs: the account only, and GitHub is not asked for its organisations" "got: $(entries "$WORLD/alone"); calls: $(cat "$GH_STUB_DIR/calls")" \
+        "$( [ "$(entries "$WORLD/alone")" = "mine " ] && ! contains "$(cat "$GH_STUB_DIR/calls")" "user/orgs" && echo 0 || echo 1 )"
+    git config --global gh-batch.orgs false
+    gb clone --into "$WORLD/never" --dry-run
+    never=$OUTPUT
+    gb clone --into "$WORLD/never" --dry-run --orgs
+    check "clone: gh-batch.orgs false makes it the rule, --orgs the exception" "got: $never; then: $OUTPUT" \
+        "$( contains "$never" "1 repository of me on GitHub" && contains "$OUTPUT" "4 repositories of me, Lab and guild on GitHub" && echo 0 || echo 1 )"
+    git config --global --unset gh-batch.orgs
+    : > "$GH_STUB_DIR/calls"
+    gb clone --into "$WORLD/named" --yes me
+    check "clone: an owner that is named is read alone" "got: $(entries "$WORLD/named"); calls: $(cat "$GH_STUB_DIR/calls")" \
+        "$( [ "$(entries "$WORLD/named")" = "mine " ] && ! contains "$(cat "$GH_STUB_DIR/calls")" "user/orgs" && echo 0 || echo 1 )"
+    gb clone --into "$WORLD/by-owner" --yes --by-owner
+    check "clone --by-owner: the account in the folder of its name, like the organisations" "got: $(entries "$WORLD/by-owner")" \
+        "$( [ -d "$WORLD/by-owner/me/mine/.git" ] && [ -d "$WORLD/by-owner/Lab/tool/.git" ] && [ "$(entries "$WORLD/by-owner")" = "Lab guild me " ] && echo 0 || echo 1 )"
+    gb clone --into "$WORLD/flat" --yes --flat
+    check "clone --flat: the organisations at the top too" "got: $(entries "$WORLD/flat")" \
+        "$( [ "$(entries "$WORLD/flat")" = "craft data mine tool " ] && echo 0 || echo 1 )"
+fi
+
+if describe "clone: the folder of an organisation"; then
+    world
+    account me
+    listed me mine
+    organisation Lab
+    organisation guild
+    listed Lab tool
+    listed Lab data
+    listed guild craft
+    git config --global gh-batch.lab.folder work/lab
+    gb clone --into "$A" --yes
+    check "clone: gh-batch.OWNER.folder names the folder, whatever the case of the owner" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ -d "$A/work/lab/tool/.git" ] && [ -d "$A/work/lab/data/.git" ] && [ ! -e "$A/Lab" ] && [ -d "$A/guild/craft/.git" ] && contains "$OUTPUT" "into $A/work/lab/tool" && echo 0 || echo 1 )"
+    gb config
+    check "config: the folder of an owner is listed" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "lab in work/lab" && contains "$OUTPUT" "orgs " && echo 0 || echo 1 )"
+    listed Lab extra
+    git config --global gh-batch.lab.folder .
+    gb clone --into "$A" --dry-run
+    check "clone: a dot is the destination itself" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "  extra  " && ! contains "$OUTPUT" "/extra" && echo 0 || echo 1 )"
+    git config --global gh-batch.lab.folder ../outside
+    gb clone --into "$A" --dry-run
+    check "clone: a folder that leaves the destination is refused, and the organisation named" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 1 ] && contains "$OUTPUT" "the organisation Lab is left out" && contains "$OUTPUT" "it leaves $A" && ! contains "$OUTPUT" "extra" && echo 0 || echo 1 )"
+    gb clone --into "$A" --dry-run Lab
+    check "clone: for an owner that is named, such a folder is a usage error" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 2 ] && contains "$OUTPUT" "gh-batch.Lab.folder" && echo 0 || echo 1 )"
+    git config --global gh-batch.lab.folder mine
+    gb clone --into "$A" --dry-run
+    check "clone: a folder that is a repository is refused" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 1 ] && contains "$OUTPUT" "$A/mine is a git repository itself" && echo 0 || echo 1 )"
+    git config --global gh-batch.lab.folder a/b/c
+    gb clone --into "$A" --dry-run
+    deep=$OUTPUT
+    gb clone --into "$A" --dry-run --depth 4
+    check "clone: a folder below the levels that are searched is refused" "got: $deep; with --depth 4: $OUTPUT" \
+        "$( contains "$deep" "it is too deep: repositories are searched 3 levels below" && contains "$OUTPUT" "a/b/c/extra" && echo 0 || echo 1 )"
+    git config --global --unset gh-batch.lab.folder
+    git config --global gh-batch.LAB.skip true
+    : > "$GH_STUB_DIR/calls"
+    gb clone --into "$A" --dry-run --verbose
+    check "clone: gh-batch.OWNER.skip leaves an organisation out, and GitHub is not asked for it" "got: $OUTPUT; calls: $(cat "$GH_STUB_DIR/calls")" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "2 repositories of me and guild on GitHub" && contains "$OUTPUT" "the organisation Lab is left out by gh-batch.Lab.skip" && ! contains "$(cat "$GH_STUB_DIR/calls")" "repo list Lab" && echo 0 || echo 1 )"
+    gb clone --into "$A" --dry-run Lab
+    check "clone: an organisation left out is still read when it is named" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "3 repositories of Lab on GitHub" && contains "$OUTPUT" "extra" && echo 0 || echo 1 )"
+
+    world
+    account me
+    organisation Lab
+    listed me mine
+    listed Lab tool
+    listed Lab data
+    listed Lab more
+    listed Lab other
+    mkdir -p "$A/team"
+    git clone -q "https://github.com/Lab/tool" "$A/team/tool"
+    git clone -q "https://github.com/Lab/data" "$A/team/under-another-name"
+    git clone -q "https://github.com/Lab/other" "$A/other"
+    gb clone --into "$A" --yes
+    check "clone: without a setting, the folder where most clones of the organisation are" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ -d "$A/team/more/.git" ] && [ ! -e "$A/Lab" ] && [ ! -e "$A/more" ] && echo 0 || echo 1 )"
+    listed Lab extra
+    gb clone --into "$A" --dry-run --by-owner --only extra
+    check "clone --by-owner: the name of the owner, wherever its clones are" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "Lab/extra" && ! contains "$OUTPUT" "team/extra" && echo 0 || echo 1 )"
+
+    world
+    account me
+    organisation Lab
+    listed me mine
+    listed Lab tool
+    listed Lab data
+    git clone -q "https://github.com/me/mine" "$A/mine"
+    git -C "$A/mine" remote add upstream "https://github.com/Lab/tool"
+    gb clone --into "$A" --yes
+    check "clone: a fork that names a repository of the organisation does not decide its folder" "got rc=$RC: $(entries "$A"): $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ -d "$A/Lab/data/.git" ] && [ "$(entries "$A")" = "Lab mine " ] && [ "$(entries "$A/Lab")" = "data " ] && contains "$OUTPUT" "1 cloned" && echo 0 || echo 1 )"
+    listed Lab -dash
+    asked '-dash\ny\n' clone --into "$A" --only=-dash
+    check "clone: a folder whose name begins with a dash is kept in a form that git accepts" "got rc=$RC: $OUTPUT; settings: $(settings)" \
+        "$( [ "$RC" -eq 0 ] && [ -d "$A/-dash/-dash/.git" ] && [ "$(git config --global gh-batch.Lab.folder)" = "./-dash" ] && echo 0 || echo 1 )"
+    listed Lab again
+    gb clone --into "$A" --yes
+    check "clone: and it is read back as the same folder" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ -d "$A/-dash/again/.git" ] && echo 0 || echo 1 )"
+fi
+
+if describe "clone: the question about the folder of an organisation"; then
+    world
+    account me
+    listed me mine
+    organisation Lab "Laboratory of Waves"
+    organisation guild
+    listed Lab tool
+    listed guild craft
+    asked 'ee\n-\ny\n' clone --into "$A"
+    check "clone: the folder is asked for, under the name that the organisation shows" "got rc=$RC: $OUTPUT" \
+        "$( contains "$OUTPUT" "1 repository of the organisation Laboratory of Waves (Lab) is missing here." && contains "$OUTPUT" "Folder for the organisation under $A [Lab], or - to leave it out:" && contains "$OUTPUT" "1 repository of the organisation guild is missing here." && echo 0 || echo 1 )"
+    check "clone: the answer is the folder, and a minus sign leaves the organisation out" "got rc=$RC: $(entries "$A"): $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ -d "$A/ee/tool/.git" ] && [ -d "$A/mine/.git" ] && [ "$(entries "$A")" = "ee mine " ] && contains "$OUTPUT" "2 repositories of me and Lab on GitHub" && contains "$OUTPUT" "2 cloned" && echo 0 || echo 1 )"
+    check "clone: both answers are kept in the settings of git, and shown" "settings: $(settings); got: $OUTPUT" \
+        "$( [ "$(git config --global gh-batch.Lab.folder)" = "ee" ] && [ "$(git config --global gh-batch.guild.skip)" = "true" ] && contains "$OUTPUT" "(kept: git config --global gh-batch.Lab.folder ee)" && contains "$OUTPUT" "(kept: git config --global gh-batch.guild.skip true)" && echo 0 || echo 1 )"
+    listed Lab later
+    asked 'y\n' clone --into "$A"
+    check "clone: the question does not return" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && ! contains "$OUTPUT" "Folder for the organisation" && [ -d "$A/ee/later/.git" ] && [ ! -e "$A/guild" ] && echo 0 || echo 1 )"
+
+    world
+    account me
+    organisation Lab
+    listed me mine
+    listed Lab tool
+    listed Lab data
+    mkdir -p "$A/team"
+    git clone -q "https://github.com/Lab/tool" "$A/team/tool"
+    asked '\ny\n' clone --into "$A"
+    check "clone: Enter takes the folder proposed, the one where the clones already are" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "[team], or - to leave it out:" && [ -d "$A/team/data/.git" ] && [ "$(git config --global gh-batch.Lab.folder)" = "team" ] && echo 0 || echo 1 )"
+
+    world
+    account me
+    organisation Lab
+    listed me mine
+    listed Lab tool
+    asked "../out\\n/somewhere/else\\n.hidden\\n$A/fine/place\\ny\\n" clone --into "$A"
+    check "clone: a folder outside the destination, or hidden, is refused and asked for again" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "This folder cannot be used: it leaves $A." && contains "$OUTPUT" "it lies outside $A." && contains "$OUTPUT" "a hidden folder" && [ -d "$A/fine/place/tool/.git" ] && [ ! -e "$WORLD/out" ] && [ "$(git config --global gh-batch.Lab.folder)" = "fine/place" ] && echo 0 || echo 1 )"
+
+    world
+    account me
+    organisation Lab
+    listed me mine
+    listed Lab tool
+    asked '' clone --into "$A"
+    check "clone: without an answer nothing is done and nothing is kept" "got rc=$RC: $OUTPUT; settings: $(settings)" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "Nothing was done." && [ -z "$(entries "$A")" ] && [ -z "$(settings)" ] && echo 0 || echo 1 )"
+    gb clone --into "$A" --dry-run
+    dry=$OUTPUT
+    gb clone --into "$A"
+    check "clone: a dry run, and a run without a terminal, ask nothing" "dry run: $dry; without a terminal, rc=$RC: $OUTPUT" \
+        "$( ! contains "$dry" "Folder for the organisation" && contains "$dry" "Lab/tool" && [ "$RC" -eq 2 ] && ! contains "$OUTPUT" "Folder for the organisation" && [ -z "$(settings)" ] && echo 0 || echo 1 )"
+    asked 'lab\nn\n' clone --into "$A"
+    check "clone: the folder is kept even when the list is then declined" "got rc=$RC: $OUTPUT; found: $(entries "$A")" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "Nothing was done." && [ -z "$(entries "$A")" ] && [ "$(git config --global gh-batch.Lab.folder)" = "lab" ] && echo 0 || echo 1 )"
+
+    world
+    account me
+    organisation Lab
+    listed me mine
+    listed Lab tool
+    mkdir -p "$A/x"
+    git clone -q "https://github.com/Lab/tool" "$A/x/tool"
+    asked 'y\n' clone --into "$A"
+    check "clone: an organisation with nothing missing is not asked about" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && ! contains "$OUTPUT" "Folder for the organisation" && [ -d "$A/mine/.git" ] && [ -z "$(settings)" ] && echo 0 || echo 1 )"
+
+    # An interrupt while a question waits. The questions come before
+    # anything is changed, so the run may end there; a bash older than 4
+    # hands the signal over only when the line is complete, hence the line
+    # that follows a late answer.
+    for which in folder confirmation; do
+        world
+        account me
+        listed me mine
+        if [ "$which" = "folder" ]; then
+            organisation Lab
+            listed Lab tool
+        fi
+        mkfifo "$WORLD/keyboard"
+        export GH_BATCH_TTY=1
+        set -m
+        "$GB" clone --into "$A" < "$WORLD/keyboard" > "$WORLD/bg.out" 2>&1 &
+        BG_PID=$!
+        set +m
+        unset GH_BATCH_TTY
+        exec 9> "$WORLD/keyboard"
+        n=0
+        while [ "$n" -lt 100 ] && ! grep -q -E 'leave it out|Proceed' "$WORLD/bg.out" 2>/dev/null; do
+            sleep 0.1
+            n=$((n + 1))
+        done
+        kill -INT -- "-$BG_PID" 2>/dev/null
+        n=0
+        while [ "$n" -lt 30 ] && kill -0 "$BG_PID" 2>/dev/null; do
+            sleep 0.1
+            n=$((n + 1))
+        done
+        late=0
+        if kill -0 "$BG_PID" 2>/dev/null; then
+            late=1
+            printf '\n' >&9
+        fi
+        ended=1
+        wait_bg 10 && ended=0
+        exec 9>&-
+        prompt=0
+        if [ "${BASH_VERSINFO[0]}" -ge 4 ]; then
+            { [ "$late" -eq 0 ] && [ "$RC" -eq 130 ]; } || prompt=1
+        fi
+        check "clone: an interrupt at the question of the $which ends the run, with nothing done" "ended=$ended late=$late rc=$RC: $OUTPUT; found: $(entries "$A"); settings: $(settings)" \
+            "$( [ "$ended" -eq 0 ] && [ "$prompt" -eq 0 ] && { [ "$RC" -eq 130 ] || [ "$RC" -eq 0 ]; } && contains "$OUTPUT" "Nothing was done." && [ -z "$(entries "$A")" ] && [ -z "$(settings)" ] && echo 0 || echo 1 )"
+    done
+fi
+
+if describe "clone: an organisation that GitHub does not give"; then
+    world
+    account me
+    listed me mine
+    organisation closed
+    organisation Lab
+    listed Lab tool
+    gb clone --into "$A" --yes
+    check "clone: an organisation that cannot be listed is named, and the others are cloned" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 1 ] && contains "$OUTPUT" "the organisation closed is left out: GitHub did not give its repositories" && [ -d "$A/mine/.git" ] && [ -d "$A/Lab/tool/.git" ] && echo 0 || echo 1 )"
+    printf 'gh: Resource not accessible by personal access token (HTTP 403)\n' > "$GH_STUB_DIR/orgs.refused"
+    gb clone --into "$B" --yes
+    check "clone: when the organisations cannot be listed, the account is still cloned" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "warning: GitHub did not give the organisations of me" && [ "$(entries "$B")" = "mine " ] && echo 0 || echo 1 )"
 fi
 
 # --- list --manifest and clone --manifest ----------------------------------------------

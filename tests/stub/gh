@@ -10,6 +10,9 @@
 #   repos/OWNER/NAME   the line answered by "gh api repos/OWNER/NAME"
 #   names/OWNER/NAME   its present name, answered when only .full_name is asked
 #   list/OWNER         the lines answered by "gh repo list OWNER"
+#   orgs               the organisations of the account, one login per line
+#   orgs.refused       when present, GitHub refuses to list them, in these words
+#   titles/LOGIN       the name that the organisation LOGIN shows
 #   protocol           https or ssh, for "gh config get git_protocol"
 # Every call is appended to $GH_STUB_DIR/calls, so that a test can tell
 # whether GitHub was asked.
@@ -20,6 +23,20 @@ printf '%s\n' "$*" >> "$dir/calls"
 case "$1 $2" in
     "api user")
         cat "$dir/user" 2>/dev/null || exit 1
+        ;;
+    "api user/orgs")
+        if [ -f "$dir/orgs.refused" ]; then
+            cat "$dir/orgs.refused" >&2
+            exit 1
+        fi
+        # An account without the file belongs to no organisation.
+        [ -f "$dir/orgs" ] && cat "$dir/orgs"
+        exit 0
+        ;;
+    "api orgs/"*)
+        # An organisation without the file shows no name.
+        [ -f "$dir/titles/${2#orgs/}" ] && cat "$dir/titles/${2#orgs/}"
+        exit 0
         ;;
     "api repos/"*)
         kind=repos
