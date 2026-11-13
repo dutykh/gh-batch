@@ -182,6 +182,7 @@ C_DIM=""
 C_OFF=""
 NAME_WIDTH=12
 PROGRESS=0
+SHOWN=0                   # a line of the report was written since its header
 ATTENTION=0
 ATTENTION_LIST=""
 TOTAL=0
@@ -1019,6 +1020,7 @@ put_repo() {
     plain=$(printf '  %-13s %-*s  %-8s %s' "$label" "$NAME_WIDTH" "$name" "$branch" "$message")
     plain=${plain%"${plain##*[! ]}"}
     [ -n "$TMP" ] && printf '%s\n' "$plain" >> "$TMP/report.txt"
+    SHOWN=1
     if [ "$QUIET" -eq 1 ] && [ "$attention" -ne 1 ]; then
         return 0
     fi
@@ -1117,7 +1119,9 @@ summary() {
         [ "$n" -gt 0 ] || continue
         text="$text${text:+, }$(state_phrase "$state" "$n")"
     done
-    [ "$TOTAL" -gt 0 ] && put ""
+    # A blank line parts the summary from the lines above it, and only from
+    # them: the header already ends with one.
+    [ "$SHOWN" -eq 1 ] && put ""
     put "$(plural "$TOTAL" repository): ${text:-nothing to report}."
     if [ -n "$ATTENTION_LIST" ]; then
         put "Needs you: $ATTENTION_LIST."
@@ -1442,15 +1446,26 @@ fetch_upstream() {
 }
 
 incoming() {
-    # incoming OLD NEW COUNT -> the first new commits, one per line
-    local shown=5 line
+    # incoming OLD NEW COUNT -> the first new commits, one per line, then
+    # what was left out. The merge commits are counted, not listed, so that
+    # the lines and the count of the report agree.
+    local limit=5 line listed=0 merges rest
     while IFS= read -r line; do
-        [ -n "$line" ] && printf '%s\n' "$(clip "$line" 100)"
+        [ -n "$line" ] || continue
+        listed=$(( listed + 1 ))
+        printf '%s\n' "$(clip "$line" 100)"
     done <<EOF
-$(g log --no-merges --format='%h %s' -n "$shown" "$1..$2" 2>/dev/null)
+$(g log --no-merges --format='%h %s' -n "$limit" "$1..$2" 2>/dev/null)
 EOF
-    if [ "$3" -gt "$shown" ]; then
-        printf '... and %s more\n' $(( $3 - shown ))
+    merges=$(g rev-list --merges --count "$1..$2" 2>/dev/null)
+    is_uint "$merges" || merges=0
+    rest=$(( $3 - merges - listed ))
+    if [ "$rest" -gt 0 ] && [ "$merges" -gt 0 ]; then
+        printf '... and %s more, and %s\n' "$rest" "$(plural "$merges" "merge commit")"
+    elif [ "$rest" -gt 0 ]; then
+        printf '... and %s more\n' "$rest"
+    elif [ "$merges" -gt 0 ]; then
+        printf '... and %s\n' "$(plural "$merges" "merge commit")"
     fi
     return 0
 }
@@ -1480,15 +1495,44 @@ lfs_prefetch() {
     run_net lfs "${GIT[@]}" lfs fetch "$R_up_remote" "$R_up_ref"
 }
 
+written_back() {
+    # written_back FILE -> the words for the files that FILE lists (deleted
+    # here before the update, separated by NUL) and that the update wrote
+    # back, or nothing.
+    local path list="" n=0
+    [ -s "$1" ] || return 0
+    while IFS= read -r -d '' path; do
+        if [ -e "$REPO/$path" ] || [ -L "$REPO/$path" ]; then
+            n=$(( n + 1 ))
+            [ "$n" -le 5 ] && list="$list${list:+, }$path"
+        fi
+    done < "$1"
+    [ "$n" -gt 0 ] || return 0
+    [ "$n" -gt 5 ] && list="$list and $(( n - 5 )) more"
+    if [ "$n" -eq 1 ]; then
+        printf 'a file deleted here and changed on the server came back: %s' "$list"
+    else
+        printf '%s files deleted here and changed on the server came back: %s' "$n" "$list"
+    fi
+}
+
 fast_forward() {
     # The branch is strictly behind: move it forward. Pending changes that
     # the new commits do not touch stay; otherwise git refuses and nothing
-    # changes.
-    local before after now rc files
+    # changes. A file deleted here without a commit is the exception: git
+    # does not count a missing file as a change it would overwrite, and
+    # writes the new version of a file that the new commits change. The
+    # report names such files.
+    local before after now rc files pending back
     if ! lfs_prefetch; then
         U_state="failed"; U_attn=1
         U_msg="the large files of the new commits could not be downloaded: $(net_failure "$?")"
         return 0
+    fi
+    pending=$(( R_tracked + R_untracked ))
+    : > "$W/deleted"
+    if [ "$R_tracked" -gt 0 ]; then
+        g diff --no-color --name-only --diff-filter=D -z > "$W/deleted" 2>/dev/null
     fi
     before=$(snapshot)
     mark_inflight
@@ -1500,9 +1544,16 @@ fast_forward() {
     if [ "$rc" -eq 0 ] && [ "$now" = "$U_up" ]; then
         U_state="updated"
         U_msg="$(plural "$U_behind" "new commit")"
-        if [ $(( R_tracked + R_untracked )) -gt 0 ]; then
-            U_msg="$U_msg (your pending changes were kept)"
+        back=$(written_back "$W/deleted")
+        if [ "$pending" -gt 0 ]; then
+            inspect
+            if [ $(( R_tracked + R_untracked )) -gt 0 ] && [ -n "$back" ]; then
+                U_msg="$U_msg (your other pending changes were kept)"
+            elif [ $(( R_tracked + R_untracked )) -gt 0 ]; then
+                U_msg="$U_msg (your pending changes were kept)"
+            fi
         fi
+        [ -n "$back" ] && U_msg="$U_msg; $back"
         U_details=$(incoming "$U_head" "$U_up" "$U_behind")
         U_move="fast-forward$US$U_head$US$U_up"
         return 0
@@ -1802,8 +1853,21 @@ oldest_change() {
     return 0
 }
 
+change_word() {
+    # change_word XY -> the word for a pending change, from the two letters
+    # that "git status" gives it: new, deleted, changed, or conflict.
+    case "$1" in
+        "??")         printf 'new' ;;
+        U?|?U|AA|DD)  printf 'conflict' ;;
+        D?|?D)        printf 'deleted' ;;
+        A?|?A)        printf 'new' ;;
+        *)            printf 'changed' ;;
+    esac
+}
+
 pending_files() {
-    # pending_files LIMIT -> the pending files, "XY path" per line
+    # pending_files LIMIT -> the pending files, one per line with the word
+    # for its change: "changed  notes.txt"
     local limit="$1" record path flag n=0 more=0
     while IFS= read -r -d '' record; do
         case "$record" in
@@ -1814,7 +1878,7 @@ pending_files() {
         esac
         n=$(( n + 1 ))
         if [ "$n" -le "$limit" ]; then
-            printf '%s %s\n' "$flag" "$path"
+            printf '%-8s %s\n' "$(change_word "$flag")" "$path"
         else
             more=$(( more + 1 ))
         fi
@@ -2003,6 +2067,18 @@ list_pending() {
     return 0
 }
 
+pending_words() {
+    # pending_words LIMIT -> the first LIMIT files that list_pending wrote,
+    # each with the word for its change: "new      abstract.tex"
+    local limit="$1" flag path n=0
+    while IFS=$TAB read -r flag path; do
+        n=$(( n + 1 ))
+        [ "$n" -le "$limit" ] || break
+        printf '%-8s %s\n' "$(change_word "$flag")" "$path"
+    done < "$W/pending"
+    return 0
+}
+
 looks_secret() {
     # looks_secret NAME (in lower case) -> 0 when the name of the file is
     # one under which credentials are usually kept.
@@ -2126,7 +2202,7 @@ commit_pending() {
     # Commit every pending change of $REPO. On a refusal (a hook, a guard)
     # the staging area is put back as it was. Returns 0 when the commit
     # exists; C_why says why it does not.
-    local reason index old new shown=0 flag path rc
+    local reason index old new rc
     C_why=""
     list_pending
     if [ "$L_count" -eq 0 ]; then
@@ -2148,10 +2224,7 @@ commit_pending() {
     old=$(g rev-parse -q --verify HEAD 2>/dev/null)
     {
         printf '%s\n\n' "$(expand_message "$MESSAGE")"
-        while IFS=$TAB read -r flag path; do
-            shown=$(( shown + 1 ))
-            [ "$shown" -le 50 ] && printf '%s %s\n' "$flag" "$path"
-        done < "$W/pending"
+        pending_words 50
         [ "$L_count" -gt 50 ] && printf '... and %s more\n' $(( L_count - 50 ))
     } > "$W/message"
 
@@ -2393,6 +2466,22 @@ do_plan() {
         details "$extras"
         return 0
     fi
+    if [ "$P_behind" -gt 0 ] && [ "$DIVERGED" = "report" ]; then
+        # The last fetch saw commits on the server that this machine lacks,
+        # and the setting leaves them to the user: the push would be
+        # refused, and a commit made now would only widen the gap.
+        if [ "$pending" -gt 0 ]; then
+            text="; $(describe_pending): not committed"
+        fi
+        if [ "$P_ahead" -gt 0 ]; then
+            emit diverged 1 "$(plural "$P_ahead" commit) here and $P_behind on the server: left to you, since the push would be refused (git pull --rebase, or git pull --no-rebase)$text"
+        else
+            emit behind 1 "$(plural "$P_behind" "new commit") on the server: pull them first, then push ($PROG sync does both)$text"
+        fi
+        extras=$(other_branches)
+        details "$extras"
+        return 0
+    fi
 
     slug=$(remote_slug "$P_remote")
     net_setup
@@ -2431,7 +2520,7 @@ do_plan() {
     text="$text$(visibility_mark)"
     emit planned "$( [ -n "$block" ] && printf 1 || printf 0 )" "$text"
     if [ "$will_commit" -eq 1 ]; then
-        details "$(head -n 6 "$W/pending" | tr '\t' ' ')"
+        details "$(pending_words 6)"
         [ "$L_count" -gt 6 ] && detail "... and $(( L_count - 6 )) more"
         : > "$TMP/plan/$IDX.commit"
     fi
@@ -2447,7 +2536,7 @@ do_push() {
     # when the server has newer commits, take them as "pull" does and push
     # once more. A repository without a marker keeps the answer of the plan.
     local committed=0 note="" rc pushed mark nfiles=0 stays="" alert=0 made="" looked=0
-    local kind
+    local kind server=""
     if [ ! -e "$TMP/plan/$IDX.go" ]; then
         cat "$TMP/plan/$IDX.res"
         return 0
@@ -2495,6 +2584,7 @@ do_push() {
         return 0
     fi
     pushed=$P_ahead
+    server=$(g rev-parse -q --verify "$P_ref^{commit}" 2>/dev/null)
     push_once
     rc=$?
     if [ "$rc" -eq 1 ]; then
@@ -2515,6 +2605,7 @@ do_push() {
                     inspect
                     push_target && count_to_push
                     pushed=$P_ahead
+                    server=$(g rev-parse -q --verify "$P_ref^{commit}" 2>/dev/null)
                     push_once
                     rc=$?
                     ;;
@@ -2549,7 +2640,9 @@ do_push() {
             fi
             [ -n "$stays" ] && note="$note; $stays"
             emit pushed "$alert" "$note$mark"
-            record_move push "$P_remote" "${P_dst#refs/heads/}"
+            # The journal keeps where the branch of the server was and the
+            # commit that it received.
+            record_move push "$server" "$(g rev-parse -q --verify HEAD 2>/dev/null)"
             ;;
         3)
             emit interrupted 1 "stopped during the push$made"
@@ -2737,6 +2830,7 @@ reset_tally() {
         printf -v "N_$state" '%s' 0
     done
     TOTAL=0
+    SHOWN=0
     ATTENTION_LIST=""
 }
 
@@ -3624,15 +3718,17 @@ cmd_doctor() {
     AROUND=()
     doctor_around
     if [ "$PORCELAIN" -eq 0 ] && [ "${#AROUND[@]}" -gt 0 ]; then
-        put ""
+        [ "$SHOWN" -eq 1 ] && put ""
         put "Around the repositories:"
         for line in "${AROUND[@]}"; do
             put "  warning: $line"
         done
+        SHOWN=1
     fi
     if [ "$PORCELAIN" -eq 0 ] && [ "$OFFLINE" -eq 0 ] && ! have gh; then
-        put ""
+        [ "$SHOWN" -eq 1 ] && put ""
         put "GitHub was not asked: gh is not installed."
+        SHOWN=1
     fi
     finish
 }
@@ -3886,7 +3982,9 @@ Fetch every repository and bring its branch forward. For each repository:
                               pending changes that the new commits do not
                               touch stay as they are; if they would be
                               touched, git refuses, nothing changes, and the
-                              repository is reported as blocked
+                              repository is reported as blocked; a file
+                              deleted here that the new commits change comes
+                              back in its new version, and is named
   new commits on both sides   following gh-batch.diverged:
                                 report  (default) nothing is tried
                                 rebase  your commits are replayed on top
@@ -3936,7 +4034,9 @@ confirmation is asked. Without a terminal the run needs --yes.
 
 When the server has commits that this machine lacks, they are taken as
 "pull" would take them (see gh-batch.diverged) and the push is tried once
-more; a conflict there is undone and reported.
+more; a conflict there is undone and reported. With the default setting,
+report, a repository whose last fetch already showed such commits is
+neither committed nor pushed: pull first, or use "$PROG sync".
 
 Pending changes of a repository without remote, of a detached HEAD, or of
 a branch that exists on this machine only are reported, never committed.

@@ -14,7 +14,7 @@ https://github.com/dutykh/gh-batch
 
 ## A day with gh-batch
 
-**In the morning** one command fetches every repository and brings it forward. What arrived is listed, and the two repositories that could not be updated safely are named with the reason.
+**In the morning** one command fetches every repository and brings it forward. What arrived is listed, and the two repositories that could not be updated safely are named with the reason. Here the setting `gh-batch.diverged` is `rebase`, so that the commits made on this machine are replayed after the new ones of the server; by default they are only reported.
 
 ```text
 $ gh-batch pull
@@ -46,11 +46,11 @@ gh-batch push: 7 repositories under ~/workspace
 Plan:
   not committed lecture-notes       main     1 changed, 1 new: the new file .env looks like a secret: commit it by hand, or add it to .gitignore
   to do         teaching/exam-2026  main     commit 1 file, then push 1 commit
-        ?? solutions.md
+        new      solutions.md
   to do         thesis              main     commit 3 files, then push 1 commit
-        .M notes.txt
-        ?? abstract.tex
-        ?? figures/energy.pdf
+        changed  notes.txt
+        new      abstract.tex
+        new      figures/energy.pdf
   to do         wave-solver         main     push 2 commits  [PUBLIC]
 
 To do: a commit in 2 repositories, then a push from 3 repositories, 1 of them PUBLIC.
@@ -174,7 +174,7 @@ flowchart TD
     conflict -- yes --> undone["Undone, as it was:<br/>conflict"]
 ```
 
-When only the server has new commits, the branch is moved forward. Files with uncommitted changes that the new commits do not touch stay as they are. If they would be touched, or if an untracked or ignored file stands where a new file must be written, git refuses, nothing changes, and the repository is reported as blocked with the names of the files.
+When only the server has new commits, the branch is moved forward. Files with uncommitted changes that the new commits do not touch stay as they are. If they would be touched, or if an untracked or ignored file stands where a new file must be written, git refuses, nothing changes, and the repository is reported as blocked with the names of the files. A file deleted here without a commit is the one exception, because git does not count a missing file as a change it could overwrite: when the new commits change it, it comes back in its new version, and the report names it.
 
 When both sides have new commits, the setting `gh-batch.diverged` decides. With `report`, the default, nothing is tried. With `rebase`, your commits are replayed on top of those of the server; with `merge`, the two histories are joined by a merge commit. At the first conflict the attempt is undone at once, the tool verifies that the commit, the branch and every pending change are what they were, and the conflicting files are named together with the command to run by hand.
 
@@ -210,7 +210,7 @@ A repository opts out for good with `git config gh-batch.commit false`, typed in
 
 **The push itself** sends the branch where `git push` would send it and never forces. A branch that exists on this machine only is reported, and published only with `--set-upstream`. Only the branch that is checked out is pushed; another local branch with unpushed commits is named in the report. When GitHub answers that the account has no right to push, or that the repository is archived, nothing is tried.
 
-**When the server has newer commits**, they are first taken exactly as `pull` would take them, under the same setting `gh-batch.diverged`, and the push is tried once more. A conflict on the way is undone and reported, and the commit just made stays on this machine.
+**When the server has newer commits**, they are first taken exactly as `pull` would take them, under the same setting `gh-batch.diverged`, and the push is tried once more. A conflict on the way is undone and reported, and the commit just made stays on this machine. With the default setting `report`, a repository whose last fetch already showed such commits is neither committed nor pushed, since the push would be refused: the plan names it, and `gh-batch sync`, which pulls first, is the command for it.
 
 ### sync
 

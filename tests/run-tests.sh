@@ -397,8 +397,8 @@ if describe "status: what is pending"; then
     check "status: the report hides clean repositories and counts them" "got: $OUTPUT" \
         "$( ! contains "$OUTPUT" "  clean  " && contains "$OUTPUT" "1 clean" && contains "$OUTPUT" "Needs you: midmerge" && echo 0 || echo 1 )"
     gb status --long --only edited "$A"
-    check "status: --long lists the files, spaces kept" "got: $OUTPUT" \
-        "$( contains "$OUTPUT" "?? extra file.txt" && contains "$OUTPUT" ".M readme.txt" && echo 0 || echo 1 )"
+    check "status: --long lists the files in words, spaces kept" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "new      extra file.txt" && contains "$OUTPUT" "changed  readme.txt" && echo 0 || echo 1 )"
     gb status --verbose --only clean "$A"
     check "status: --verbose shows a clean repository" "got: $OUTPUT" \
         "$( contains "$OUTPUT" "clean" && [ "$RC" -eq 0 ] && echo 0 || echo 1 )"
@@ -460,6 +460,39 @@ if describe "pull: pending changes are kept or protect the repository"; then
     check "pull: an ignored file in the way is not overwritten" "got: $(st ignored), file: $(cat "$A/ignored/secret.cfg")" \
         "$( [ "$(st ignored)" = "blocked" ] && [ "$(cat "$A/ignored/secret.cfg")" = "my secret" ] && [ "$(state_of "$A/ignored")" = "$s_ignored" ] && echo 0 || echo 1 )"
     check "pull: a blocked repository makes the exit status 1" "got rc=$RC" "$( [ "$RC" -eq 1 ] && echo 0 || echo 1 )"
+fi
+
+if describe "pull: a file deleted here, and merge commits among the new ones"; then
+    world
+    repo back
+    repo kept
+    repo joined
+    commit "$B/back" other.txt "other" "Add another file"
+    publish "$B/back"
+    git -C "$A/back" pull -q --ff-only
+    commit "$B/back" readme.txt "server version" "Rewrite the readme"
+    publish "$B/back"
+    rm "$A/back/readme.txt"
+    printf 'my edit\n' >> "$A/back/other.txt"
+    commit "$B/kept" news.txt "news" "Add the news"
+    publish "$B/kept"
+    rm "$A/kept/readme.txt"
+    commit "$B/joined" main.txt "main" "Main work"
+    git -C "$B/joined" checkout -q -b side HEAD~1
+    commit "$B/joined" side.txt "side" "Side work"
+    git -C "$B/joined" checkout -q main
+    git -C "$B/joined" merge -q --no-ff -m "Join the side work" side
+    publish "$B/joined"
+    gb pull --porcelain --except joined "$A"
+    check "pull: a file deleted here and changed on the server comes back, and is named" "got: $(st back) $(msg back)" \
+        "$( [ "$(st back)" = "updated" ] && contains "$(msg back)" "came back: readme.txt" && contains "$(msg back)" "other pending changes were kept" && [ "$(cat "$A/back/readme.txt")" = "server version" ] && [ "$(tail -n 1 "$A/back/other.txt")" = "my edit" ] && echo 0 || echo 1 )"
+    check "pull: a file deleted here and left alone on the server stays deleted" "got: $(st kept) $(msg kept)" \
+        "$( [ "$(st kept)" = "updated" ] && contains "$(msg kept)" "(your pending changes were kept)" && ! contains "$(msg kept)" "came back" && [ ! -e "$A/kept/readme.txt" ] && [ -f "$A/kept/news.txt" ] && echo 0 || echo 1 )"
+    commit "$B/joined" last.txt "last" "Add the last file"
+    publish "$B/joined"
+    gb pull --only joined "$A"
+    check "pull: the merge commits that arrive are counted" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "4 new commits" && contains "$OUTPUT" "Side work" && contains "$OUTPUT" "Add the last file" && contains "$OUTPUT" "... and 1 merge commit" && echo 0 || echo 1 )"
 fi
 
 # --- pull: both sides moved ------------------------------------------------
@@ -870,18 +903,19 @@ if describe "push: --commit commits everything and pushes"; then
     git config --global gh-batch.machine "test-machine"
     gb push --commit --dry-run "$A"
     check "push --commit --dry-run: the files are listed, nothing is committed" "got: $OUTPUT" \
-        "$( contains "$OUTPUT" "commit 5 files, then push 2 commits" && contains "$OUTPUT" "new file.txt" && [ -n "$(git -C "$A/work" status --porcelain)" ] && echo 0 || echo 1 )"
+        "$( contains "$OUTPUT" "commit 5 files, then push 2 commits" && contains "$OUTPUT" "new      new file.txt" && contains "$OUTPUT" "deleted  gone.txt" && [ -n "$(git -C "$A/work" status --porcelain)" ] && echo 0 || echo 1 )"
+    server_before=$(git -C "$SRV/work.git" rev-parse main)
     gb push --commit --yes "$A"
     check "push --commit: one commit, pushed, the tree is clean" "got rc=$RC: $OUTPUT; status: $(git -C "$A/work" status --porcelain)" \
         "$( [ "$RC" -eq 0 ] && [ -z "$(git -C "$A/work" status --porcelain)" ] && [ "$(git -C "$SRV/work.git" rev-parse main)" = "$(head_of "$A/work")" ] && contains "$OUTPUT" "committed 5 files, pushed 2 commits" && echo 0 || echo 1 )"
     subject=$(git -C "$A/work" log -1 --format=%s)
     body=$(git -C "$A/work" log -1 --format=%b)
     check "push --commit: the message has the date, the machine and the files" "subject: $subject; body: $body" \
-        "$( [ "$subject" = "Work in progress, $(date '+%Y-%m-%d') (test-machine)" ] && contains "$body" "?? new file.txt" && contains "$body" ".D gone.txt" && contains "$body" "sub/deep.txt" && echo 0 || echo 1 )"
+        "$( [ "$subject" = "Work in progress, $(date '+%Y-%m-%d') (test-machine)" ] && contains "$body" "new      new file.txt" && contains "$body" "deleted  gone.txt" && contains "$body" "changed  readme.txt" && contains "$body" "sub/deep.txt" && echo 0 || echo 1 )"
     check "push --commit: an ignored file stays out" "it was committed" \
         "$( [ -z "$(git -C "$A/work" ls-files ignored.log)" ] && [ -f "$A/work/ignored.log" ] && echo 0 || echo 1 )"
     check "push --commit: the journal records the commit and the push" "journal: $(cat "$GH_BATCH_STATE_DIR/journal.tsv")" \
-        "$( contains "$(cat "$GH_BATCH_STATE_DIR/journal.tsv")" "${TAB}commit${TAB}" && contains "$(cat "$GH_BATCH_STATE_DIR/journal.tsv")" "${TAB}push${TAB}" && echo 0 || echo 1 )"
+        "$( contains "$(cat "$GH_BATCH_STATE_DIR/journal.tsv")" "${TAB}commit${TAB}" && contains "$(cat "$GH_BATCH_STATE_DIR/journal.tsv")" "${TAB}push${TAB}$A/work${TAB}$server_before${TAB}$(head_of "$A/work")" && echo 0 || echo 1 )"
     printf 'again\n' >> "$A/work/readme.txt"
     gb push --commit --yes -m "End of day %d, %n file(s) from %h, 100%%" "$A"
     check "push -m: the text of the message is chosen" "subject: $(git -C "$A/work" log -1 --format=%s)" \
@@ -991,6 +1025,27 @@ if describe "push: the server has newer commits"; then
     gb push --porcelain --yes --commit --diverged rebase --only evening "$A"
     check "push --commit: commit, take the server's commits, push" "got rc=$RC: $OUTPUT" \
         "$( [ "$(st evening)" = "pushed" ] && [ "$(git -C "$SRV/evening.git" rev-parse main)" = "$(head_of "$A/evening")" ] && [ -f "$A/evening/theirs.txt" ] && [ -z "$(git -C "$A/evening" status --porcelain)" ] && echo 0 || echo 1 )"
+fi
+
+if describe "push: a gap seen at the last fetch, under the default setting"; then
+    world
+    diverge split
+    repo late
+    commit "$B/late" theirs.txt "theirs" "Work of the other machine"
+    publish "$B/late"
+    printf 'pending\n' > "$A/late/pending.txt"
+    git -C "$A/split" fetch -q
+    git -C "$A/late" fetch -q
+    server_split=$(git -C "$SRV/split.git" rev-parse main)
+    remember split late
+    gb push --porcelain --yes --commit "$A"
+    check "push: under report a repository that has diverged is named, nothing is pushed" "got rc=$RC: $OUTPUT" \
+        "$( [ "$(st split)" = "diverged" ] && contains "$(msg split)" "left to you" && [ "$(git -C "$SRV/split.git" rev-parse main)" = "$server_split" ] && untouched split && [ "$RC" -eq 1 ] && echo 0 || echo 1 )"
+    check "push: under report nothing is committed where the server has new commits" "got: $(st late) $(msg late)" \
+        "$( [ "$(st late)" = "behind" ] && contains "$(msg late)" "pull them first" && contains "$(msg late)" "1 new: not committed" && untouched late && echo 0 || echo 1 )"
+    gb sync --porcelain --yes --commit --only late "$A"
+    check "push: sync takes the commits of the server, then commits and pushes" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ -f "$A/late/theirs.txt" ] && [ -z "$(git -C "$A/late" status --porcelain)" ] && [ "$(git -C "$SRV/late.git" rev-parse main)" = "$(head_of "$A/late")" ] && echo 0 || echo 1 )"
 fi
 
 if describe "push: a hook of the server side or of this side that refuses"; then
@@ -1627,6 +1682,13 @@ if describe "output: quiet, verbose and colour"; then
     gb fetch "$A"
     check "output: no colour in a pipe" "an escape was found" \
         "$( ! contains "$OUTPUT" "${esc}[" && echo 0 || echo 1 )"
+    nl=$(printf '\n_'); nl=${nl%_}
+    gb pull --only same "$A"
+    check "output: one blank line between the header and the summary" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "1 up to date" && ! contains "$OUTPUT" "$nl$nl$nl" && echo 0 || echo 1 )"
+    gb doctor --offline --only same "$A"
+    check "output: the same for the health check" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "1 healthy" && ! contains "$OUTPUT" "$nl$nl$nl" && echo 0 || echo 1 )"
     gb config
     check "config: the settings and their source" "got: $OUTPUT" \
         "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "diverged" && contains "$OUTPUT" "default" && echo 0 || echo 1 )"
