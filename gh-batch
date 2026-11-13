@@ -59,6 +59,25 @@ OPT_MESSAGE=""
 OPT_NOTIFY=0
 YES=0
 SET_UPSTREAM=0
+EXEC_CMD=()               # exec: the command and its arguments
+EXEC_LIMIT=0
+F_DIRTY=0                 # exec: keep only the repositories in these states
+F_CLEAN=0
+F_AHEAD=0
+F_BEHIND=0
+LOG_SINCE=""
+LOG_UNTIL=""
+LOG_AUTHOR=""
+LOG_DATE=""
+LOG_COMMITS=0
+LOG_REPOS=0
+ALL_AUTHORS=0
+OFFLINE=0                 # doctor: do not ask GitHub
+DOCTOR_DAYS=7             # doctor: pending work older than this is reported
+SHELL_NAME=""
+ROOTS_ABS=()              # the folders searched, as absolute paths
+ALL_REPOS=()              # every repository found, before --only and --except
+AROUND=()
 OWNERS=()                 # clone: the accounts or organisations named
 INTO=""
 MANIFEST_IN=""
@@ -260,6 +279,15 @@ last_line() {
     [ -n "$b" ] && text="$b; $c"
     [ -n "$a" ] && text="$a; $b; $c"
     one_line "$text" | redact | cut -c 1-300
+}
+
+clip() {
+    # clip TEXT WIDTH -> TEXT, cut with three dots when it is longer
+    if [ "${#1}" -gt "$2" ]; then
+        printf '%s...' "${1:0:$(( $2 - 3 ))}"
+    else
+        printf '%s' "$1"
+    fi
 }
 
 age_text() {
@@ -609,9 +637,11 @@ discover() {
         roots=(".")
     fi
     ROOT_LABEL=""
+    ROOTS_ABS=()
     for root in "${roots[@]}"; do
         [ -d "$root" ] || die "$EX_USAGE" "no such folder: $root"
         abs=$(cd "$root" && pwd) || die "$EX_USAGE" "cannot enter $root"
+        ROOTS_ABS+=("$abs")
         ROOT_LABEL="$ROOT_LABEL${ROOT_LABEL:+, }$(short_path "$abs")"
         if [ -e "$abs/.git" ]; then
             add_repo "$abs" "${abs##*/}"
@@ -619,6 +649,7 @@ discover() {
             walk "${abs%/}" "$DEPTH" ""
         fi
     done
+    ALL_REPOS=(${REPOS[@]+"${REPOS[@]}"})
     i=0
     while [ "$i" -lt "${#REPOS[@]}" ]; do
         if selected "${NAMES[$i]}"; then
@@ -873,6 +904,7 @@ state_label() {
         noupstream)   printf 'no upstream' ;;
         notcommitted) printf 'not committed' ;;
         planned)      printf 'to do' ;;
+        active)       printf 'commits' ;;
         *)            printf '%s' "$1" ;;
     esac
 }
@@ -880,8 +912,8 @@ state_label() {
 state_class() {
     case "$1" in
         updated|rebased|merged|pushed|cloned|ok)   printf 'good' ;;
-        uptodate|clean|present|skipped|nothing)    printf 'dim' ;;
-        ahead|behind|pending|stash|localonly|noupstream|detached|planned) printf 'info' ;;
+        uptodate|clean|present|skipped|nothing|healthy) printf 'dim' ;;
+        ahead|behind|pending|stash|localonly|noupstream|detached|planned|active|warning) printf 'info' ;;
         *)                                         printf 'bad' ;;
     esac
 }
@@ -891,6 +923,11 @@ state_phrase() {
     local n="$2"
     case "$1" in
         updated)      printf '%s updated' "$n" ;;
+        cloned)       printf '%s cloned' "$n" ;;
+        ok)           printf '%s ok' "$n" ;;
+        healthy)      printf '%s healthy' "$n" ;;
+        warning)      printf '%s with warnings' "$n" ;;
+        problem)      printf '%s with problems' "$n" ;;
         pushed)       printf '%s pushed' "$n" ;;
         planned)      printf '%s to do' "$n" ;;
         nothing)      printf '%s with nothing to push' "$n" ;;
@@ -923,7 +960,7 @@ state_phrase() {
     esac
 }
 
-STATE_ORDER="updated rebased merged pushed planned cloned ok uptodate clean nothing present pending stash ahead behind localonly noupstream detached skipped diverged conflict blocked rejected notcommitted failed gone unfinished halfupdated busy unreadable interrupted lost"
+STATE_ORDER="updated rebased merged pushed planned cloned ok uptodate clean nothing present pending stash ahead behind localonly noupstream detached skipped healthy warning problem diverged conflict blocked rejected notcommitted failed gone unfinished halfupdated busy unreadable interrupted lost"
 
 tally() {
     local var="N_$1"
@@ -1400,8 +1437,12 @@ fetch_upstream() {
 
 incoming() {
     # incoming OLD NEW COUNT -> the first new commits, one per line
-    local shown=5
-    g log --no-merges --format='%h %s' -n "$shown" "$1..$2" 2>/dev/null
+    local shown=5 line
+    while IFS= read -r line; do
+        [ -n "$line" ] && printf '%s\n' "$(clip "$line" 100)"
+    done <<EOF
+$(g log --no-merges --format='%h %s' -n "$shown" "$1..$2" 2>/dev/null)
+EOF
     if [ "$3" -gt "$shown" ]; then
         printf '... and %s more\n' $(( $3 - shown ))
     fi
@@ -2710,15 +2751,19 @@ notify() {
         return 0
     fi
     [ -s "$TMP/report.txt" ] || return 0
-    (
-        W="$TMP"
-        export GH_BATCH_COMMAND="$COMMAND"
-        export GH_BATCH_STATUS="$status"
-        # shellcheck disable=SC2016  # the inner shell expands its own arguments
-        spawn notify sh -c 'exec sh -c "$1" < "$2"' sh "$NOTIFY_CMD" "$TMP/report.txt"
-        await timed 60
-    ) </dev/null >/dev/null 2>&1 || warn "the notification command did not succeed"
+    ( notify_child "$status" ) </dev/null >/dev/null 2>&1 ||
+        warn "the notification command did not succeed"
     return 0
+}
+
+notify_child() {
+    # Runs in a subshell of its own: the command gets one minute.
+    W="$TMP"
+    export GH_BATCH_COMMAND="$COMMAND"
+    export GH_BATCH_STATUS="$1"
+    # shellcheck disable=SC2016  # the inner shell expands its own arguments
+    spawn notify sh -c 'exec sh -c "$1" < "$2"' sh "$NOTIFY_CMD" "$TMP/report.txt"
+    await timed 60
 }
 
 # ---------------------------------------------------------------------------
@@ -3176,6 +3221,500 @@ cmd_clone() {
     exit "$EX_OK"
 }
 
+# ---------------------------------------------------------------------------
+# log: the commits of a period across the repositories
+# ---------------------------------------------------------------------------
+
+do_log() {
+    # One line "L" per commit of the period on a local branch: epoch, date,
+    # short hash, author, subject.
+    local author line n=0 args
+    repo_begin || return 0
+    if [ "$R_unborn" -eq 1 ]; then
+        emit quiet 0 ""
+        return 0
+    fi
+    args=(log --branches HEAD --no-merges --reverse "--since=$LOG_SINCE"
+        "--date=format-local:$LOG_DATE" "--format=%ct%x1f%cd%x1f%h%x1f%an%x1f%s")
+    [ -n "$LOG_UNTIL" ] && args+=("--until=$LOG_UNTIL")
+    if [ "$ALL_AUTHORS" -eq 0 ]; then
+        author=$LOG_AUTHOR
+        [ -n "$author" ] || author=$(g config --get user.email 2>/dev/null)
+        [ -n "$author" ] && args+=(--fixed-strings "--author=$author")
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        n=$(( n + 1 ))
+        printf 'L%s%s\n' "$US" "$line"
+    done <<EOF
+$(g "${args[@]}" 2>/dev/null)
+EOF
+    if [ "$n" -eq 0 ]; then
+        emit quiet 0 ""
+    else
+        emit active 0 "$(plural "$n" commit)"
+    fi
+    return 0
+}
+
+render_log() {
+    # render_log INDEX FILE: the commits of one repository, oldest first.
+    local idx="$1" kind a b c d e state="" branch="" message="" n=0 shown=0 line limit=50 width=100
+    if [ "$LONG" -eq 1 ]; then
+        limit=1000000
+        width=1000000
+    fi
+    while IFS=$US read -r kind a b c d e; do
+        [ "$kind" = "S" ] && { state=$a; branch=$c; message=$d; }
+    done < "$2"
+    case "$state" in
+        ignored|skipped|"") return 0 ;;
+        unreadable)
+            TOTAL=$(( TOTAL + 1 ))
+            ATTENTION=1
+            put_repo unreadable 1 "${NAMES[$idx]}" "" "$message"
+            return 0
+            ;;
+    esac
+    TOTAL=$(( TOTAL + 1 ))
+    [ "$state" = "active" ] || return 0
+    LOG_REPOS=$(( LOG_REPOS + 1 ))
+    [ "$PORCELAIN" -eq 1 ] || put_repo active 0 "${NAMES[$idx]}" "$branch" "$message"
+    while IFS=$US read -r kind a b c d e; do
+        [ "$kind" = "L" ] || continue
+        n=$(( n + 1 ))
+        LOG_COMMITS=$(( LOG_COMMITS + 1 ))
+        if [ "$PORCELAIN" -eq 1 ]; then
+            printf '%s\t%s\t%s\t%s\t%s\n' "$a" "${REPOS[$idx]}" "$c" "$d" "$e"
+            continue
+        fi
+        [ "$n" -gt "$limit" ] && continue
+        shown=$n
+        line="$b  $c  $(clip "$e" "$width")"
+        [ "$ALL_AUTHORS" -eq 1 ] && line="$line  ($d)"
+        [ -n "$TMP" ] && printf '        %s\n' "$line" >> "$TMP/report.txt"
+        [ "$QUIET" -eq 1 ] || printf '        %s\n' "$line"
+    done < "$2"
+    if [ "$PORCELAIN" -eq 0 ] && [ "$n" -gt "$shown" ]; then
+        put "        ... and $(( n - shown )) more (all of them with --long)"
+    fi
+    return 0
+}
+
+cmd_log() {
+    local period="since $LOG_SINCE"
+    LOG_COMMITS=0; LOG_REPOS=0
+    if [ -z "$LOG_SINCE" ]; then
+        LOG_SINCE="midnight"
+        LOG_DATE="%H:%M"
+        period="today"
+    else
+        LOG_DATE="%Y-%m-%d %H:%M"
+    fi
+    [ -n "$LOG_UNTIL" ] && period="$period until $LOG_UNTIL"
+    begin_command read
+    no_repository && exit "$EX_OK"
+    pool do_log log render_log
+    if [ "$PORCELAIN" -eq 0 ]; then
+        [ "$LOG_COMMITS" -gt 0 ] && put ""
+        if [ "$LOG_COMMITS" -eq 0 ]; then
+            put "No commit $period in the $(plural "$TOTAL" repository) under $ROOT_LABEL."
+        else
+            put "$(plural "$LOG_COMMITS" commit) in $(plural "$LOG_REPOS" repository) $period ($TOTAL searched under $ROOT_LABEL)."
+        fi
+    fi
+    [ "$STOP" -eq 1 ] && exit "$EX_INTERRUPT"
+    [ "$ATTENTION" -eq 1 ] && exit "$EX_ATTENTION"
+    exit "$EX_OK"
+}
+
+# ---------------------------------------------------------------------------
+# exec: a command of the user in every repository
+# ---------------------------------------------------------------------------
+
+chosen_by_state() {
+    # The filters --dirty, --clean, --ahead and --behind, for the repository
+    # just inspected. Without a filter every repository is chosen.
+    local pending=$(( R_tracked + R_untracked + R_unmerged ))
+    [ "$F_DIRTY" -eq 1 ] && [ "$pending" -eq 0 ] && return 1
+    [ "$F_CLEAN" -eq 1 ] && [ "$pending" -gt 0 ] && return 1
+    [ "$F_AHEAD" -eq 1 ] && [ "${R_ahead:-0}" -eq 0 ] && return 1
+    [ "$F_BEHIND" -eq 1 ] && [ "${R_behind:-0}" -eq 0 ] && return 1
+    return 0
+}
+
+do_exec() {
+    # Run the command in the repository, its two outputs together, with the
+    # path and the name of the repository in the environment.
+    local rc
+    repo_begin || return 0
+    if ! chosen_by_state; then
+        emit ignored 0 ""
+        return 0
+    fi
+    export GH_BATCH_REPO="$REPO"
+    export GH_BATCH_NAME="$NAME"
+    # shellcheck disable=SC2016  # the inner shell expands its own arguments
+    spawn exec sh -c 'cd "$1" && shift && unset GIT_OPTIONAL_LOCKS && exec "$@" 2>&1' sh "$REPO" "${EXEC_CMD[@]}"
+    await net "$EXEC_LIMIT"
+    rc=$?
+    case "$rc" in
+        0)   emit ok 0 "" ;;
+        124) emit failed 1 "no end within $EXEC_LIMIT s: the command was stopped" ;;
+        125) emit failed 1 "the command waited for the terminal and was stopped" ;;
+        130) emit interrupted 1 "stopped" ;;
+        127) emit failed 1 "the command was not found" ;;
+        *)   emit failed 1 "exit status $rc" ;;
+    esac
+    # The first 500 lines of what the command wrote, as lines of detail.
+    awk -v us="$US" '
+        NR <= 500 { gsub(/[\r\t\037]/, " "); print "D" us $0 }
+        END { if (NR > 500) print "D" us "... and " (NR - 500) " more lines" }
+    ' "$OUT"
+    return 0
+}
+
+render_exec() {
+    # render_exec INDEX FILE: a repository is shown when the command wrote
+    # something there or failed; the others are only counted.
+    local idx="$1"
+    read_record "$2"
+    [ "$REC_state" = "ignored" ] && return 0
+    TOTAL=$(( TOTAL + 1 ))
+    tally "$REC_state"
+    if [ "$REC_attention" = 1 ]; then
+        ATTENTION=1
+        ATTENTION_LIST="$ATTENTION_LIST${ATTENTION_LIST:+, }${NAMES[$idx]} ($(state_label "$REC_state"))"
+    fi
+    if [ "$PORCELAIN" -eq 1 ]; then
+        printf '%s\t%s\t%s\t%s\n' "$REC_state" "${REPOS[$idx]}" "$REC_branch" "$REC_message"
+        return 0
+    fi
+    if [ "${#REC_lines[@]}" -eq 0 ] && [ "$REC_attention" != 1 ] && [ "$VERBOSE" -eq 0 ]; then
+        return 0
+    fi
+    print_record "$idx"
+    return 0
+}
+
+cmd_exec() {
+    local name
+    [ "${#EXEC_CMD[@]}" -gt 0 ] ||
+        die "$EX_USAGE" "exec needs a command: $PROG exec [options] [folder ...] -- COMMAND [ARGUMENT ...]"
+    EXEC_LIMIT=${OPT_TIMEOUT:-0}
+    setup_colour
+    setup_run
+    for name in $(git rev-parse --local-env-vars 2>/dev/null); do
+        unset "$name"
+    done
+    export GIT_OPTIONAL_LOCKS=0
+    discover
+    no_repository && exit "$EX_OK"
+    header ""
+    pool do_exec exec render_exec
+    finish
+}
+
+# ---------------------------------------------------------------------------
+# doctor: what is wrong, or will be, in the repositories and around them
+# ---------------------------------------------------------------------------
+
+finding() {
+    # finding LEVEL TEXT: one line of the diagnosis; a problem needs the
+    # user, a warning is worth knowing.
+    printf 'D%s%s: %s\n' "$US" "$1" "$(one_line "$2")"
+    [ "$1" = "problem" ] && D_problems=$(( D_problems + 1 ))
+    [ "$1" = "warning" ] && D_warnings=$(( D_warnings + 1 ))
+    return 0
+}
+
+doctor_remotes() {
+    # The remotes of the repository: an address that carries a password, one
+    # that travels unencrypted, and what GitHub says of each.
+    local name url slug answer now archived seen="" authority k=0 fresh
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        url=$(g config --get "remote.$name.url" 2>/dev/null)
+        case "$url" in
+            http://*|https://*)
+                authority=${url#*://}
+                authority=${authority%%/*}
+                case "$authority" in
+                    *:*@*|ghp_*@*|gho_*@*|ghs_*@*|github_pat_*@*|glpat-*@*)
+                        finding problem "the address of the remote $name holds a password or a token: keep it in a credential helper instead" ;;
+                esac
+                ;;
+        esac
+        case "$url" in
+            http://*|git://*) finding warning "the remote $name is reached without encryption ($(printf '%s' "${url%%://*}"))" ;;
+        esac
+        [ "$OFFLINE" -eq 1 ] && continue
+        have gh || continue
+        slug=$(github_slug "$(g remote get-url "$name" 2>/dev/null)")
+        [ -n "$slug" ] || slug=$(github_slug "$url")
+        [ -n "$slug" ] || continue
+        case "$seen " in *" $slug "*) continue ;; esac
+        seen="$seen $slug"
+        k=$(( k + 1 ))
+        spawn "github$k" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api "repos/$slug" \
+            --jq '[.full_name, (.archived|tostring)] | join("\u001f")'
+        if await net 20; then
+            now=""; archived=""
+            IFS=$US read -r now archived < "$OUT" || true
+            answer=$(printf '%s' "$now" | tr '[:upper:]' '[:lower:]')
+            if [ -n "$answer" ] && [ "$answer" != "$slug" ]; then
+                case "$url" in
+                    *://*) fresh="https://${GH_HOST:-github.com}/$now" ;;
+                    *)     fresh="git@${GH_HOST:-github.com}:$now.git" ;;
+                esac
+                finding warning "the remote $name moved on GitHub to $now: git remote set-url $name $fresh"
+            fi
+            [ "$archived" = "true" ] && finding warning "$now is archived on GitHub: it takes no push"
+        elif grep -q -i -E 'not found|404' "$ERR" 2>/dev/null; then
+            finding problem "GitHub does not know $slug (remote $name): deleted, renamed without a trace, or closed to this account"
+        else
+            finding warning "GitHub could not be asked about $slug: $(last_line "$ERR")"
+        fi
+    done <<EOF
+$(g remote 2>/dev/null)
+EOF
+    return 0
+}
+
+do_doctor() {
+    local age first stashes limit=$(( DOCTOR_DAYS * 86400 )) state="healthy" attention=0 text=""
+    D_problems=0; D_warnings=0
+    GIT=(git -C "$REPO" -c credential.interactive=false -c submodule.recurse=false)
+    if ! inspect; then
+        if [ -n "$R_problem" ]; then
+            emit problem 1 "git cannot read it: $R_problem"
+        else
+            emit ignored 0 ""
+        fi
+        return 0
+    fi
+    repo_settings
+    if [ "$R_worktree" -eq 1 ]; then
+        emit skipped 0 "a linked worktree: its main repository is the one examined"
+        return 0
+    fi
+    net_setup
+    {
+        [ "$R_skip" -eq 1 ] && finding note "set aside by gh-batch.skip: no command touches it"
+        [ "$R_pullonly" -eq 1 ] && finding note "update-only (gh-batch.pullOnly): never committed or pushed"
+        [ -n "$R_operation" ] && finding problem "$R_operation is in progress: finish or abort it"
+        [ "$R_unmerged" -gt 0 ] && finding problem "$(plural "$R_unmerged" file) with unresolved conflicts"
+        [ "$R_busy" -eq 1 ] && finding warning "an index.lock is present: a git process is at work, or died there"
+        if [ "$R_remotes" -eq 0 ]; then
+            finding warning "no remote: the repository exists on this machine only"
+        elif [ "$R_detached" -eq 1 ]; then
+            finding warning "HEAD is detached: new commits would belong to no branch"
+        elif [ "$R_unborn" -eq 0 ] && [ -z "$R_upstream" ]; then
+            finding warning "the branch $R_branch follows no branch of a server: it is never pulled or pushed"
+        elif [ "$R_unborn" -eq 0 ] && [ -z "$R_ahead" ]; then
+            finding problem "the branch $R_upstream that $R_branch follows is gone"
+        fi
+        if [ $(( R_tracked + R_untracked )) -gt 0 ]; then
+            age=$(oldest_change)
+            if [ -n "$age" ] && [ "$age" -gt "$limit" ]; then
+                finding warning "$(describe_pending) pending, the oldest since $(age_text "$age")"
+            fi
+        fi
+        if is_uint "${R_ahead:-}" && [ "$R_ahead" -gt 0 ]; then
+            first=""
+            IFS= read -r first < <(g log --format=%ct --reverse "$R_upstream..HEAD" 2>/dev/null)
+            if is_uint "$first" && [ $(( NOW - first )) -gt "$limit" ]; then
+                finding warning "$(plural "$R_ahead" commit) not pushed, the oldest since $(age_text $(( NOW - first )))"
+            fi
+        fi
+        stashes=$(count_stashes)
+        [ "$stashes" -gt 0 ] && finding warning "$(plural "$stashes" stash): what is stashed stays on this machine"
+        [ "$R_shallow" -eq 1 ] && finding note "a shallow clone: its history is cut"
+        if ! g var GIT_COMMITTER_IDENT >/dev/null 2>&1; then
+            finding warning "git does not know your name and e-mail here: no commit can be made"
+        fi
+        if grep -qs 'filter=lfs' "$REPO/.gitattributes" && ! have git-lfs; then
+            finding warning "it keeps large files with git-lfs, which is not installed"
+        fi
+        doctor_remotes
+    } > "$W/findings"
+    if [ "$D_problems" -gt 0 ]; then
+        state="problem"; attention=1
+        text="$(plural "$D_problems" problem)"
+        [ "$D_warnings" -gt 0 ] && text="$text, $(plural "$D_warnings" warning)"
+    elif [ "$D_warnings" -gt 0 ]; then
+        state="warning"
+        text="$(plural "$D_warnings" warning)"
+    fi
+    emit "$state" "$attention" "$text"
+    cat "$W/findings"
+    return 0
+}
+
+doctor_around() {
+    # What is wrong around the repositories: folders and files of the
+    # workspace that no repository holds, leftovers of interrupted runs.
+    local root entry base covered i n
+    for root in ${ROOTS_ABS[@]+"${ROOTS_ABS[@]}"}; do
+        [ -e "$root/.git" ] && continue
+        n=0
+        for entry in "$root"/*; do
+            [ -e "$entry" ] || continue
+            base=${entry##*/}
+            if [ ! -d "$entry" ]; then
+                n=$(( n + 1 ))
+                continue
+            fi
+            [ -e "$entry/.git" ] && continue
+            covered=0
+            i=0
+            while [ "$i" -lt "${#ALL_REPOS[@]}" ]; do
+                case "${ALL_REPOS[$i]}" in
+                    "$entry"/*) covered=1; break ;;
+                esac
+                i=$(( i + 1 ))
+            done
+            if [ "$covered" -eq 0 ] && [ -n "$(ls -A "$entry" 2>/dev/null)" ]; then
+                AROUND+=("the folder $(short_path "$entry") holds no git repository within $(plural "$DEPTH" level): git saves nothing of it")
+            fi
+        done
+        [ "$n" -gt 0 ] &&
+            AROUND+=("$(plural "$n" file) directly in $(short_path "$root") belong to no repository")
+        for entry in "$root"/.gh-batch-clone.* "$root"/*/.gh-batch-clone.*; do
+            [ -d "$entry" ] || continue
+            AROUND+=("$(short_path "$entry") is the leftover of an interrupted clone: the next clone removes it")
+        done
+    done
+    return 0
+}
+
+cmd_doctor() {
+    local line
+    is_uint "$DOCTOR_DAYS" || die "$EX_USAGE" "--days takes a number of days, not '$DOCTOR_DAYS'"
+    begin_command read
+    no_repository && exit "$EX_OK"
+    header ""
+    pool do_doctor doctor render
+    AROUND=()
+    doctor_around
+    if [ "$PORCELAIN" -eq 0 ] && [ "${#AROUND[@]}" -gt 0 ]; then
+        put ""
+        put "Around the repositories:"
+        for line in "${AROUND[@]}"; do
+            put "  warning: $line"
+        done
+    fi
+    if [ "$PORCELAIN" -eq 0 ] && [ "$OFFLINE" -eq 0 ] && ! have gh; then
+        put ""
+        put "GitHub was not asked: gh is not installed."
+    fi
+    finish
+}
+
+# ---------------------------------------------------------------------------
+# completion: the words the shell proposes
+# ---------------------------------------------------------------------------
+
+cmd_completion() {
+    case "${SHELL_NAME:-}" in
+        bash)
+            cat <<'EOF'
+# bash completion for gh-batch
+_gh_batch() {
+    local cur prev words cword commands options
+    cur=${COMP_WORDS[COMP_CWORD]}
+    prev=${COMP_WORDS[COMP_CWORD-1]}
+    commands="pull push sync clone status fetch log exec doctor list config completion help"
+    if [ "$COMP_CWORD" -eq 1 ]; then
+        COMPREPLY=($(compgen -W "$commands --help --version" -- "$cur"))
+        return 0
+    fi
+    case "$prev" in
+        --diverged) COMPREPLY=($(compgen -W "report rebase merge" -- "$cur")); return 0 ;;
+        --color|--colour) COMPREPLY=($(compgen -W "auto always never" -- "$cur")); return 0 ;;
+        --into) COMPREPLY=($(compgen -d -- "$cur")); return 0 ;;
+        --manifest) COMPREPLY=($(compgen -f -- "$cur")); return 0 ;;
+        help) COMPREPLY=($(compgen -W "$commands" -- "$cur")); return 0 ;;
+        completion) COMPREPLY=($(compgen -W "bash zsh" -- "$cur")); return 0 ;;
+    esac
+    options="--jobs --depth --only --except --dry-run --yes --verbose --quiet --porcelain --timeout --color --help"
+    case "${COMP_WORDS[1]}" in
+        pull|fetch) options="$options --diverged --notify" ;;
+        push|sync)  options="$options --commit --no-commit --message --set-upstream --diverged --notify" ;;
+        clone)      options="$options --into --manifest --update --since --no-forks --no-archived --flat --by-owner" ;;
+        status)     options="$options --long" ;;
+        log)        options="$options --since --until --author --all-authors --long" ;;
+        exec)       options="$options --dirty --clean --ahead --behind" ;;
+        doctor)     options="$options --offline --days" ;;
+        list)       options="$options --absolute --manifest" ;;
+    esac
+    case "$cur" in
+        -*) COMPREPLY=($(compgen -W "$options" -- "$cur")) ;;
+        *)  COMPREPLY=($(compgen -d -- "$cur")) ;;
+    esac
+    return 0
+}
+complete -o filenames -F _gh_batch gh-batch
+EOF
+            ;;
+        zsh)
+            cat <<'EOF'
+#compdef gh-batch
+# zsh completion for gh-batch
+_gh_batch() {
+    local -a commands
+    commands=(
+        'pull:fetch every repository and bring it forward'
+        'push:commit what is pending when asked to, then push'
+        'sync:pull, then push'
+        'clone:clone what is missing from an account or a layout file'
+        'status:what is pending in every repository'
+        'fetch:look at the servers and say what pull would do'
+        'log:the commits of a period across the repositories'
+        'exec:run a command in every repository'
+        'doctor:health check of the repositories and their remotes'
+        'list:the repositories found'
+        'config:the settings in force'
+        'completion:shell completion for bash or zsh'
+        'help:help for one command'
+    )
+    if (( CURRENT == 2 )); then
+        _describe 'command' commands
+        return
+    fi
+    case "${words[2]}" in
+        help)       _describe 'command' commands ;;
+        completion) _values 'shell' bash zsh ;;
+        *)
+            _arguments \
+                '(-j --jobs)'{-j,--jobs}'[repositories handled at the same time]:number:' \
+                '--depth[levels searched below each folder]:number:' \
+                '*--only[keep the names that match]:pattern:' \
+                '*--except[leave out the names that match]:pattern:' \
+                '(-n --dry-run)'{-n,--dry-run}'[show what would be done]' \
+                '(-y --yes)'{-y,--yes}'[do not ask before changing repositories]' \
+                '(-v --verbose)'{-v,--verbose}'[show every repository]' \
+                '(-q --quiet)'{-q,--quiet}'[show only what needs you]' \
+                '--porcelain[one line per repository, fields separated by tabs]' \
+                '--diverged[what to do when both sides have commits]:how:(report rebase merge)' \
+                '--commit[commit pending changes before the push]' \
+                '--no-commit[push only what is committed already]' \
+                '--into[the folder that receives the clones]:folder:_files -/' \
+                '--manifest[a layout file]:file:_files' \
+                '*:folder:_files -/'
+            ;;
+    esac
+}
+_gh_batch "$@"
+EOF
+            ;;
+        *)
+            die "$EX_USAGE" "completion exists for bash and zsh: $PROG completion bash"
+            ;;
+    esac
+    exit "$EX_OK"
+}
+
 cmd_list() {
     local i=0 url branch
     setup_colour
@@ -3270,8 +3809,12 @@ COMMANDS
               of a layout file written by "list --manifest"
   status      what is pending in every repository, without touching the network
   fetch       look at the servers, change no file, say what pull would do
+  log         the commits of today, or of a period, across the repositories
+  exec        run a command in every repository
+  doctor      health check of the repositories, their remotes and the folder
   list        the repositories found; --manifest writes their layout
   config      the settings in force and where each comes from
+  completion  the completion script for bash or zsh
   help        help for one command, for example: $PROG help pull
 
 COMMON OPTIONS
@@ -3477,6 +4020,107 @@ OPTIONS
 EOF
 }
 
+help_log() {
+    cat <<EOF
+$PROG log [options] [folder ...]
+
+The commits of a period across all the repositories, each repository with
+its commits in the order they were made. Without an option: your commits of
+today, on every local branch. "Yours" means the e-mail address that git
+uses in each repository (user.email).
+
+OPTIONS
+      --since WHEN     the start of the period, as git reads it: yesterday,
+                       monday, "2 weeks ago", 2026-11-01 (default: midnight)
+      --until WHEN     the end of the period
+      --author TEXT    the commits of another author (a part of the name or
+                       of the address)
+      --all-authors    the commits of everybody
+  -l, --long           every commit and its whole first line; by default at
+                       most 50 per repository, cut at 100 characters
+      --porcelain      one line per commit, fields separated by tabs: time
+                       in seconds, path, short hash, author, subject
+  and the common options, see: $PROG help
+EOF
+}
+
+help_exec() {
+    cat <<EOF
+$PROG exec [options] [--] COMMAND [ARGUMENT ...]
+
+Run a command in every repository, several at a time, and print what it
+wrote under the name of each repository, in the order of the folders. The
+command starts at "--", or at the first word that is not an option, and
+keeps the rest of the line. It runs in the top folder of the repository,
+without a terminal, with GH_BATCH_REPO (the path) and GH_BATCH_NAME (the
+name) in its environment. A repository where it wrote nothing and succeeded
+is only counted.
+
+  $PROG exec git gc --quiet
+  $PROG exec --dirty -- git diff --stat
+  $PROG exec --in ~/papers -- sh -c 'ls *.tex 2>/dev/null | wc -l'
+
+OPTIONS
+      --in DIR       a folder to search, repeatable (a folder cannot be
+                     given as a plain word here: the command starts there)
+      --dirty        only the repositories with pending changes
+      --clean        only those without
+      --ahead        only those with commits to push
+      --behind       only those behind the last fetch
+      --timeout SEC  stop a command that runs longer (default: no limit)
+  and the common options, see: $PROG help
+
+The exit status is 1 when the command failed somewhere.
+EOF
+}
+
+help_doctor() {
+    cat <<EOF
+$PROG doctor [options] [folder ...]
+
+Health check. Nothing is changed. For each repository:
+
+  problems   an operation left in progress, unresolved conflicts, a branch
+             whose upstream is gone, a password or a token written in the
+             address of a remote, a repository that GitHub does not know,
+             a folder that git refuses to read
+  warnings   no remote (the repository exists on this machine only), a
+             detached HEAD, a branch that follows nothing, pending changes
+             or unpushed commits older than a week, stashes, a remote that
+             was renamed or transferred on GitHub (with the command that
+             corrects its address), an archived repository, git-lfs needed
+             and missing
+
+And around the repositories: the folders of the workspace that hold no
+repository, the loose files, the leftovers of an interrupted clone.
+
+GitHub is asked through gh, one question per repository; without gh, or
+with --offline, those checks are left out.
+
+OPTIONS
+      --offline    do not ask GitHub
+      --days N     the age from which pending work is reported (default 7)
+  -v, --verbose    show the healthy repositories and the notes too
+  and the common options, see: $PROG help
+
+The exit status is 1 when there is a problem, 0 with warnings only.
+EOF
+}
+
+help_completion() {
+    cat <<EOF
+$PROG completion bash|zsh
+
+Print the completion script of the shell named. For bash:
+
+  $PROG completion bash > ~/.local/share/bash-completion/completions/$PROG
+
+For zsh, into a folder of \$fpath:
+
+  $PROG completion zsh > ~/.zsh/completions/_$PROG
+EOF
+}
+
 help_list() {
     cat <<EOF
 $PROG list [options] [folder ...]
@@ -3513,6 +4157,10 @@ show_help() {
         clone)   help_clone ;;
         status)  help_status ;;
         fetch)   help_fetch ;;
+        log)     help_log ;;
+        exec)    help_exec ;;
+        doctor)  help_doctor ;;
+        completion) help_completion ;;
         list)    help_list ;;
         config)  help_config ;;
         *)       die "$EX_USAGE" "no such command: $1 (see $PROG help)" ;;
@@ -3557,6 +4205,20 @@ parse_options() {
             --into=*)       INTO=${1#*=}; shift ;;
             --since)        need_value "$@"; SINCE=$2; shift 2 ;;
             --since=*)      SINCE=${1#*=}; shift ;;
+            --until)        need_value "$@"; LOG_UNTIL=$2; shift 2 ;;
+            --until=*)      LOG_UNTIL=${1#*=}; shift ;;
+            --author)       need_value "$@"; LOG_AUTHOR=$2; shift 2 ;;
+            --author=*)     LOG_AUTHOR=${1#*=}; shift ;;
+            --all-authors)  ALL_AUTHORS=1; shift ;;
+            --dirty)        F_DIRTY=1; shift ;;
+            --clean)        F_CLEAN=1; shift ;;
+            --ahead)        F_AHEAD=1; shift ;;
+            --behind)       F_BEHIND=1; shift ;;
+            --offline)      OFFLINE=1; shift ;;
+            --days)         need_value "$@"; DOCTOR_DAYS=$2; shift 2 ;;
+            --days=*)       DOCTOR_DAYS=${1#*=}; shift ;;
+            --in)           need_value "$@"; ARGS+=("$2"); shift 2 ;;
+            --in=*)         ARGS+=("${1#*=}"); shift ;;
             --no-forks)     NO_FORKS=1; shift ;;
             --no-archived)  NO_ARCHIVED=1; shift ;;
             --flat)         LAYOUT="flat"; shift ;;
@@ -3580,9 +4242,22 @@ parse_options() {
             --no-color|--no-colour) COLOR_MODE="never"; shift ;;
             -h|--help)      show_help "$COMMAND"; exit "$EX_OK" ;;
             --version)      printf '%s %s\n' "$PROG" "$GH_BATCH_VERSION"; exit "$EX_OK" ;;
-            --)             shift; while [ "$#" -gt 0 ]; do positional "$1"; shift; done ;;
+            --)
+                shift
+                if [ "$COMMAND" = "exec" ]; then
+                    EXEC_CMD=("$@")
+                    return 0
+                fi
+                while [ "$#" -gt 0 ]; do positional "$1"; shift; done ;;
             -?*)            die "$EX_USAGE" "unknown option: $1 (see $PROG help${COMMAND:+ $COMMAND})" ;;
-            *)              positional "$1"; shift ;;
+            *)
+                # The command of "exec" starts at its first word and keeps
+                # the rest of the line, options included.
+                if [ "$COMMAND" = "exec" ]; then
+                    EXEC_CMD=("$@")
+                    return 0
+                fi
+                positional "$1"; shift ;;
         esac
     done
 }
@@ -3590,6 +4265,7 @@ parse_options() {
 positional() {
     case "$COMMAND" in
         help)   HELP_TOPIC=$1 ;;
+        completion) SHELL_NAME=$1 ;;
         clone)  OWNERS+=("$1") ;;
         config) die "$EX_USAGE" "config takes no argument" ;;
         *)      ARGS+=("$1") ;;
@@ -3605,7 +4281,7 @@ main() {
     COMMAND=$1
     shift
     case "$COMMAND" in
-        pull|push|sync|clone|status|fetch|list|config|help) ;;
+        pull|push|sync|clone|status|fetch|log|exec|doctor|list|config|completion|help) ;;
         *) die "$EX_USAGE" "no such command: $COMMAND (see $PROG help)" ;;
     esac
     parse_options "$@"
@@ -3613,6 +4289,7 @@ main() {
         show_help "$HELP_TOPIC"
         exit "$EX_OK"
     fi
+    [ "$COMMAND" = "completion" ] && cmd_completion
     check_git
     load_settings
     resolve_settings
@@ -3621,6 +4298,9 @@ main() {
         push)       cmd_push ;;
         sync)       cmd_sync ;;
         clone)      cmd_clone ;;
+        log)        LOG_SINCE=$SINCE; cmd_log ;;
+        exec)       cmd_exec ;;
+        doctor)     cmd_doctor ;;
         status)     cmd_status ;;
         list)       cmd_list ;;
         config)     cmd_config ;;

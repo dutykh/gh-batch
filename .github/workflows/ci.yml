@@ -1,0 +1,82 @@
+# Continuous integration for gh-batch.
+#
+# Author: Dr. Denys Dutykh (Mathematics Department, Khalifa University of
+#         Science and Technology, Abu Dhabi, UAE).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint
+        run: shellcheck -x gh-batch install.sh tests/run-tests.sh tests/stub/gh tests/stub/hanging-ssh
+
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show the tools
+        run: |
+          bash --version | head -n1
+          git --version
+      - name: Run the offline test suite
+        run: tests/run-tests.sh
+      - name: Check that the help text renders
+        run: |
+          ./gh-batch --version
+          ./gh-batch help
+          ./gh-batch help push
+
+  macos-bash-3-2:
+    # The bash that macOS ships (3.2), with the BSD tools and the git of
+    # Apple, for the program and for the test suite.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Put /bin/bash first on PATH
+        run: |
+          mkdir -p "$RUNNER_TEMP/oldbash"
+          ln -s /bin/bash "$RUNNER_TEMP/oldbash/bash"
+          echo "$RUNNER_TEMP/oldbash" >> "$GITHUB_PATH"
+      - name: Run the offline test suite under bash 3.2
+        run: |
+          bash --version | head -n1
+          /bin/bash tests/run-tests.sh
+
+  without-process-groups:
+    # The fallback used where job control cannot isolate a child process.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the plain cases without process groups
+        env:
+          GH_BATCH_ISOLATE: none
+        run: tests/run-tests.sh pull
+
+  installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install into a scratch prefix, run, uninstall
+        run: |
+          ./install.sh --prefix "$RUNNER_TEMP/prefix"
+          "$RUNNER_TEMP/prefix/bin/gh-batch" --version
+          test -s "$RUNNER_TEMP/prefix/share/bash-completion/completions/gh-batch"
+          ./install.sh --prefix "$RUNNER_TEMP/prefix" --uninstall
+          test ! -e "$RUNNER_TEMP/prefix/bin/gh-batch"
+          ./install.sh --prefix "$RUNNER_TEMP/prefix" --link
+          test -L "$RUNNER_TEMP/prefix/bin/gh-batch"
+          "$RUNNER_TEMP/prefix/bin/gh-batch" --version

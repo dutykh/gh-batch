@@ -87,7 +87,10 @@ server() {
     git init -q "$seed"
     printf 'first line\n' > "$seed/readme.txt"
     git -C "$seed" add readme.txt
-    git -C "$seed" commit -q -m "Start $name"
+    # The first commit is dated in the past, so that "today" holds only what
+    # a test does.
+    GIT_AUTHOR_DATE="2021-06-01T12:00:00" GIT_COMMITTER_DATE="2021-06-01T12:00:00" \
+        git -C "$seed" commit -q -m "Start $name"
     git -C "$seed" push -q "$SRV/$name.git" HEAD:refs/heads/main
     rm -rf "$seed"
 }
@@ -133,6 +136,33 @@ state_of() {
             cksum "$f"
         done
     )
+}
+
+remember() {
+    # remember NAME...: keep the state of these repositories of machine A.
+    local r
+    for r in "$@"; do
+        state_of "$A/$r" > "$WORLD/before.$r"
+    done
+}
+
+untouched() {
+    # untouched NAME... -> 0 when each is exactly as "remember" saw it
+    local r
+    for r in "$@"; do
+        [ "$(state_of "$A/$r")" = "$(cat "$WORLD/before.$r")" ] || return 1
+    done
+    return 0
+}
+
+entries() {
+    # entries DIR -> the names in DIR, the hidden ones too, on one line
+    local e out=""
+    for e in "$1"/* "$1"/.[!.]*; do
+        [ -e "$e" ] || [ -L "$e" ] || continue
+        out="$out${e##*/} "
+    done
+    printf '%s' "$out"
 }
 
 operation_in_progress() {
@@ -428,7 +458,7 @@ if describe "pull: pending changes are kept or protect the repository"; then
     check "pull: an untracked file in the way blocks, nothing changes" "got: $(st untracked)" \
         "$( [ "$(st untracked)" = "blocked" ] && [ "$(state_of "$A/untracked")" = "$s_untracked" ] && echo 0 || echo 1 )"
     check "pull: an ignored file in the way is not overwritten" "got: $(st ignored), file: $(cat "$A/ignored/secret.cfg")" \
-        "$( [ "$(st ignored)" = "blocked" ] && [ "$(cat "$A/ignored/secret.cfg")" = "my secret" ] && echo 0 || echo 1 )"
+        "$( [ "$(st ignored)" = "blocked" ] && [ "$(cat "$A/ignored/secret.cfg")" = "my secret" ] && [ "$(state_of "$A/ignored")" = "$s_ignored" ] && echo 0 || echo 1 )"
     check "pull: a blocked repository makes the exit status 1" "got rc=$RC" "$( [ "$RC" -eq 1 ] && echo 0 || echo 1 )"
 fi
 
@@ -564,19 +594,13 @@ if describe "pull: repositories that are left alone"; then
     : > "$A/locked/.git/index.lock"
     git init -q "$A/lonely"
     commit "$A/lonely" f.txt "f" "Alone"
-    for r in detached nobranch midmerge vanished locked lonely; do
-        eval "s_$r=\$(state_of \"\$A/$r\")"
-    done
+    remember detached nobranch midmerge vanished locked lonely
     gb pull --porcelain "$A"
     check "pull: the six states" "got rc=$RC: $OUTPUT" \
         "$( [ "$(st detached)" = "detached" ] && [ "$(st nobranch)" = "noupstream" ] && [ "$(st midmerge)" = "unfinished" ] && [ "$(st vanished)" = "gone" ] && [ "$(st locked)" = "busy" ] && [ "$(st lonely)" = "localonly" ] && echo 0 || echo 1 )"
     rm -f "$A/locked/.git/index.lock"
-    unchanged=0
-    for r in detached nobranch midmerge vanished locked lonely; do
-        eval "was=\$s_$r"
-        [ "$(state_of "$A/$r")" = "$was" ] || unchanged=1
-    done
-    check "pull: none of them was touched" "a repository changed" "$unchanged"
+    check "pull: none of them was touched" "a repository changed" \
+        "$( untouched detached nobranch midmerge vanished locked lonely && echo 0 || echo 1 )"
 fi
 
 if describe "pull: a linked worktree and a shallow clone"; then
@@ -710,7 +734,7 @@ if describe "engine: a signal stops the network steps at once"; then
             "$( [ "$ended" -eq 0 ] && [ "$RC" -eq 130 ] && [ "$(st hang)" = "interrupted" ] && echo 0 || echo 1 )"
         sleep 0.3
         check "engine: after SIG$sig no child survives and the scratch folder is gone" "leftovers found" \
-            "$( ! pgrep -f "$ROOT/tests/stub/hanging-ssh" >/dev/null 2>&1 && [ -z "$(ls -d "${TMPDIR:-/tmp}"/gh-batch.* 2>/dev/null)" ] && echo 0 || echo 1 )"
+            "$( ! pgrep -f "$ROOT/tests/stub/hanging-ssh" >/dev/null 2>&1 && ! contains " $(entries "${TMPDIR:-/tmp}")" " gh-batch." && echo 0 || echo 1 )"
     done
 fi
 
@@ -910,18 +934,16 @@ if describe "push: the guards of the automatic commit"; then
     printf 'KEY\n' > "$A/both/server.pem"
     git config --global gh-batch.maxFileSize 1
     git config --global gh-batch.maxNewFiles 4
-    for r in secret heavy flood nested; do
-        eval "s_$r=\$(state_of \"\$A/$r\")"
-    done
+    remember secret heavy flood nested
     gb push --porcelain --yes --commit "$A"
     check "guard: a new file that looks like a secret" "got: $(st secret) $(msg secret)" \
-        "$( [ "$(st secret)" = "notcommitted" ] && contains "$(msg secret)" ".env" && [ "$(state_of "$A/secret")" = "$s_secret" ] && echo 0 || echo 1 )"
+        "$( [ "$(st secret)" = "notcommitted" ] && contains "$(msg secret)" ".env" && untouched secret && echo 0 || echo 1 )"
     check "guard: a file above the size limit" "got: $(st heavy) $(msg heavy)" \
-        "$( [ "$(st heavy)" = "notcommitted" ] && contains "$(msg heavy)" "big.bin" && [ "$(state_of "$A/heavy")" = "$s_heavy" ] && echo 0 || echo 1 )"
+        "$( [ "$(st heavy)" = "notcommitted" ] && contains "$(msg heavy)" "big.bin" && untouched heavy && echo 0 || echo 1 )"
     check "guard: too many new files at once" "got: $(st flood) $(msg flood)" \
-        "$( [ "$(st flood)" = "notcommitted" ] && contains "$(msg flood)" "5 new files" && [ "$(state_of "$A/flood")" = "$s_flood" ] && echo 0 || echo 1 )"
+        "$( [ "$(st flood)" = "notcommitted" ] && contains "$(msg flood)" "5 new files" && untouched flood && echo 0 || echo 1 )"
     check "guard: a git repository inside the repository" "got: $(st nested) $(msg nested)" \
-        "$( [ "$(st nested)" = "notcommitted" ] && contains "$(msg nested)" "inner" && [ "$(state_of "$A/nested")" = "$s_nested" ] && echo 0 || echo 1 )"
+        "$( [ "$(st nested)" = "notcommitted" ] && contains "$(msg nested)" "inner" && untouched nested && echo 0 || echo 1 )"
     check "guard: the commits that exist are pushed, the guarded files stay and are named" "got rc=$RC: $(st both) $(msg both)" \
         "$( [ "$(st both)" = "pushed" ] && contains "$(msg both)" "NOT committed" && contains "$(msg both)" "server.pem" && [ "$(git -C "$SRV/both.git" rev-parse main)" = "$(head_of "$A/both")" ] && [ -f "$A/both/server.pem" ] && [ -z "$(git -C "$A/both" ls-files server.pem)" ] && [ "$RC" -eq 1 ] && echo 0 || echo 1 )"
     printf 'PUBLIC\n' > "$A/secret/id_ed25519.pub"
@@ -1084,7 +1106,7 @@ fi
 
 if describe "github: addresses are recognised in every form"; then
     world
-    slug() { ( PROG=t; eval "$(sed -n '/^github_slug() {/,/^}/p' "$GB")"; github_slug "$1" ); }
+    slug() { ( eval "$(sed -n '/^github_slug() {/,/^}/p' "$GB")"; github_slug "$1" ); }
     all=0
     for pair in \
         "https://github.com/Owner/Name.git=owner/name" \
@@ -1195,8 +1217,8 @@ if describe "clone: the missing repositories of an account"; then
         "$( [ "$RC" -eq 0 ] && [ -f "$A/gamma/readme.txt" ] && [ "$(git -C "$A/gamma" config remote.origin.url)" = "https://github.com/me/gamma" ] && contains "$OUTPUT" "1 cloned" && echo 0 || echo 1 )"
     check "clone: a repository present under another name and depth is not cloned again" "beta was cloned twice" \
         "$( [ ! -e "$A/beta" ] && echo 0 || echo 1 )"
-    check "clone: no temporary folder is left" "found: $(ls -A "$A" | tr '\n' ' ')" \
-        "$( [ -z "$(ls -A "$A" | grep '^\.gh-batch-clone' || true)" ] && echo 0 || echo 1 )"
+    check "clone: no temporary folder is left" "found: $(entries "$A")" \
+        "$( ! contains "$(entries "$A")" ".gh-batch-clone" && echo 0 || echo 1 )"
     gb clone --into "$A" --yes
     check "clone: a second run finds nothing missing" "got rc=$RC: $OUTPUT" \
         "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "Nothing is missing" && echo 0 || echo 1 )"
@@ -1219,11 +1241,11 @@ if describe "clone: owners, layouts and filters"; then
     check "clone: the account goes flat, another owner in its own folder" "got rc=$RC: $(cd "$A" && find . -maxdepth 2 -name .git -prune -o -type d -print | sort | tr '\n' ' ')" \
         "$( [ -d "$A/mine/.git" ] && [ -d "$A/lab/tool/.git" ] && [ -d "$A/lab/data/.git" ] && [ ! -e "$A/tool" ] && echo 0 || echo 1 )"
     gb clone --into "$WORLD/flat" --yes --flat lab
-    check "clone --flat: every owner at the top" "got: $(ls "$WORLD/flat" | tr '\n' ' ')" \
+    check "clone --flat: every owner at the top" "got: $(entries "$WORLD/flat")" \
         "$( [ -d "$WORLD/flat/tool/.git" ] && [ ! -e "$WORLD/flat/lab" ] && echo 0 || echo 1 )"
     gb clone --into "$WORLD/owners" --yes --by-owner --only mine
-    check "clone --by-owner, --only: one repository, under its owner" "got: $(ls "$WORLD/owners" | tr '\n' ' ')" \
-        "$( [ -d "$WORLD/owners/me/mine/.git" ] && [ "$(ls "$WORLD/owners/me" | tr '\n' ' ')" = "mine " ] && echo 0 || echo 1 )"
+    check "clone --by-owner, --only: one repository, under its owner" "got: $(entries "$WORLD/owners")" \
+        "$( [ -d "$WORLD/owners/me/mine/.git" ] && [ "$(entries "$WORLD/owners/me")" = "mine " ] && echo 0 || echo 1 )"
     gb clone --into "$WORLD/f1" --dry-run --no-forks --no-archived
     check "clone --no-forks --no-archived" "got: $OUTPUT" \
         "$( contains "$OUTPUT" "mine" && contains "$OUTPUT" "old" && ! contains "$OUTPUT" "forked" && ! contains "$OUTPUT" "shelved" && echo 0 || echo 1 )"
@@ -1284,8 +1306,8 @@ if describe "clone: failures leave nothing half-made"; then
     gb clone --into "$A" --yes --porcelain
     check "clone: one failure, the other is cloned" "got rc=$RC: $OUTPUT" \
         "$( [ "$RC" -eq 1 ] && [ "$(st good)" = "cloned" ] && [ "$(st broken)" = "failed" ] && [ ! -e "$A/broken" ] && echo 0 || echo 1 )"
-    check "clone: the leftover of a dead run is removed, the one of a live run is kept" "found: $(ls -A "$A" | tr '\n' ' ')" \
-        "$( [ ! -e "$A/.gh-batch-clone.stale.999999" ] && [ -d "$A/.gh-batch-clone.alive.$$" ] && [ -z "$(ls -A "$A" | grep 'clone.broken' || true)" ] && echo 0 || echo 1 )"
+    check "clone: the leftover of a dead run is removed, the one of a live run is kept" "found: $(entries "$A")" \
+        "$( [ ! -e "$A/.gh-batch-clone.stale.999999" ] && [ -d "$A/.gh-batch-clone.alive.$$" ] && ! contains "$(entries "$A")" "clone.broken" && echo 0 || echo 1 )"
     world
     account me
     listed me slow
@@ -1297,8 +1319,8 @@ if describe "clone: failures leave nothing half-made"; then
     ended=1
     wait_bg 10 && ended=0
     unset GIT_SSH_COMMAND
-    check "clone: an interrupt ends the clone and leaves no folder" "ended=$ended rc=$RC: $OUTPUT; found: $(ls -A "$A" | tr '\n' ' ')" \
-        "$( [ "$ended" -eq 0 ] && [ "$RC" -eq 130 ] && [ -z "$(ls -A "$A")" ] && echo 0 || echo 1 )"
+    check "clone: an interrupt ends the clone and leaves no folder" "ended=$ended rc=$RC: $OUTPUT; found: $(entries "$A")" \
+        "$( [ "$ended" -eq 0 ] && [ "$RC" -eq 130 ] && [ -z "$(entries "$A")" ] && echo 0 || echo 1 )"
 fi
 
 if describe "clone: --update pulls what was there"; then
@@ -1359,6 +1381,231 @@ if describe "manifest: the layout of one machine is rebuilt on another"; then
     check "clone: owners and a layout file together are a usage error" "got rc=$RC" "$( [ "$RC" -eq 2 ] && echo 0 || echo 1 )"
 fi
 
+# --- log -----------------------------------------------------------------------------
+if describe "log: the commits of a period"; then
+    world
+    repo busy
+    repo idle
+    repo other
+    commit "$A/busy" a.txt "a" "First thing of the day"
+    commit "$A/busy" b.txt "b" "Second thing of the day"
+    git -C "$A/busy" checkout -q -b side
+    commit "$A/busy" c.txt "c" "Work on a side branch"
+    git -C "$A/busy" checkout -q main
+    GIT_AUTHOR_EMAIL="someone@example.org" GIT_AUTHOR_NAME="Someone Else" \
+        git -C "$A/other" commit -q --allow-empty -m "Commit of a colleague"
+    GIT_AUTHOR_DATE="2020-01-01T10:00:00" GIT_COMMITTER_DATE="2020-01-01T10:00:00" \
+        git -C "$A/idle" commit -q --allow-empty -m "An old commit"
+    gb log "$A"
+    check "log: today's own commits, every local branch, oldest first" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "First thing of the day" && contains "$OUTPUT" "Work on a side branch" && ! contains "$OUTPUT" "colleague" && ! contains "$OUTPUT" "An old commit" && contains "$OUTPUT" "3 commits in 1 repository today" && echo 0 || echo 1 )"
+    first=$(printf '%s\n' "$OUTPUT" | grep -n "First thing" | cut -d: -f1)
+    second=$(printf '%s\n' "$OUTPUT" | grep -n "Second thing" | cut -d: -f1)
+    check "log: the order is the order of the work" "lines $first and $second" \
+        "$( [ "$first" -lt "$second" ] && echo 0 || echo 1 )"
+    gb log --all-authors "$A"
+    check "log --all-authors: the colleague appears, with the name" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "Commit of a colleague" && contains "$OUTPUT" "(Someone Else)" && echo 0 || echo 1 )"
+    gb log --author someone@example.org "$A"
+    check "log --author: one author only" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "Commit of a colleague" && ! contains "$OUTPUT" "First thing" && echo 0 || echo 1 )"
+    gb log --since 2019-12-01 --until 2020-02-01 "$A"
+    check "log --since --until: a period of the past, with the dates" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "An old commit" && contains "$OUTPUT" "2020-01-01" && ! contains "$OUTPUT" "First thing" && echo 0 || echo 1 )"
+    gb log --porcelain "$A"
+    check "log --porcelain: time, path, hash, author, subject" "got: $OUTPUT" \
+        "$( [ "$(printf '%s\n' "$OUTPUT" | wc -l | tr -d ' ')" = 3 ] && contains "$OUTPUT" "${TAB}$A/busy${TAB}" && contains "$OUTPUT" "${TAB}Test Author${TAB}First thing of the day" && echo 0 || echo 1 )"
+    gb log --only idle "$A"
+    check "log: a day without commits says so" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "No commit today" && echo 0 || echo 1 )"
+fi
+
+# --- exec ----------------------------------------------------------------------------
+if describe "exec: a command in every repository"; then
+    world
+    repo one
+    repo two
+    repo "with space"
+    printf 'edit\n' >> "$A/two/readme.txt"
+    commit "$A/one" x.txt "x" "Local work"
+    gb exec --in "$A" -- git rev-parse --abbrev-ref HEAD
+    check "exec: the output of each repository under its name" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ "$(printf '%s\n' "$OUTPUT" | grep -c '^        main$')" = 3 ] && contains "$OUTPUT" "3 ok" && echo 0 || echo 1 )"
+    # shellcheck disable=SC2016  # the command of exec expands its own variables
+    OUTPUT=$(cd "$A" && "$GB" exec sh -c 'printf "%s|%s\n" "$GH_BATCH_NAME" "$(basename "$PWD")"' 2>&1); RC=$?
+    check "exec: without --, the command starts at its first word; it runs inside the repository" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "with space|with space" && contains "$OUTPUT" "one|one" && echo 0 || echo 1 )"
+    gb exec --in "$A" --dirty -- git status --short
+    check "exec --dirty: only the repositories with pending changes" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "M readme.txt" && contains "$OUTPUT" "1 repository" || contains "$OUTPUT" "1 ok" && ! contains "$OUTPUT" "  ok            one " && echo 0 || echo 1 )"
+    gb exec --in "$A" --ahead --porcelain -- true
+    check "exec --ahead: only the repositories with commits to push" "got: $OUTPUT" \
+        "$( [ "$(printf '%s\n' "$OUTPUT" | wc -l | tr -d ' ')" = 1 ] && [ "$(st one)" = "ok" ] && echo 0 || echo 1 )"
+    # shellcheck disable=SC2016
+    gb exec --in "$A" -- sh -c 'test "$GH_BATCH_NAME" != two'
+    check "exec: a failure is reported with its status, and counts" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 1 ] && contains "$OUTPUT" "exit status 1" && contains "$OUTPUT" "Needs you: two" && contains "$OUTPUT" "2 ok" && echo 0 || echo 1 )"
+    gb exec --in "$A" -- true
+    check "exec: a silent success is only counted" "got: $OUTPUT" \
+        "$( ! contains "$OUTPUT" "  ok   " && contains "$OUTPUT" "3 ok" && echo 0 || echo 1 )"
+    gb exec --in "$A" -- no-such-program-anywhere
+    check "exec: a command that does not exist" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 1 ] && contains "$OUTPUT" "not found" && echo 0 || echo 1 )"
+    started=$SECONDS
+    gb exec --in "$A" --timeout 1 --only one -- sleep 30
+    check "exec --timeout: a command that lasts is stopped" "got rc=$RC after $((SECONDS - started)) s: $OUTPUT" \
+        "$( [ "$RC" -eq 1 ] && [ $((SECONDS - started)) -lt 15 ] && contains "$OUTPUT" "stopped" && echo 0 || echo 1 )"
+    gb exec --in "$A"
+    check "exec: without a command, a usage error" "got rc=$RC" "$( [ "$RC" -eq 2 ] && echo 0 || echo 1 )"
+fi
+
+# --- doctor ---------------------------------------------------------------------------
+if describe "doctor: what is wrong in the repositories"; then
+    world
+    repo healthy
+    repo midmerge
+    repo stashed
+    repo secret
+    repo topic
+    repo aged
+    commit "$A/midmerge" readme.txt "mine" "Mine"
+    git -C "$A/midmerge" checkout -q -b side HEAD~1
+    commit "$A/midmerge" readme.txt "theirs" "Theirs"
+    git -C "$A/midmerge" checkout -q main
+    git -C "$A/midmerge" merge -q side >/dev/null 2>&1
+    printf 'wip\n' >> "$A/stashed/readme.txt"
+    git -C "$A/stashed" stash -q
+    git -C "$A/secret" remote set-url origin "https://user:hunter2secret@example.invalid/x.git"
+    git -C "$A/topic" checkout -q -b unpublished
+    printf 'old\n' > "$A/aged/old.txt"
+    touch -t 202001010000 "$A/aged/old.txt"
+    git init -q "$A/lonely"
+    commit "$A/lonely" f.txt "f" "Alone"
+    mkdir -p "$A/papers"
+    printf 'draft\n' > "$A/papers/draft.tex"
+    printf 'loose\n' > "$A/loose.txt"
+    mkdir -p "$A/.gh-batch-clone.left.999999"
+    remember healthy midmerge stashed secret topic aged lonely
+    gb doctor --offline "$A"
+    check "doctor: problems are an unfinished merge and a password in an address" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 1 ] && contains "$OUTPUT" "problem: a merge is in progress" && contains "$OUTPUT" "problem: the address of the remote origin holds a password" && contains "$OUTPUT" "Needs you: midmerge (problem), secret (problem)" && echo 0 || echo 1 )"
+    check "doctor: the password itself is never printed" "it was printed" \
+        "$( ! contains "$OUTPUT" "hunter2secret" && echo 0 || echo 1 )"
+    check "doctor: warnings for a stash, a branch that follows nothing, old pending work, no remote" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "warning: 1 stash" && contains "$OUTPUT" "the branch unpublished follows no branch" && contains "$OUTPUT" "pending, the oldest since" && contains "$OUTPUT" "no remote: the repository exists on this machine only" && echo 0 || echo 1 )"
+    check "doctor: around the repositories" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "papers holds no git repository" && contains "$OUTPUT" "1 file directly in" && contains "$OUTPUT" "leftover of an interrupted clone" && echo 0 || echo 1 )"
+    check "doctor: a healthy repository is only counted" "got: $OUTPUT" \
+        "$( ! contains "$OUTPUT" "  healthy  " && contains "$OUTPUT" "1 healthy" && echo 0 || echo 1 )"
+    check "doctor: nothing is changed by the examination" "a repository changed" \
+        "$( untouched healthy midmerge stashed secret topic aged lonely && echo 0 || echo 1 )"
+    gb doctor --offline --only healthy --only stashed "$A"
+    check "doctor: warnings alone leave the exit status at 0" "got rc=$RC" "$( [ "$RC" -eq 0 ] && echo 0 || echo 1 )"
+    gb doctor --offline --days 100000 --only aged "$A"
+    check "doctor --days: the age from which pending work is reported" "got: $OUTPUT" \
+        "$( ! contains "$OUTPUT" "the oldest since" && echo 0 || echo 1 )"
+fi
+
+if describe "doctor: what GitHub says of the remotes"; then
+    world
+    account me
+    listed me kept
+    listed me renamed
+    listed me frozen
+    listed me deleted
+    for r in kept renamed frozen deleted; do
+        git clone -q "https://github.com/me/$r" "$A/$r"
+    done
+    git -C "$A/renamed" remote set-url origin "https://github.com/me/old-name"
+    mkdir -p "$GH_STUB_DIR/repos/me"
+    printf 'me/kept\037false\n' > "$GH_STUB_DIR/repos/me/kept"
+    printf 'Lab/New-Name\037false\n' > "$GH_STUB_DIR/repos/me/old-name"
+    printf 'me/frozen\037true\n' > "$GH_STUB_DIR/repos/me/frozen"
+    gb doctor "$A"
+    check "doctor: a moved repository, with the command that corrects its address" "got rc=$RC: $OUTPUT" \
+        "$( contains "$OUTPUT" "the remote origin moved on GitHub to Lab/New-Name: git remote set-url origin https://github.com/Lab/New-Name" && echo 0 || echo 1 )"
+    check "doctor: an archived repository, and one that GitHub does not know" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "me/frozen is archived" && contains "$OUTPUT" "GitHub does not know me/deleted" && [ "$RC" -eq 1 ] && echo 0 || echo 1 )"
+    : > "$GH_STUB_DIR/calls"
+    gb doctor --offline "$A"
+    check "doctor --offline: GitHub is not asked" "calls: $(cat "$GH_STUB_DIR/calls")" \
+        "$( [ ! -s "$GH_STUB_DIR/calls" ] && [ "$RC" -eq 0 ] && echo 0 || echo 1 )"
+fi
+
+# --- completion and help ---------------------------------------------------------------
+if describe "completion: scripts for bash and zsh, help for every command"; then
+    world
+    gb completion bash
+    printf '%s\n' "$OUTPUT" > "$WORLD/completion.bash"
+    check "completion bash: a script that bash accepts" "got rc=$RC" \
+        "$( [ "$RC" -eq 0 ] && bash -n "$WORLD/completion.bash" && contains "$OUTPUT" "complete -o filenames -F _gh_batch gh-batch" && echo 0 || echo 1 )"
+    gb completion zsh
+    check "completion zsh: a compdef script" "got rc=$RC" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "#compdef gh-batch" && echo 0 || echo 1 )"
+    gb completion fish
+    check "completion: another shell is a usage error" "got rc=$RC" "$( [ "$RC" -eq 2 ] && echo 0 || echo 1 )"
+    all=0
+    for c in pull push sync clone status fetch log exec doctor list config completion; do
+        gb help "$c"
+        if [ "$RC" -ne 0 ] || ! contains "$OUTPUT" "gh-batch $c"; then
+            all=1
+            printf '     help %s gave rc=%s\n' "$c" "$RC"
+        fi
+        gb "$c" --help
+        [ "$RC" -eq 0 ] || all=1
+        contains "$(./gh-batch help 2>/dev/null || "$GB" help)" "  $c " || { all=1; printf '     %s is missing from the list of commands\n' "$c"; }
+    done
+    check "help: every command has its page and its line in the list" "see above" "$all"
+fi
+
+# --- invariants of the source ----------------------------------------------------------
+if describe "source: what the program must never contain"; then
+    world
+    # The program names no destructive git command. The words are assembled
+    # here so that this test does not find itself.
+    hard="reset --""hard"
+    forced="push --""force"
+    all=0
+    for word in "$hard" "$forced" "--force-with-lease" "stash drop" "stash clear" "clean -f" "branch -D" "checkout -f" "--no-verify"; do
+        if grep -n -F -- "$word" "$GB" >/dev/null; then
+            all=1
+            printf '     the source contains: %s\n' "$word"
+        fi
+    done
+    check "source: no forced push, no hard reset, no cleaning, no skipped hook" "see above" "$all"
+    all=0
+    for construct in 'declare -A' 'mapfile' 'readarray' 'wait -n' 'local -n' 'coproc' '|&' '&>>' ';;&' 'BASHPID' 'EPOCHSECONDS'; do
+        if grep -n -F -- "$construct" "$GB" >/dev/null; then
+            all=1
+            printf '     the source uses a construct newer than bash 3.2: %s\n' "$construct"
+        fi
+    done
+    if grep -n -E '\$\{[A-Za-z_]+(,,|\^\^)\}' "$GB" >/dev/null; then
+        all=1
+        printf '     the source changes the case of a variable, which bash 3.2 cannot\n'
+    fi
+    check "source: nothing newer than bash 3.2" "see above" "$all"
+    check "source: the version of the help is the version of the program" "they differ" \
+        "$( contains "$("$GB" --version)" "$(sed -n 's/^GH_BATCH_VERSION="\(.*\)"$/\1/p' "$GB")" && echo 0 || echo 1 )"
+fi
+
+# --- the installer ---------------------------------------------------------------------
+if describe "install: copy, link and removal"; then
+    world
+    prefix="$WORLD/prefix"
+    OUTPUT=$("$ROOT/install.sh" --prefix "$prefix" 2>&1); RC=$?
+    check "install: the program and its completions are placed" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ -x "$prefix/bin/gh-batch" ] && [ ! -L "$prefix/bin/gh-batch" ] && [ -s "$prefix/share/bash-completion/completions/gh-batch" ] && [ "$("$prefix/bin/gh-batch" --version)" = "$("$GB" --version)" ] && echo 0 || echo 1 )"
+    OUTPUT=$("$ROOT/install.sh" --prefix "$prefix" --uninstall 2>&1); RC=$?
+    check "install --uninstall: they are removed" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ ! -e "$prefix/bin/gh-batch" ] && [ ! -e "$prefix/share/bash-completion/completions/gh-batch" ] && echo 0 || echo 1 )"
+    OUTPUT=$("$ROOT/install.sh" --prefix "$prefix" --link 2>&1); RC=$?
+    check "install --link: the command is a link to the checkout" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ -L "$prefix/bin/gh-batch" ] && [ "$("$prefix/bin/gh-batch" --version)" = "$("$GB" --version)" ] && echo 0 || echo 1 )"
+    OUTPUT=$("$ROOT/install.sh" --nosuchoption 2>&1); RC=$?
+    check "install: an unknown option is refused" "got rc=$RC" "$( [ "$RC" -ne 0 ] && echo 0 || echo 1 )"
+fi
+
 # --- output ------------------------------------------------------------------
 if describe "output: quiet, verbose and colour"; then
     world
@@ -1376,10 +1623,10 @@ if describe "output: quiet, verbose and colour"; then
     gb fetch --color always "$A"
     esc=$(printf '\033')
     check "output: --color always colours, the default does not when piped" "no escape found" \
-        "$( contains "$OUTPUT" "$esc[" && echo 0 || echo 1 )"
+        "$( contains "$OUTPUT" "${esc}[" && echo 0 || echo 1 )"
     gb fetch "$A"
     check "output: no colour in a pipe" "an escape was found" \
-        "$( ! contains "$OUTPUT" "$esc[" && echo 0 || echo 1 )"
+        "$( ! contains "$OUTPUT" "${esc}[" && echo 0 || echo 1 )"
     gb config
     check "config: the settings and their source" "got: $OUTPUT" \
         "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "diverged" && contains "$OUTPUT" "default" && echo 0 || echo 1 )"
