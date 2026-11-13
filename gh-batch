@@ -26,6 +26,8 @@
 
 set -uo pipefail
 
+: "${HOME:=/}"
+
 GH_BATCH_VERSION="1.0.0"
 PROG="gh-batch"
 
@@ -1414,22 +1416,26 @@ fetch_upstream() {
                 break
             fi
         done < "$OUT"
-        if [ "$found" -eq 0 ]; then
-            [ "$rc" -eq 0 ] && return 3
+        if [ "$found" -eq 0 ] && [ "$rc" -ne 0 ]; then
             F_msg=$(last_line "$ERR")
             return 1
         fi
     else
         after=$(g rev-parse -q --verify "$R_up_ref" 2>/dev/null)
-        if [ "$after" = "$before" ]; then
-            run_net lsremote "${GIT[@]}" ${NETCFG[@]+"${NETCFG[@]}"} ls-remote --exit-code "$R_up_remote" "$R_up_rref"
-            case "$?" in
-                0)   ;;
-                2)   return 3 ;;
-                130) return 2 ;;
-                *)   F_msg=$(net_failure "$?"); return 1 ;;
-            esac
-        fi
+        [ "$after" != "$before" ] && found=1
+    fi
+    if [ "$found" -eq 0 ]; then
+        # The fetch did not show the branch. The server is asked for it by
+        # name before it is said to be gone: a remote set to fetch only
+        # some branches does not list the others.
+        run_net lsremote "${GIT[@]}" ${NETCFG[@]+"${NETCFG[@]}"} ls-remote --exit-code "$R_up_remote" "$R_up_rref"
+        rc=$?
+        case "$rc" in
+            0)   ;;
+            2)   return 3 ;;
+            130) return 2 ;;
+            *)   F_msg=$(net_failure "$rc"); return 1 ;;
+        esac
     fi
     g rev-parse -q --verify "$R_up_ref^{commit}" >/dev/null 2>&1 || return 3
     return 0
@@ -1506,9 +1512,9 @@ fast_forward() {
         U_state="blocked"; U_attn=1
         files=$(refused_files)
         if [ -n "$files" ]; then
-            U_msg="$(plural "$U_behind" "new commit") wait on the server: they touch files with changes here ($files)"
+            U_msg="$(plural "$U_behind" "new commit") on the server would overwrite your changes in $files: nothing was changed"
         else
-            U_msg="$(plural "$U_behind" "new commit") wait on the server: git refused the update ($(last_line "$ERR"))"
+            U_msg="$(plural "$U_behind" "new commit") on the server could not be taken, git refused the update ($(last_line "$ERR")): nothing was changed"
         fi
     else
         U_state="halfupdated"; U_attn=1
@@ -2648,6 +2654,26 @@ show_plan() {
     return 0
 }
 
+asks() {
+    # asks -> 0 when this run will stop for the confirmation
+    [ "$YES" -eq 0 ] && [ "$CONFIRM" -eq 1 ]
+}
+
+show_before_asking() {
+    # show_before_asking FUNCTION: print the list of what is about to be
+    # done. Whoever is asked must see it, even with --quiet; and a run that
+    # prints records for a program cannot stop to ask.
+    local quiet=$QUIET
+    if [ "$PORCELAIN" -eq 1 ]; then
+        asks && die "$EX_USAGE" "with --porcelain nothing can be asked: add --yes"
+        return 0
+    fi
+    asks && QUIET=0
+    "$1"
+    QUIET=$quiet
+    return 0
+}
+
 confirmed() {
     # One question for the whole run. Without a terminal there is nobody to
     # ask: the run then needs --yes.
@@ -2672,7 +2698,7 @@ push_phase() {
     PLAN_GO=0; PLAN_COMMITS=0; PLAN_PUBLIC=0
     pool do_plan plan render_plan
     if [ "$STOP" -eq 0 ] && [ "$PLAN_GO" -gt 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-        [ "$PORCELAIN" -eq 0 ] && show_plan
+        show_before_asking show_plan
         if ! confirmed; then
             put "Nothing was done."
             exit "$EX_OK"
@@ -3168,7 +3194,7 @@ cmd_clone() {
                 put "Nothing was cloned (dry run)."
             fi
         else
-            [ "$PORCELAIN" -eq 0 ] && show_clone_plan
+            show_before_asking show_clone_plan
             take_lock
             if ! confirmed; then
                 put "Nothing was done."
