@@ -67,6 +67,29 @@ Done:
 Needs you: lecture-notes (not committed).
 ```
 
+**During the day**, when the pending changes should become a commit before anything is sent, one command shows the list and asks for the message. Enter takes the sentence below. Another line replaces it, and a minus sign alone does nothing. `gh-batch commit push` then goes on to the push and asks for it separately, so a refusal there leaves the commits on this machine.
+
+```text
+$ gh-batch commit
+gh-batch commit: 7 repositories under ~/workspace
+
+Plan:
+  to do         teaching/exam-2026  main     commit 1 file
+        new      solutions.md
+  to do         thesis              main     commit 3 files
+        changed  notes.txt
+        new      abstract.tex
+        new      figures/energy.pdf
+To do: a commit in 2 repositories.
+Commit message [A Regular Commit to Synchronise], or - to do nothing:
+
+Done:
+  committed     teaching/exam-2026  main     committed 1 file: A Regular Commit to Synchronise
+  committed     thesis              main     committed 3 files: A Regular Commit to Synchronise
+
+7 repositories: 2 committed, 5 clean.
+```
+
 **In the middle of the day**, before leaving one machine for another, `gh-batch sync` does both in one run. **On a new machine**, or the day after a project was created elsewhere, `gh-batch clone` brings what is missing:
 
 ```text
@@ -128,6 +151,7 @@ Without that setting, every command works on the folders named on its command li
 |---|---|
 | `pull` | Fetch every repository and bring it forward. |
 | `push` | Push every repository that has new commits, after committing what is pending when asked to. |
+| `commit` | Commit what is pending, asking for the message. `commit push` then pushes. |
 | `sync` | Pull, then push. |
 | `clone` | Clone what is missing: a whole GitHub account with its organisations, or the entries of a layout file. |
 | `status` | Show what is pending in every repository, without touching the network. |
@@ -213,6 +237,20 @@ A repository opts out for good with `git config gh-batch.commit false`, typed in
 **The push itself** sends the branch where `git push` would send it and never forces. A branch that exists on this machine only is reported, and published only with `--set-upstream`. Only the branch that is checked out is pushed; another local branch with unpushed commits is named in the report. When GitHub answers that the account has no right to push, or that the repository is archived, nothing is tried.
 
 **When the server has newer commits**, they are first taken exactly as `pull` would take them, under the same setting `gh-batch.diverged`, and the push is tried once more. A conflict on the way is undone and reported, and the commit just made stays on this machine. With the default setting `report`, a repository whose last fetch already showed such commits is neither committed nor pushed, since the push would be refused: the plan names it, and `gh-batch sync`, which pulls first, is the command for it.
+
+### commit
+
+The command `gh-batch commit` is the commit on its own, for the moment in the day when the work should be recorded and not yet sent. It commits every pending change of every repository (files modified, deleted or new, the ignored ones excepted) under one message, the same one for the whole run. The list of files is shown first. The first line is then asked for:
+
+```text
+Commit message [A Regular Commit to Synchronise], or - to do nothing:
+```
+
+Enter takes that sentence. A line that is typed replaces it. A minus sign alone, or the end of the input, does nothing. The list of the files follows the first line in the commit, as it does for the evening commit. `-m TEXT` gives the first line in advance, and the question is then the usual confirmation; `%d` is the date, `%t` the time, `%h` the machine and `%n` the number of files. When `gh-batch.message` has been set, that text replaces the sentence, in the question and in the commit. Without a terminal the run needs `--yes`. With `gh-batch.confirm false` nothing is asked.
+
+The four guards of the evening commit apply here too, and a refusal by a hook puts the staging area back as it was. A repository that sets `gh-batch.commit` to false, or `gh-batch.pullOnly`, is left alone. A detached HEAD is left alone. A repository without a remote is committed, and the report says that the commit stays on this machine. The evening push is unchanged: it still commits only when asked, and then under its own line, `Work in progress, DATE (MACHINE)`, unless `-m` or `gh-batch.message` says otherwise.
+
+`gh-batch commit push` runs the push once the commits are made. The push has its own list and its own confirmation, including the commits that were already waiting. Declining it leaves the new commits on this machine. The word `push` is that request. A folder that is itself named push is given as a path, for example `./push`.
 
 ### sync
 
@@ -351,7 +389,7 @@ The command `list` prints the names of the repositories found, their full paths 
 
 ## What gh-batch never does
 
-It never forces a push, never deletes a branch or a file of yours, never resets a repository, never cleans a working tree, never drops a stash and never skips a hook. It never leaves a conflict, a half-finished rebase or a half-finished merge behind. It never commits unless the option or the setting says so, and then never a repository that opted out. It never pushes a branch onto a branch of another name unless git itself was configured to do so. It never asks a question in the middle of a run: git is run so that a missing password is an error, not a prompt, and its own questions, the folder of an organisation met for the first time and the one confirmation, come before anything is changed. A test of the suite reads the source and fails if a forced push, a hard reset or a cleaning command ever appears in it.
+It never forces a push, never deletes a branch or a file of yours, never resets a repository, never cleans a working tree, never drops a stash and never skips a hook. It never leaves a conflict, a half-finished rebase or a half-finished merge behind. It never commits unless the commit command, the option or the setting says so, and then never a repository that opted out. It never pushes a branch onto a branch of another name unless git itself was configured to do so. It never asks a question in the middle of a run: git is run so that a missing password is an error, not a prompt, and its own questions, the folder of an organisation met for the first time and the one confirmation, come before anything is changed. A test of the suite reads the source and fails if a forced push, a hard reset or a cleaning command ever appears in it.
 
 ## Settings
 
@@ -366,7 +404,7 @@ The settings live in git's own configuration, so there is no new file to learn. 
 | `gh-batch.diverged` | `report` | What `pull` does when both sides have commits: `report`, `rebase` or `merge`. |
 | `gh-batch.commit` | `false` | Commit pending changes before the push. |
 | `gh-batch.confirm` | `true` | Ask once before committing, pushing or cloning. |
-| `gh-batch.message` | `Work in progress, %d (%h)` | First line of the automatic commits. |
+| `gh-batch.message` | `Work in progress, %d (%h)` | First line of the commits made by `push --commit`. The command `commit` uses it too, when it has been set; otherwise its sentence is "A Regular Commit to Synchronise". |
 | `gh-batch.machine` | the name of the host | The machine named in those commits. |
 | `gh-batch.maxFileSize` | 50 | Megabytes above which a file stops the automatic commit; 0 for no limit. |
 | `gh-batch.maxNewFiles` | 200 | New files at once above which the automatic commit stops; 0 for no limit. |
@@ -401,7 +439,7 @@ A report has one line per repository that changed or needs you, in the order of 
 | `updated`, `rebased`, `merged` | The branch was brought forward by `pull`. |
 | `up to date`, `clean`, `nothing` | Nothing to do. |
 | `ahead`, `behind`, `pending`, `stash` | Commits to push, commits to pull, uncommitted changes, stashes. |
-| `pushed`, `cloned`, `to do` | Done by `push` or `clone`, or about to be done. |
+| `pushed`, `cloned`, `committed`, `to do` | Done by `push`, `clone` or `commit`, or about to be done. |
 | `blocked` | New commits wait on the server, and taking them would overwrite a change here. |
 | `diverged` | Both sides have commits, and they were not reconciled. |
 | `conflict` | A rebase or a merge was tried, conflicted, and was undone. |

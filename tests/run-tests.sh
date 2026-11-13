@@ -1195,6 +1195,159 @@ if describe "github: addresses are recognised in every form"; then
     check "github: thirteen addresses" "see above" "$all"
 fi
 
+# --- commit --------------------------------------------------------------------------
+if describe "commit: a message, by Enter or by typing"; then
+    world
+    repo work
+    repo quiet
+    printf 'changed\n' >> "$A/work/readme.txt"
+    printf 'new\n' > "$A/work/notes.txt"
+    printf 'ignored.log\n' > "$A/work/.gitignore"
+    printf 'noise\n' > "$A/work/ignored.log"
+    server_before=$(git -C "$SRV/work.git" rev-parse main)
+    gb commit --dry-run "$A"
+    check "commit --dry-run: the files and the sentence, nothing committed" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "commit 3 files" && contains "$OUTPUT" "A Regular Commit to Synchronise" && contains "$OUTPUT" "Nothing was changed" && [ -n "$(git -C "$A/work" status --porcelain)" ] && echo 0 || echo 1 )"
+    gb commit "$A"
+    check "commit: without a terminal the run asks for --yes and does nothing" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 2 ] && contains "$OUTPUT" "--yes" && [ -n "$(git -C "$A/work" status --porcelain)" ] && echo 0 || echo 1 )"
+    gb commit --porcelain "$A"
+    check "commit --porcelain: nothing can be asked" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 2 ] && contains "$OUTPUT" "porcelain" && echo 0 || echo 1 )"
+    gb commit --yes --porcelain "$A"
+    check "commit --yes: one commit, the default sentence, not pushed" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ "$(st work)" = "committed" ] && [ "$(st quiet)" = "clean" ] && [ -z "$(git -C "$A/work" status --porcelain)" ] && [ "$(git -C "$A/work" log -1 --format=%s)" = "A Regular Commit to Synchronise" ] && [ "$(git -C "$SRV/work.git" rev-parse main)" = "$server_before" ] && echo 0 || echo 1 )"
+    body=$(git -C "$A/work" log -1 --format=%b)
+    check "commit: the message lists the files and leaves an ignored one out" "body: $body" \
+        "$( contains "$body" "readme.txt" && contains "$body" "notes.txt" && contains "$body" ".gitignore" && [ -z "$(git -C "$A/work" ls-files ignored.log)" ] && [ -f "$A/work/ignored.log" ] && echo 0 || echo 1 )"
+    check "commit: the journal records the commit" "journal: $(cat "$GH_BATCH_STATE_DIR/journal.tsv")" \
+        "$( contains "$(cat "$GH_BATCH_STATE_DIR/journal.tsv")" "${TAB}commit${TAB}" && echo 0 || echo 1 )"
+    printf 'more\n' >> "$A/work/readme.txt"
+    asked '\n' commit --only work "$A"
+    check "commit: Enter takes the sentence" "got rc=$RC: $OUTPUT; subject: $(git -C "$A/work" log -1 --format=%s)" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "Commit message" && [ "$(git -C "$A/work" log -1 --format=%s)" = "A Regular Commit to Synchronise" ] && [ -z "$(git -C "$A/work" status --porcelain)" ] && echo 0 || echo 1 )"
+    printf 'more\n' >> "$A/work/readme.txt"
+    asked 'Ship the notes\n' commit --only work "$A"
+    check "commit: a typed line is the message" "subject: $(git -C "$A/work" log -1 --format=%s)" \
+        "$( [ "$(git -C "$A/work" log -1 --format=%s)" = "Ship the notes" ] && echo 0 || echo 1 )"
+    printf 'more\n' >> "$A/work/readme.txt"
+    asked '   \n' commit --only work "$A"
+    check "commit: a blank line is the same as Enter" "subject: $(git -C "$A/work" log -1 --format=%s)" \
+        "$( [ "$(git -C "$A/work" log -1 --format=%s)" = "A Regular Commit to Synchronise" ] && echo 0 || echo 1 )"
+    printf 'more\n' >> "$A/work/readme.txt"
+    before=$(state_of "$A/work")
+    asked '-\n' commit --only work "$A"
+    check "commit: a minus sign does nothing" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "Nothing was done." && [ "$(state_of "$A/work")" = "$before" ] && echo 0 || echo 1 )"
+    asked '' commit --only work "$A"
+    check "commit: the end of the input does nothing" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "Nothing was done." && [ "$(state_of "$A/work")" = "$before" ] && echo 0 || echo 1 )"
+    asked 'n\n' commit -m 'Nope %d' --only work "$A"
+    check "commit -m: the confirmation can decline, and the text is shown" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "Nope %d" && contains "$OUTPUT" "Nothing was done." && [ "$(state_of "$A/work")" = "$before" ] && echo 0 || echo 1 )"
+    asked 'y\n' commit -m 'Notes of %d, %n file(s)' --only work "$A"
+    check "commit -m: the text is chosen, and the date and the count are filled in" "subject: $(git -C "$A/work" log -1 --format=%s)" \
+        "$( [ "$(git -C "$A/work" log -1 --format=%s)" = "Notes of $(date '+%Y-%m-%d'), 1 file(s)" ] && echo 0 || echo 1 )"
+    git config --global gh-batch.message "Saved for later"
+    printf 'again\n' >> "$A/work/readme.txt"
+    gb commit --dry-run --only work "$A"
+    check "commit: a configured message replaces the sentence" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "Saved for later" && ! contains "$OUTPUT" "A Regular Commit to Synchronise" && echo 0 || echo 1 )"
+    gb commit --yes --porcelain --only work "$A"
+    check "commit: --yes uses the configured message" "subject: $(git -C "$A/work" log -1 --format=%s)" \
+        "$( [ "$(st work)" = "committed" ] && [ "$(git -C "$A/work" log -1 --format=%s)" = "Saved for later" ] && echo 0 || echo 1 )"
+fi
+
+if describe "commit: what is left alone, and a repository without a remote"; then
+    world
+    repo secret
+    repo opted
+    repo readonly
+    repo detached
+    printf 'TOKEN=abc\n' > "$A/secret/.env"
+    printf 'x\n' >> "$A/secret/readme.txt"
+    printf 'b\n' >> "$A/opted/readme.txt"
+    printf 'c\n' >> "$A/readonly/readme.txt"
+    git -C "$A/detached" checkout -q --detach
+    printf 'd\n' >> "$A/detached/readme.txt"
+    git -C "$A/opted" config gh-batch.commit false
+    git -C "$A/readonly" config gh-batch.pullOnly true
+    git config --global gh-batch.commit false
+    remember secret opted readonly detached
+    gb commit --porcelain --yes "$A"
+    check "commit: a new file that looks like a secret stops the commit" "got: $(st secret) $(msg secret)" \
+        "$( [ "$(st secret)" = "notcommitted" ] && contains "$(msg secret)" ".env" && untouched secret && echo 0 || echo 1 )"
+    check "commit: gh-batch.commit false inside a repository is respected" "got: $(st opted) $(msg opted)" \
+        "$( [ "$(st opted)" = "pending" ] && contains "$(msg opted)" "false" && untouched opted && echo 0 || echo 1 )"
+    check "commit: gh-batch.pullOnly keeps a repository out" "got: $(st readonly)" \
+        "$( [ "$(st readonly)" = "skipped" ] && untouched readonly && echo 0 || echo 1 )"
+    check "commit: a detached HEAD is left alone" "got: $(st detached) $(msg detached)" \
+        "$( [ "$(st detached)" = "detached" ] && untouched detached && echo 0 || echo 1 )"
+    git init -q "$A/lonely"
+    printf 'f\n' > "$A/lonely/f.txt"
+    gb commit --porcelain --yes --only lonely "$A"
+    check "commit: a repository without a remote is committed, and stays here" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ "$(st lonely)" = "committed" ] && contains "$(msg lonely)" "no remote" && [ -z "$(git -C "$A/lonely" status --porcelain)" ] && [ "$(git -C "$A/lonely" log -1 --format=%s)" = "A Regular Commit to Synchronise" ] && echo 0 || echo 1 )"
+    check "commit: the general setting gh-batch.commit false does not block the command" "the lonely repository was not committed" \
+        "$( [ "$(st lonely)" = "committed" ] && echo 0 || echo 1 )"
+fi
+
+if describe "commit: a refusing hook restores the staging area"; then
+    world
+    repo hooked
+    printf 'one\n' > "$A/hooked/staged.txt"
+    printf 'two\n' > "$A/hooked/unstaged.txt"
+    git -C "$A/hooked" add staged.txt
+    printf '#!/bin/sh\necho "the hook says no" >&2\nexit 1\n' > "$A/hooked/.git/hooks/pre-commit"
+    chmod +x "$A/hooked/.git/hooks/pre-commit"
+    before=$(state_of "$A/hooked")
+    gb commit --porcelain --yes "$A"
+    check "commit: the refusal is reported with the words of the hook" "got rc=$RC: $OUTPUT" \
+        "$( [ "$(st hooked)" = "notcommitted" ] && contains "$(msg hooked)" "the hook says no" && [ "$RC" -eq 1 ] && echo 0 || echo 1 )"
+    check "commit: what was staged is staged, what was not is not" "status: $(git -C "$A/hooked" status --porcelain | tr '\n' '|')" \
+        "$( [ "$(state_of "$A/hooked")" = "$before" ] && echo 0 || echo 1 )"
+fi
+
+if describe "commit push: commit, then push, and a declined push keeps the commit"; then
+    world
+    repo work
+    repo ahead
+    printf 'changed\n' >> "$A/work/readme.txt"
+    commit "$A/ahead" mine.txt "mine" "Already committed"
+    server_work=$(git -C "$SRV/work.git" rev-parse main)
+    server_ahead=$(git -C "$SRV/ahead.git" rev-parse main)
+    gb commit push --dry-run "$A"
+    check "commit push --dry-run: the commit and the push are named, nothing moves" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "commit 1 file, then a push" && contains "$OUTPUT" "push 1 commit" && contains "$OUTPUT" "Nothing was changed" && [ -n "$(git -C "$A/work" status --porcelain)" ] && [ "$(git -C "$SRV/work.git" rev-parse main)" = "$server_work" ] && [ "$(git -C "$SRV/ahead.git" rev-parse main)" = "$server_ahead" ] && echo 0 || echo 1 )"
+    asked '\nY\n' commit push --only work "$A"
+    check "commit push: Enter commits, and the confirmation pushes" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "Then, the push:" && [ "$(git -C "$A/work" log -1 --format=%s)" = "A Regular Commit to Synchronise" ] && [ "$(git -C "$SRV/work.git" rev-parse main)" = "$(head_of "$A/work")" ] && [ -z "$(git -C "$A/work" status --porcelain)" ] && echo 0 || echo 1 )"
+    printf 'more\n' >> "$A/work/readme.txt"
+    asked 'Ship the notes\nn\n' commit push --only work "$A"
+    check "commit push: declining the push leaves the commit on this machine" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "The commits stay on this machine. Nothing was pushed." && [ "$(git -C "$A/work" log -1 --format=%s)" = "Ship the notes" ] && [ "$(git -C "$SRV/work.git" rev-parse main)" != "$(head_of "$A/work")" ] && echo 0 || echo 1 )"
+    asked 'n\n' commit push --only ahead "$A"
+    check "commit push: with nothing to commit, declining does nothing" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "Nothing was done." && ! contains "$OUTPUT" "The commits stay" && [ "$(git -C "$SRV/ahead.git" rev-parse main)" = "$server_ahead" ] && echo 0 || echo 1 )"
+    gb commit push --yes --porcelain "$A"
+    check "commit push --yes: what was already committed is pushed, with no second commit" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "pushed${TAB}$A/work${TAB}" && contains "$OUTPUT" "pushed${TAB}$A/ahead${TAB}" && [ "$(git -C "$SRV/work.git" rev-parse main)" = "$(head_of "$A/work")" ] && [ "$(git -C "$SRV/ahead.git" rev-parse main)" = "$(head_of "$A/ahead")" ] && [ "$(git -C "$A/work" log -1 --format=%s)" = "Ship the notes" ] && echo 0 || echo 1 )"
+fi
+
+if describe "commit: the word push is not the name of a folder"; then
+    world
+    server push
+    clone_to "$A" push
+    printf 'changed\n' >> "$A/push/readme.txt"
+    server_before=$(git -C "$SRV/push.git" rev-parse main)
+    gb commit --yes --porcelain "$A/push"
+    check "commit: a folder named push is committed and not pushed" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ "$(st push)" = "committed" ] && [ "$(git -C "$SRV/push.git" rev-parse main)" = "$server_before" ] && echo 0 || echo 1 )"
+    gb commit push --yes --porcelain "$A"
+    check "commit push: the word push sends the commit" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "pushed${TAB}$A/push${TAB}" && [ "$(git -C "$SRV/push.git" rev-parse main)" = "$(head_of "$A/push")" ] && echo 0 || echo 1 )"
+fi
+
 # --- sync ---------------------------------------------------------------------------
 if describe "sync: pull, then push"; then
     world
@@ -1899,7 +2052,7 @@ if describe "completion: scripts for bash and zsh, help for every command"; then
     gb completion fish
     check "completion: another shell is a usage error" "got rc=$RC" "$( [ "$RC" -eq 2 ] && echo 0 || echo 1 )"
     all=0
-    for c in pull push sync clone status fetch log exec doctor list config completion; do
+    for c in pull push commit sync clone status fetch log exec doctor list config completion; do
         gb help "$c"
         if [ "$RC" -ne 0 ] || ! contains "$OUTPUT" "gh-batch $c"; then
             all=1

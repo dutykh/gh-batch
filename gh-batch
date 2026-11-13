@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# gh-batch: fetch, pull, push and clone many git repositories with one command.
+# gh-batch: fetch, pull, commit, push and clone many git repositories with one command.
 #
 # Author: Dr. Denys Dutykh (Mathematics Department, Khalifa University of
 #         Science and Technology, Abu Dhabi, UAE).
@@ -28,7 +28,7 @@ set -uo pipefail
 
 : "${HOME:=/}"
 
-GH_BATCH_VERSION="1.2.0"
+GH_BATCH_VERSION="1.3.0"
 PROG="gh-batch"
 
 TAB=$(printf '\t')
@@ -61,6 +61,8 @@ OPT_MESSAGE=""
 OPT_NOTIFY=0
 YES=0
 SET_UPSTREAM=0
+ALSO_PUSH=0               # commit: push once the commits are made
+COMMITS_MADE=0            # commit: a commit was attempted in this run
 EXEC_CMD=()               # exec: the command and its arguments
 EXEC_LIMIT=0
 F_DIRTY=0                 # exec: keep only the repositories in these states
@@ -1019,7 +1021,7 @@ state_label() {
 
 state_class() {
     case "$1" in
-        updated|rebased|merged|pushed|cloned|ok)   printf 'good' ;;
+        updated|rebased|merged|pushed|committed|cloned|ok) printf 'good' ;;
         uptodate|clean|present|skipped|nothing|healthy) printf 'dim' ;;
         ahead|behind|pending|stash|localonly|noupstream|detached|planned|active|warning) printf 'info' ;;
         *)                                         printf 'bad' ;;
@@ -1037,6 +1039,7 @@ state_phrase() {
         warning)      printf '%s with warnings' "$n" ;;
         problem)      printf '%s with problems' "$n" ;;
         pushed)       printf '%s pushed' "$n" ;;
+        committed)    printf '%s committed' "$n" ;;
         planned)      printf '%s to do' "$n" ;;
         nothing)      printf '%s with nothing to push' "$n" ;;
         rejected)     printf '%s rejected' "$n" ;;
@@ -1068,7 +1071,7 @@ state_phrase() {
     esac
 }
 
-STATE_ORDER="updated rebased merged pushed planned cloned ok uptodate clean nothing present pending stash ahead behind localonly noupstream detached skipped healthy warning problem diverged conflict blocked rejected notcommitted failed gone unfinished halfupdated busy unreadable interrupted lost"
+STATE_ORDER="updated rebased merged pushed committed planned cloned ok uptodate clean nothing present pending stash ahead behind localonly noupstream detached skipped healthy warning problem diverged conflict blocked rejected notcommitted failed gone unfinished halfupdated busy unreadable interrupted lost"
 
 tally() {
     local var="N_$1"
@@ -1119,7 +1122,7 @@ mark() {
     # cross for what needs the user; letters when the terminal is not UTF-8.
     local u a
     case "$1" in
-        updated|rebased|merged|pushed|cloned|ok|healthy) u='✓'; a='+' ;;
+        updated|rebased|merged|pushed|committed|cloned|ok|healthy) u='✓'; a='+' ;;
         ahead)                 u='↑'; a='^' ;;
         behind)                u='↓'; a='v' ;;
         diverged)              u='⇅'; a='x' ;;
@@ -3031,8 +3034,9 @@ push_phase() {
     if [ "$STOP" -eq 0 ] && [ "$PLAN_GO" -gt 0 ] && [ "$DRY_RUN" -eq 0 ]; then
         show_before_asking show_plan
         if ! confirmed; then
-            put "Nothing was done."
-            exit "$EX_OK"
+            # The caller says what was left undone: a push on its own did
+            # nothing, while a push that follows a commit leaves that commit.
+            return 1
         fi
         if [ "$PORCELAIN" -eq 0 ]; then
             put ""
@@ -3058,7 +3062,10 @@ cmd_push() {
     begin_command change
     no_repository && exit "$EX_OK"
     header ""
-    push_phase
+    if ! push_phase; then
+        put "Nothing was done."
+        exit "$EX_OK"
+    fi
     finish
 }
 
@@ -3089,7 +3096,292 @@ cmd_sync() {
         put ""
         put_title "Then, the push:"
     fi
-    push_phase
+    if ! push_phase; then
+        put "Nothing was done."
+        exit "$EX_OK"
+    fi
+    finish
+}
+
+# ---------------------------------------------------------------------------
+# commit: the pending changes, with a message, and a push when asked for
+# ---------------------------------------------------------------------------
+
+commit_proposal() {
+    # The first line that Enter accepts. A message the user chose (on the
+    # command line, in the environment or in git) wins. Otherwise this
+    # command has its own sentence, and the work-in-progress line of the
+    # evening push is left to that command.
+    if [ "$SRC_message" = "default" ]; then
+        printf '%s' "A Regular Commit to Synchronise"
+    else
+        printf '%s' "$MESSAGE"
+    fi
+}
+
+commit_plan_words() {
+    local text
+    text="To do: a commit in $(plural "$PLAN_COMMITS" repository)"
+    if [ -n "$OPT_MESSAGE" ]; then
+        text="$text, with the message \"$(one_line "$OPT_MESSAGE")\""
+    fi
+    if [ "$ALSO_PUSH" -eq 1 ]; then
+        text="$text. A push is asked afterwards"
+    fi
+    printf '%s.' "$text"
+}
+
+ask_commit_message() {
+    # Ask for the first line of every commit of this run. Enter takes the
+    # line proposed, another line replaces it, and a minus sign alone does
+    # nothing. Returns 1 when nothing is to be committed. With -m the line
+    # is already chosen, and the question is the usual confirmation.
+    local proposed answer="" ended since trimmed
+    proposed=$(commit_proposal)
+    if [ "$YES" -eq 1 ] || [ "$CONFIRM" -eq 0 ]; then
+        if [ -z "$OPT_MESSAGE" ]; then
+            MESSAGE=$proposed
+        fi
+        return 0
+    fi
+    if [ -n "$OPT_MESSAGE" ]; then
+        confirmed
+        return $?
+    fi
+    if ! answered; then
+        die "$EX_USAGE" "this run commits in the repositories: confirm it at a terminal, or add --yes"
+    fi
+    printf '%sCommit message%s [%s], or - to do nothing: ' "$C_BOLD" "$C_OFF" "$proposed" >&2
+    ended=0
+    ASKING=1
+    since=$SECONDS
+    IFS= read -r answer || [ -n "$answer" ] || ended=1
+    RUN_START=$(( RUN_START + SECONDS - since ))
+    ASKING=0
+    if [ "$ended" -eq 1 ] || [ "$STOP" -eq 1 ]; then
+        printf '\n' >&2
+        put "Nothing was done."
+        exit "$EX_OK"
+    fi
+    trimmed=${answer#"${answer%%[![:space:]]*}"}
+    trimmed=${trimmed%"${trimmed##*[![:space:]]}"}
+    if [ "$trimmed" = "-" ]; then
+        return 1
+    fi
+    if [ -n "$trimmed" ]; then
+        MESSAGE=$(one_line "$trimmed")
+        [ -n "$MESSAGE" ] || MESSAGE=$proposed
+    else
+        MESSAGE=$proposed
+    fi
+    return 0
+}
+
+do_commit_plan() {
+    # What "commit" would commit in this repository. Nothing is changed.
+    # A repository without a remote is included: the commit stays here.
+    local pending block text
+    repo_begin || return 0
+    if [ "$R_pullonly" -eq 1 ]; then
+        emit skipped 0 "update-only (gh-batch.pullOnly): nothing is committed"
+        return 0
+    fi
+    if [ "$R_busy" -eq 1 ]; then
+        emit busy 1 "another git process holds its index (index.lock): try again later"
+        return 0
+    fi
+    if [ -n "$R_operation" ]; then
+        emit unfinished 1 "$R_operation is in progress: finish or abort it first"
+        return 0
+    fi
+    if [ "$R_unmerged" -gt 0 ]; then
+        emit unfinished 1 "$(plural "$R_unmerged" file) with unresolved conflicts"
+        return 0
+    fi
+    pending=$(( R_tracked + R_untracked ))
+    if [ "$R_detached" -eq 1 ]; then
+        if [ "$pending" -gt 0 ]; then
+            emit detached 0 "HEAD is detached: nothing is committed ($(describe_pending))"
+        else
+            emit detached 0 "HEAD is detached: nothing is committed"
+        fi
+        return 0
+    fi
+    if [ "$pending" -eq 0 ]; then
+        # A dry run does not go on to the push, so a repository that already
+        # has commits to send is named here. A real run leaves that to the push.
+        if [ "$ALSO_PUSH" -eq 1 ] && [ "$DRY_RUN" -eq 1 ] && [ "$R_remotes" -gt 0 ] && push_target; then
+            count_to_push
+            if [ "$P_ahead" -gt 0 ] || [ "$P_new" -eq 1 ]; then
+                emit planned 0 "push $(plural "$P_ahead" commit)"
+                printf 'P%s0%s0%s\n' "$US" "$US" "$US"
+                return 0
+            fi
+        fi
+        emit clean 0 ""
+        return 0
+    fi
+    if ! commits_here; then
+        emit pending 0 "$(describe_pending): not committed (gh-batch.commit is false here)"
+        return 0
+    fi
+    list_pending
+    block=$(commit_blocker)
+    if [ -n "$block" ]; then
+        emit notcommitted 1 "$(describe_pending): $block"
+        return 0
+    fi
+    text="commit $(plural "$L_count" file)"
+    if [ "$R_remotes" -eq 0 ]; then
+        text="$text; no remote, so the commit stays on this machine"
+    elif [ "$ALSO_PUSH" -eq 1 ]; then
+        if push_target; then
+            text="$text, then a push"
+        else
+            text="$text; $P_why"
+        fi
+    fi
+    emit planned 0 "$text"
+    details "$(pending_words 6)"
+    [ "$L_count" -gt 6 ] && detail "... and $(( L_count - 6 )) more"
+    : > "$TMP/cplan/$IDX.commit"
+    printf 'P%s1%s0%s\n' "$US" "$US" "$US"
+    return 0
+}
+
+do_commit() {
+    # Commit what the plan marked. A repository without a marker keeps the
+    # answer of the plan.
+    local nfiles subject note
+    if [ ! -e "$TMP/cplan/$IDX.commit" ]; then
+        cat "$TMP/cplan/$IDX.res"
+        return 0
+    fi
+    repo_begin || return 0
+    if [ "$R_busy" -eq 1 ] || [ -n "$R_operation" ] || [ "$R_unmerged" -gt 0 ] || [ "$R_detached" -eq 1 ]; then
+        emit unfinished 1 "its state changed since the plan: nothing was done"
+        return 0
+    fi
+    if ! commits_here; then
+        emit pending 0 "$(describe_pending): not committed (gh-batch.commit is false here)"
+        return 0
+    fi
+    if commit_pending; then
+        nfiles=$L_count
+        subject=$(clip "$(expand_message "$MESSAGE")" 120)
+        note="committed $(plural "$nfiles" file): $subject"
+        if [ "$R_remotes" -eq 0 ]; then
+            note="$note; no remote, so it stays on this machine"
+        fi
+        emit committed 0 "$note"
+    elif [ "$C_why" = "nothing is pending any more" ]; then
+        emit clean 0 ""
+    else
+        emit notcommitted 1 "$(describe_pending) NOT committed: $C_why"
+    fi
+    return 0
+}
+
+show_commit_plan() {
+    local i=0 count="${#REPOS[@]}"
+    put_title "Plan:"
+    while [ "$i" -lt "$count" ]; do
+        if [ -f "$TMP/cplan/$i.res" ]; then
+            read_record "$TMP/cplan/$i.res"
+            if [ "$REC_state" = "planned" ] || [ "$REC_attention" = 1 ]; then
+                print_record "$i"
+            fi
+        fi
+        i=$(( i + 1 ))
+    done
+    put ""
+    put_title "$(commit_plan_words)"
+    return 0
+}
+
+commit_phase() {
+    local i=0 count="${#REPOS[@]}" proposed=""
+    PLAN_GO=0
+    PLAN_COMMITS=0
+    PLAN_PUBLIC=0
+    pool do_commit_plan cplan render_plan
+    if [ "$STOP" -eq 0 ] && [ "$PLAN_COMMITS" -gt 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+        show_before_asking show_commit_plan
+        if ! ask_commit_message; then
+            put "Nothing was done."
+            exit "$EX_OK"
+        fi
+        if [ "$PORCELAIN" -eq 0 ]; then
+            put ""
+            put_title "Done:"
+        fi
+        pool do_commit cwork render
+        [ "${N_committed:-0}" -gt 0 ] && COMMITS_MADE=1
+        return 0
+    fi
+    while [ "$i" -lt "$count" ]; do
+        [ -f "$TMP/cplan/$i.res" ] && render "$i" "$TMP/cplan/$i.res"
+        i=$(( i + 1 ))
+    done
+    if [ "$DRY_RUN" -eq 1 ] && [ "$PORCELAIN" -eq 0 ] && [ "$STOP" -eq 0 ]; then
+        if [ "$PLAN_COMMITS" -gt 0 ]; then
+            put ""
+            if [ -n "$OPT_MESSAGE" ]; then
+                put_title "$(commit_plan_words) Nothing was changed (dry run)."
+            else
+                proposed=$(one_line "$(commit_proposal)")
+                put_title "$(commit_plan_words) The message would be \"$proposed\". Nothing was changed (dry run)."
+            fi
+        elif [ "$ALSO_PUSH" -eq 1 ] && [ "$PLAN_GO" -gt 0 ]; then
+            put ""
+            put_title "Nothing was changed (dry run)."
+        fi
+    fi
+    return 0
+}
+
+cmd_commit() {
+    # The command itself asks for the commits. The general setting does not
+    # have to be on. A repository that opted out (gh-batch.commit false
+    # inside it, or gh-batch.pullOnly) still opts out.
+    COMMIT=1
+    COMMIT_FORCED=1
+    begin_command change
+    no_repository && exit "$EX_OK"
+    header ""
+    if [ "$ALSO_PUSH" -eq 1 ] && [ "$PORCELAIN" -eq 0 ]; then
+        put_title "First, the commit:"
+    fi
+    commit_phase
+    if [ "$STOP" -eq 1 ]; then
+        finish
+    fi
+    # A dry run stops after the list: the push is described there, and a
+    # second pass would talk about changes that the commit has not made.
+    if [ "$ALSO_PUSH" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+        summary
+        reset_tally
+        if [ "$PORCELAIN" -eq 0 ]; then
+            put ""
+            put_title "Then, the push:"
+        fi
+        # What follows is an ordinary push of the commits, its own included.
+        # It asks on its own, unless this run already said not to ask.
+        COMMIT=0
+        COMMIT_FORCED=1
+        if ! push_phase; then
+            if [ "$COMMITS_MADE" -eq 1 ]; then
+                put "The commits stay on this machine. Nothing was pushed."
+            else
+                put "Nothing was done."
+            fi
+            notify
+            if [ "$ATTENTION" -eq 1 ]; then
+                exit "$EX_ATTENTION"
+            fi
+            exit "$EX_OK"
+        fi
+    fi
     finish
 }
 
@@ -4336,7 +4628,7 @@ _gh_batch() {
     local cur prev words cword commands options
     cur=${COMP_WORDS[COMP_CWORD]}
     prev=${COMP_WORDS[COMP_CWORD-1]}
-    commands="pull push sync clone status fetch log exec doctor list config completion help"
+    commands="pull push commit sync clone status fetch log exec doctor list config completion help"
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=($(compgen -W "$commands --help --version" -- "$cur"))
         return 0
@@ -4353,6 +4645,7 @@ _gh_batch() {
     case "${COMP_WORDS[1]}" in
         pull|fetch) options="$options --diverged --notify" ;;
         push|sync)  options="$options --commit --no-commit --message --set-upstream --diverged --notify" ;;
+        commit)     options="$options --message --notify" ;;
         clone)      options="$options --into --manifest --update --since --no-forks --no-archived --no-orgs --flat --by-owner" ;;
         status)     options="$options --long" ;;
         log)        options="$options --since --until --author --all-authors --long" ;;
@@ -4362,7 +4655,13 @@ _gh_batch() {
     esac
     case "$cur" in
         -*) COMPREPLY=($(compgen -W "$options" -- "$cur")) ;;
-        *)  COMPREPLY=($(compgen -d -- "$cur")) ;;
+        *)
+            if [ "${COMP_WORDS[1]}" = "commit" ]; then
+                COMPREPLY=($(compgen -W "push" -- "$cur"; compgen -d -- "$cur"))
+            else
+                COMPREPLY=($(compgen -d -- "$cur"))
+            fi
+            ;;
     esac
     return 0
 }
@@ -4378,6 +4677,7 @@ _gh_batch() {
     commands=(
         'pull:fetch every repository and bring it forward'
         'push:commit what is pending when asked to, then push'
+        'commit:commit what is pending, and push afterwards when asked'
         'sync:pull, then push'
         'clone:clone what is missing from an account or a layout file'
         'status:what is pending in every repository'
@@ -4411,6 +4711,7 @@ _gh_batch() {
                 '--diverged[what to do when both sides have commits]:how:(report rebase merge)' \
                 '--commit[commit pending changes before the push]' \
                 '--no-commit[push only what is committed already]' \
+                '(-m --message)'{-m,--message}'[the first line of the commits]:text:' \
                 '--into[the folder that receives the clones]:folder:_files -/' \
                 '--no-orgs[clone the account without its organisations]' \
                 '--manifest[a layout file]:file:_files' \
@@ -4537,6 +4838,8 @@ COMMANDS
   pull        fetch every repository and bring it forward (the morning command)
   push        push every repository that has new commits, after committing
               what is pending when asked to (the evening command)
+  commit      commit what is pending, asking for the message; with "push"
+              afterwards, push once the commits are made
   sync        pull, then push
   clone       clone what is missing: a whole GitHub account with its
               organisations, or the entries of a layout file written by
@@ -4559,7 +4862,8 @@ COMMON OPTIONS
       --only GLOB    keep only the repositories whose name matches, repeatable
       --except GLOB  leave out the repositories whose name matches, repeatable
   -n, --dry-run      show what would be done and change nothing
-  -y, --yes          do not ask before committing or pushing
+  -y, --yes          do not ask for a commit message, or before committing,
+                     pushing or cloning
   -v, --verbose      show every repository, not only those that changed
   -q, --quiet        show only what needs you
       --porcelain    one line per repository, fields separated by tabs:
@@ -4672,6 +4976,53 @@ SETTINGS (git config, in a repository or with --global)
   gh-batch.confirm false       never ask (--global)
   gh-batch.message, gh-batch.machine, gh-batch.maxFileSize,
   gh-batch.maxNewFiles         see above (--global)
+
+To commit with a message you type, and to be asked for it, see: $PROG help commit
+EOF
+}
+
+help_commit() {
+    cat <<EOF
+$PROG commit [push] [options] [folder ...]
+
+Commit the pending changes of every repository: files modified, deleted or
+new, the ignored ones excepted. The list is shown first. The first line of
+the commits is then asked for:
+
+  Commit message [A Regular Commit to Synchronise], or - to do nothing:
+
+Enter takes that sentence. Another line is used instead, and a minus sign
+alone does nothing. The list of the files follows the first line in the
+commit. With -m TEXT the text is the first line and the question is the
+usual confirmation; %d is the date, %t the time, %h the machine and %n the
+number of files. The setting gh-batch.message, when it was given, replaces
+the sentence above. Without a terminal the run needs --yes. With
+gh-batch.confirm false nothing is asked.
+
+The same four guards as "$PROG push --commit" leave a repository
+uncommitted and name it: a new file whose name suggests a secret, a file
+above gh-batch.maxFileSize, more new files at once than
+gh-batch.maxNewFiles, and a folder that is a git repository of its own.
+When a commit is refused (by a hook, for instance) the staging area is put
+back as it was. A repository that sets gh-batch.commit to false, or
+gh-batch.pullOnly, is left alone. A detached HEAD is left alone. A
+repository without a remote is committed, and the commit stays on this
+machine.
+
+With "push" after the command, the push runs once the commits are made,
+with its own list and its own confirmation. Declining it leaves the
+commits where they are.
+
+OPTIONS
+  -m, --message TEXT   the first line of the commits (see the placeholders
+                       above); the question is then the usual confirmation
+  -y, --yes            do not ask for the message, nor before the push
+  -n, --dry-run        show the list and the message, and change nothing
+      --notify         send the report through the command of gh-batch.notify
+  and the common options, see: $PROG help
+
+The word push asks for the push afterwards. A folder that is named push is
+given as a path, for example ./push.
 EOF
 }
 
@@ -4910,6 +5261,7 @@ show_help() {
         "")      usage ;;
         pull)    help_pull ;;
         push)    help_push ;;
+        commit)  help_commit ;;
         sync)    help_sync ;;
         clone)   help_clone ;;
         status)  help_status ;;
@@ -5027,6 +5379,16 @@ positional() {
         completion) SHELL_NAME=$1 ;;
         clone)  OWNERS+=("$1") ;;
         config) die "$EX_USAGE" "config takes no argument" ;;
+        commit)
+            # The word push is the request to push once the commits are
+            # made, not the name of a folder. A folder of that name is
+            # given as a path.
+            if [ "$1" = "push" ]; then
+                ALSO_PUSH=1
+            else
+                ARGS+=("$1")
+            fi
+            ;;
         *)      ARGS+=("$1") ;;
     esac
 }
@@ -5040,7 +5402,7 @@ main() {
     COMMAND=$1
     shift
     case "$COMMAND" in
-        pull|push|sync|clone|status|fetch|log|exec|doctor|list|config|completion|help) ;;
+        pull|push|commit|sync|clone|status|fetch|log|exec|doctor|list|config|completion|help) ;;
         *) die "$EX_USAGE" "no such command: $COMMAND (see $PROG help)" ;;
     esac
     parse_options "$@"
@@ -5055,6 +5417,7 @@ main() {
     case "$COMMAND" in
         pull|fetch) cmd_pull ;;
         push)       cmd_push ;;
+        commit)     cmd_commit ;;
         sync)       cmd_sync ;;
         clone)      cmd_clone ;;
         log)        LOG_SINCE=$SINCE; cmd_log ;;
