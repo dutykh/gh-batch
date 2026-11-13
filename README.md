@@ -381,6 +381,8 @@ A report has one line per repository that changed or needs you, in the order of 
 | `unfinished`, `busy` | An operation is in progress; another git process holds the index. |
 | `skipped`, `unreadable` | Set aside by a setting; git cannot read the folder. |
 
+On a terminal every line carries a sign and a colour: a green tick for what was done, a faint dot for nothing to do, yellow arrows and dots for what waits (commits to push, commits to pull, pending changes), a red cross for what needs you; the names are in bold, the branches in cyan, the commits in the yellow of git, and a run of some length says how long it took. The colours are the sixteen of the terminal, so they follow its theme. A report written to a pipe or handed to a command stays plain, `--color never` and the variable `NO_COLOR` turn the colours off, and a terminal that is not UTF-8 gets letters in place of the signs.
+
 The exit status is 0 when nothing needs you, 1 when at least one repository needs you, 2 for a bad invocation, 3 when git or `gh` is missing or another `gh-batch` is at work, and 130 when the run was stopped by a signal. With `--porcelain` each repository is one line of four fields separated by tabs: the state, the path, the branch and the message.
 
 Every move of a branch is recorded with its date in `~/.local/state/gh-batch/journal.tsv`: the fast-forwards, the rebases, the commits and the pushes, with the commits before and after. The same folder keeps the date of the last pull and of the last push, which `status` shows.

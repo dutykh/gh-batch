@@ -1685,6 +1685,15 @@ if describe "output: quiet, verbose and colour"; then
     gb fetch "$A"
     check "output: no colour in a pipe" "an escape was found" \
         "$( ! contains "$OUTPUT" "${esc}[" && echo 0 || echo 1 )"
+    gb fetch --color always --verbose "$A"
+    check "output: on a terminal that is not UTF-8 the states carry letters" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "- up to date" && contains "$OUTPUT" "v behind" && contains "$OUTPUT" "x diverged" && echo 0 || echo 1 )"
+    OUTPUT=$(LC_ALL=C.UTF-8 "$GB" fetch --color always --verbose "$A" 2>&1); RC=$?
+    check "output: on a UTF-8 terminal they carry signs" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "· up to date" && contains "$OUTPUT" "↓ behind" && contains "$OUTPUT" "⇅ diverged" && contains "$OUTPUT" "Needs you:" && echo 0 || echo 1 )"
+    gb fetch --color always --verbose --porcelain "$A"
+    check "output: --porcelain stays plain whatever the colour" "got: $OUTPUT" \
+        "$( ! contains "$OUTPUT" "${esc}[" && contains "$OUTPUT" "diverged${TAB}" && echo 0 || echo 1 )"
     nl=$(printf '\n_'); nl=${nl%_}
     gb pull --only same "$A"
     check "output: one blank line between the header and the summary" "got: $OUTPUT" \

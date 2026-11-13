@@ -28,7 +28,7 @@ set -uo pipefail
 
 : "${HOME:=/}"
 
-GH_BATCH_VERSION="1.0.0"
+GH_BATCH_VERSION="1.1.0"
 PROG="gh-batch"
 
 TAB=$(printf '\t')
@@ -175,13 +175,26 @@ PLAN_COMMITS=0
 PLAN_PUBLIC=0
 
 USE_COLOUR=0
+STYLED=0                  # colours, signs and bold type on the screen
+UNICODE=0                 # the terminal shows UTF-8: signs instead of letters
 C_GOOD=""
 C_INFO=""
 C_BAD=""
 C_DIM=""
+C_BOLD=""
+C_TITLE=""
+C_NAME=""
+C_CYAN=""
+C_HASH=""
+C_PUBLIC=""
 C_OFF=""
 NAME_WIDTH=12
 PROGRESS=0
+SPIN_I=0
+SPIN_U=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+SPIN_A=('|' '/' '-' "\\")
+RUN_START=0
+EXEC_OUTPUT=0             # the lines of detail are what a command of the user wrote
 SHOWN=0                   # a line of the report was written since its header
 ATTENTION=0
 ATTENTION_LIST=""
@@ -465,6 +478,7 @@ setup_run() {
     trap cleanup EXIT
     trap 'on_signal' INT TERM HUP PIPE
     NOW=$(date +%s)
+    RUN_START=$SECONDS
     TODAY=$(date '+%Y-%m-%d')
     CLOCK=$(date '+%H:%M')
     if stat -c %Y / >/dev/null 2>&1; then
@@ -982,22 +996,72 @@ setup_colour() {
             ;;
         *) die "$EX_USAGE" "the choices for --color are auto, always and never, not '$COLOR_MODE'" ;;
     esac
+    # The sixteen colours of the terminal, so that the output follows its
+    # theme, light or dark.
     if [ "$USE_COLOUR" -eq 1 ]; then
         C_GOOD=$(printf '\033[32m')
         C_INFO=$(printf '\033[33m')
         C_BAD=$(printf '\033[1;31m')
         C_DIM=$(printf '\033[2m')
+        C_BOLD=$(printf '\033[1m')
+        C_TITLE=$(printf '\033[1;36m')
+        C_NAME=$(printf '\033[1m')
+        C_CYAN=$(printf '\033[36m')
+        C_HASH=$(printf '\033[33m')
+        C_PUBLIC=$(printf '\033[1;35m')
         C_OFF=$(printf '\033[0m')
     fi
+    STYLED=$USE_COLOUR
+    UNICODE=0
+    case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+        *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) UNICODE=1 ;;
+    esac
     PROGRESS=0
     if [ -t 2 ] && [ "$QUIET" -eq 0 ] && [ "$PORCELAIN" -eq 0 ]; then
         PROGRESS=1
     fi
 }
 
+mark() {
+    # mark STATE -> the sign in front of a state on the screen: a tick for
+    # what was done, a dot for nothing to do, arrows for what waits, a
+    # cross for what needs the user; letters when the terminal is not UTF-8.
+    local u a
+    case "$1" in
+        updated|rebased|merged|pushed|cloned|ok|healthy) u='✓'; a='+' ;;
+        ahead)                 u='↑'; a='^' ;;
+        behind)                u='↓'; a='v' ;;
+        diverged)              u='⇅'; a='x' ;;
+        planned)               u='→'; a='>' ;;
+        warning)               u='⚠'; a='!' ;;
+        pending|stash|active)  u='●'; a='*' ;;
+        localonly|noupstream|detached) u='○'; a='o' ;;
+        uptodate|clean|nothing|present|skipped) u='·'; a='-' ;;
+        *)                     u='✗'; a='x' ;;
+    esac
+    if [ "$UNICODE" -eq 1 ]; then printf '%s' "$u"; else printf '%s' "$a"; fi
+}
+
+class_colour() {
+    # class_colour STATE -> the colour of the class of the state
+    case "$(state_class "$1")" in
+        good) printf '%s' "$C_GOOD" ;;
+        info) printf '%s' "$C_INFO" ;;
+        dim)  printf '%s' "$C_DIM" ;;
+        *)    printf '%s' "$C_BAD" ;;
+    esac
+}
+
 progress_show() {
+    local frame
     [ "$PROGRESS" -eq 1 ] || return 0
-    printf '\r\033[K  %s of %s ...' "$1" "$2" >&2
+    if [ "$UNICODE" -eq 1 ]; then
+        frame=${SPIN_U[$(( SPIN_I % 10 ))]}
+    else
+        frame=${SPIN_A[$(( SPIN_I % 4 ))]}
+    fi
+    SPIN_I=$(( SPIN_I + 1 ))
+    printf '\r\033[K  %s%s%s %s of %s' "$C_CYAN" "$frame" "$C_OFF" "$1" "$2" >&2
 }
 
 progress_clear() {
@@ -1013,9 +1077,59 @@ put() {
     printf '%s\n' "$1"
 }
 
+put_styled() {
+    # put_styled PLAIN STYLED: PLAIN goes to the copy kept for the
+    # notification and to a pipe, STYLED to a terminal that shows colours.
+    [ -n "$TMP" ] && printf '%s\n' "$1" >> "$TMP/report.txt"
+    [ "$QUIET" -eq 1 ] && return 0
+    if [ "$STYLED" -eq 1 ]; then
+        printf '%s\n' "$2"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+put_title() {
+    # put_title TEXT: a line that heads a part of the report.
+    put_styled "$1" "$C_BOLD$1$C_OFF"
+}
+
+style_message() {
+    # style_message TEXT -> the message of a repository, its marks coloured
+    local t="$1"
+    t=${t//\[PUBLIC\]/[$C_PUBLIC"PUBLIC"$C_OFF]}
+    t=${t//NOT committed/$C_BAD"NOT committed"$C_OFF}
+    printf '%s' "$t"
+}
+
+style_detail() {
+    # style_detail LINE -> a line of detail: the commit at its start in the
+    # colour of git, the word for a change in the colour of its state, the
+    # level of a finding in its own; the rest faint.
+    local line="$1" word rest
+    if [ "$EXEC_OUTPUT" -eq 1 ]; then
+        printf '%s' "$line"
+        return 0
+    fi
+    if [[ $line =~ ^([0-9a-f]{7,40})[[:space:]]+(.*)$ ]]; then
+        printf '%s%s%s %s%s%s' "$C_HASH" "${BASH_REMATCH[1]}" "$C_OFF" "$C_DIM" "${BASH_REMATCH[2]}" "$C_OFF"
+        return 0
+    fi
+    word=${line%% *}
+    rest=${line#"$word"}
+    case "$word" in
+        new)              printf '%s%s%s%s' "$C_GOOD" "$word" "$C_OFF" "$rest" ;;
+        changed)          printf '%s%s%s%s' "$C_INFO" "$word" "$C_OFF" "$rest" ;;
+        deleted|conflict) printf '%s%s%s%s' "$C_BAD" "$word" "$C_OFF" "$rest" ;;
+        warning:)         printf '%s%s%s%s' "$C_INFO" "$word" "$C_OFF" "$rest" ;;
+        problem:)         printf '%s%s%s%s' "$C_BAD" "$word" "$C_OFF" "$rest" ;;
+        *)                printf '%s%s%s' "$C_DIM" "$line" "$C_OFF" ;;
+    esac
+}
+
 put_repo() {
     # put_repo STATE ATTENTION NAME BRANCH MESSAGE
-    local state="$1" attention="$2" name="$3" branch="$4" message="$5" label colour="" plain
+    local state="$1" attention="$2" name="$3" branch="$4" message="$5" label colour="" plain name_colour
     label=$(state_label "$state")
     plain=$(printf '  %-13s %-*s  %-8s %s' "$label" "$NAME_WIDTH" "$name" "$branch" "$message")
     plain=${plain%"${plain##*[! ]}"}
@@ -1024,14 +1138,12 @@ put_repo() {
     if [ "$QUIET" -eq 1 ] && [ "$attention" -ne 1 ]; then
         return 0
     fi
-    if [ "$USE_COLOUR" -eq 1 ]; then
-        case "$(state_class "$state")" in
-            good) colour=$C_GOOD ;;
-            info) colour=$C_INFO ;;
-            dim)  colour=$C_DIM ;;
-            *)    colour=$C_BAD ;;
-        esac
-        printf '  %s%-13s%s %-*s  %s%-8s%s %s\n' "$colour" "$label" "$C_OFF" "$NAME_WIDTH" "$name" "$C_DIM" "$branch" "$C_OFF" "$message"
+    if [ "$STYLED" -eq 1 ]; then
+        colour=$(class_colour "$state")
+        name_colour=$C_NAME
+        [ "$colour" = "$C_DIM" ] && name_colour=$C_DIM
+        printf '  %s%s %-13s%s %s%-*s%s  %s%-8s%s %s\n' "$colour" "$(mark "$state")" "$label" "$C_OFF" \
+            "$name_colour" "$NAME_WIDTH" "$name" "$C_OFF" "$C_CYAN" "$branch" "$C_OFF" "$(style_message "$message")"
     else
         printf '%s\n' "$plain"
     fi
@@ -1066,7 +1178,11 @@ print_record() {
         line=$(printf '%s' "$line" | redact)
         [ -n "$TMP" ] && printf '        %s\n' "$line" >> "$TMP/report.txt"
         if [ "$QUIET" -eq 0 ] || [ "$REC_attention" = 1 ]; then
-            printf '        %s%s%s\n' "$C_DIM" "$line" "$C_OFF"
+            if [ "$STYLED" -eq 1 ]; then
+                printf '        %s\n' "$(style_detail "$line")"
+            else
+                printf '        %s\n' "$line"
+            fi
         fi
     done
     return 0
@@ -1105,29 +1221,37 @@ EOF
 
 header() {
     # header TEXT: the first line of a report.
+    local count
     [ "$PORCELAIN" -eq 1 ] && return 0
-    put "$PROG $COMMAND: $(plural "${#REPOS[@]}" repository) under $ROOT_LABEL$1"
+    count="$(plural "${#REPOS[@]}" repository) under $ROOT_LABEL"
+    put_styled "$PROG $COMMAND: $count$1" "$C_TITLE$PROG $COMMAND$C_OFF: $count${1:+$C_DIM$1$C_OFF}"
     put ""
 }
 
 summary() {
-    local state var n text=""
+    local state var n text="" styled="" phrase elapsed when="" head
     [ "$PORCELAIN" -eq 1 ] && return 0
     for state in $STATE_ORDER; do
         var="N_$state"
         n=${!var:-0}
         [ "$n" -gt 0 ] || continue
-        text="$text${text:+, }$(state_phrase "$state" "$n")"
+        phrase=$(state_phrase "$state" "$n")
+        text="$text${text:+, }$phrase"
+        styled="$styled${styled:+, }$(class_colour "$state")$phrase$C_OFF"
     done
+    # A run of some length says how long it took.
+    elapsed=$(( SECONDS - RUN_START ))
+    [ "$elapsed" -ge 2 ] && when=" in $elapsed s"
+    head="$(plural "$TOTAL" repository)$when"
     # A blank line parts the summary from the lines above it, and only from
     # them: the header already ends with one.
     [ "$SHOWN" -eq 1 ] && put ""
-    put "$(plural "$TOTAL" repository): ${text:-nothing to report}."
+    put_styled "$head: ${text:-nothing to report}." "$C_BOLD$head$C_OFF: ${styled:-nothing to report}."
     if [ -n "$ATTENTION_LIST" ]; then
-        put "Needs you: $ATTENTION_LIST."
+        put_styled "Needs you: $ATTENTION_LIST." "$C_BAD$(mark failed) Needs you:$C_OFF $ATTENTION_LIST."
     fi
     if [ "$STOP" -eq 1 ]; then
-        put "The run was stopped before the end."
+        put_styled "The run was stopped before the end." "${C_INFO}The run was stopped before the end.$C_OFF"
     fi
     return 0
 }
@@ -1163,7 +1287,8 @@ finish() {
 
 no_repository() {
     [ "${#REPOS[@]}" -gt 0 ] && return 1
-    [ "$PORCELAIN" -eq 1 ] || put "$PROG $COMMAND: no git repository found under $ROOT_LABEL."
+    [ "$PORCELAIN" -eq 1 ] || put_styled "$PROG $COMMAND: no git repository found under $ROOT_LABEL." \
+        "$C_TITLE$PROG $COMMAND$C_OFF: no git repository found under $ROOT_LABEL."
     return 0
 }
 
@@ -2732,7 +2857,7 @@ show_plan() {
     # The list shown before anything is committed or pushed: what will be
     # done, and what is left aside and why.
     local i=0 count="${#REPOS[@]}"
-    put "Plan:"
+    put_title "Plan:"
     while [ "$i" -lt "$count" ]; do
         if [ -f "$TMP/plan/$i.res" ]; then
             read_record "$TMP/plan/$i.res"
@@ -2743,7 +2868,7 @@ show_plan() {
         i=$(( i + 1 ))
     done
     put ""
-    put "$(plan_words)"
+    put_title "$(plan_words)"
     return 0
 }
 
@@ -2777,7 +2902,7 @@ confirmed() {
     if [ ! -t 0 ]; then
         die "$EX_USAGE" "this run changes repositories: confirm it at a terminal, or add --yes"
     fi
-    printf 'Proceed? [Y/n] ' >&2
+    printf '%sProceed?%s [Y/n] ' "$C_BOLD" "$C_OFF" >&2
     IFS= read -r answer || answer="n"
     [ "$STOP" -eq 1 ] && return 1
     case "$answer" in
@@ -2798,7 +2923,7 @@ push_phase() {
         fi
         if [ "$PORCELAIN" -eq 0 ]; then
             put ""
-            put "Done:"
+            put_title "Done:"
         fi
         pool do_push push render
         [ "$STOP" -eq 0 ] && remember_run push
@@ -2811,7 +2936,7 @@ push_phase() {
     done
     if [ "$DRY_RUN" -eq 1 ] && [ "$PLAN_GO" -gt 0 ] && [ "$PORCELAIN" -eq 0 ]; then
         put ""
-        put "$(plan_words) Nothing was changed (dry run)."
+        put_title "$(plan_words) Nothing was changed (dry run)."
     fi
     return 0
 }
@@ -2839,7 +2964,7 @@ cmd_sync() {
     begin_command change
     no_repository && exit "$EX_OK"
     header ""
-    [ "$PORCELAIN" -eq 0 ] && put "First, the pull:"
+    [ "$PORCELAIN" -eq 0 ] && put_title "First, the pull:"
     pool do_pull pull render
     [ "$STOP" -eq 0 ] && [ "$ONLY_LOOK" -eq 0 ] && remember_run pull
     if [ "$STOP" -eq 1 ]; then
@@ -2849,7 +2974,7 @@ cmd_sync() {
     reset_tally
     if [ "$PORCELAIN" -eq 0 ]; then
         put ""
-        put "Then, the push:"
+        put_title "Then, the push:"
     fi
     push_phase
     finish
@@ -3196,16 +3321,22 @@ do_clone() {
 }
 
 show_clone_plan() {
-    local i=0 line size=""
+    local i=0 line size="" mark_colour
     if [ "$C_TOTAL_KB" -ge 1024 ]; then
         size=" (about $(megabytes "$C_TOTAL_KB"))"
     elif [ "$C_TOTAL_KB" -gt 0 ]; then
         size=" (under 1 MB)"
     fi
-    put "Plan: clone $(plural "${#REPOS[@]}" repository) into $(short_path "$DEST")$size"
+    put_title "Plan: clone $(plural "${#REPOS[@]}" repository) into $(short_path "$DEST")$size"
     while [ "$i" -lt "${#REPOS[@]}" ]; do
-        line=$(printf '  %-*s  %-8s %s' "$NAME_WIDTH" "${NAMES[$i]}" "${C_MARK[$i]}" "$( [ "${C_SIZE[$i]}" -gt 0 ] && megabytes "${C_SIZE[$i]}" )")
-        put "${line%"${line##*[! ]}"}"
+        size=$( [ "${C_SIZE[$i]}" -gt 0 ] && megabytes "${C_SIZE[$i]}" )
+        line=$(printf '  %-*s  %-8s %s' "$NAME_WIDTH" "${NAMES[$i]}" "${C_MARK[$i]}" "$size")
+        case "${C_MARK[$i]}" in
+            PUBLIC) mark_colour=$C_PUBLIC ;;
+            *)      mark_colour=$C_DIM ;;
+        esac
+        put_styled "${line%"${line##*[! ]}"}" \
+            "$(printf '  %s%-*s%s  %s%-8s%s %s%s%s' "$C_NAME" "$NAME_WIDTH" "${NAMES[$i]}" "$C_OFF" "$mark_colour" "${C_MARK[$i]}" "$C_OFF" "$C_DIM" "$size" "$C_OFF")"
         i=$(( i + 1 ))
     done
     return 0
@@ -3273,10 +3404,11 @@ cmd_clone() {
         # The counts that follow concern the repositories that the filters
         # kept, which the first words say when they kept fewer.
         [ "$C_WANTED" -lt "$C_LISTED" ] && note="$note, $C_WANTED of them selected"
-        put "$PROG clone: $note; $C_PRESENT already under $(short_path "$DEST"), ${#REPOS[@]} to clone"
+        put_styled "$PROG clone: $note; $C_PRESENT already under $(short_path "$DEST"), ${#REPOS[@]} to clone" \
+            "$C_TITLE$PROG clone$C_OFF: $note; $C_PRESENT already under $(short_path "$DEST"), ${#REPOS[@]} to clone"
         put ""
         for note in ${C_NOTES[@]+"${C_NOTES[@]}"}; do
-            put "  note: $note"
+            put_styled "  note: $note" "  ${C_INFO}note:$C_OFF $note"
         done
         [ "${#C_NOTES[@]}" -gt 0 ] && put ""
     fi
@@ -3336,7 +3468,7 @@ cmd_clone() {
             JOBS=$VAL
             if [ "$PORCELAIN" -eq 0 ]; then
                 put ""
-                put "Then, the pull of the $(plural "${#REPOS[@]}" repository) already here:"
+                put_title "Then, the pull of the $(plural "${#REPOS[@]}" repository) already here:"
             fi
             pool do_pull pull render
             [ "$STOP" -eq 0 ] && [ "$ONLY_LOOK" -eq 0 ] && remember_run pull
@@ -3421,7 +3553,14 @@ render_log() {
         line="$b  $c  $(clip "$e" "$width")"
         [ "$ALL_AUTHORS" -eq 1 ] && line="$line  ($d)"
         [ -n "$TMP" ] && printf '        %s\n' "$line" >> "$TMP/report.txt"
-        [ "$QUIET" -eq 1 ] || printf '        %s\n' "$line"
+        [ "$QUIET" -eq 1 ] && continue
+        if [ "$STYLED" -eq 1 ]; then
+            printf '        %s%s%s  %s%s%s  %s' "$C_DIM" "$b" "$C_OFF" "$C_HASH" "$c" "$C_OFF" "$(clip "$e" "$width")"
+            [ "$ALL_AUTHORS" -eq 1 ] && printf '  %s(%s)%s' "$C_DIM" "$d" "$C_OFF"
+            printf '\n'
+        else
+            printf '        %s\n' "$line"
+        fi
     done < "$2"
     if [ "$PORCELAIN" -eq 0 ] && [ "$n" -gt "$shown" ]; then
         put "        ... and $(( n - shown )) more (all of them with --long)"
@@ -3446,9 +3585,11 @@ cmd_log() {
     if [ "$PORCELAIN" -eq 0 ]; then
         [ "$LOG_COMMITS" -gt 0 ] && put ""
         if [ "$LOG_COMMITS" -eq 0 ]; then
-            put "No commit $period in the $(plural "$TOTAL" repository) under $ROOT_LABEL."
+            put_styled "No commit $period in the $(plural "$TOTAL" repository) under $ROOT_LABEL." \
+                "${C_DIM}No commit $period in the $(plural "$TOTAL" repository) under $ROOT_LABEL.$C_OFF"
         else
-            put "$(plural "$LOG_COMMITS" commit) in $(plural "$LOG_REPOS" repository) $period ($TOTAL searched under $ROOT_LABEL)."
+            put_styled "$(plural "$LOG_COMMITS" commit) in $(plural "$LOG_REPOS" repository) $period ($TOTAL searched under $ROOT_LABEL)." \
+                "$C_BOLD$(plural "$LOG_COMMITS" commit) in $(plural "$LOG_REPOS" repository) $period$C_OFF ($TOTAL searched under $ROOT_LABEL)."
         fi
     fi
     [ "$STOP" -eq 1 ] && exit "$EX_INTERRUPT"
@@ -3530,6 +3671,7 @@ cmd_exec() {
     [ "${#EXEC_CMD[@]}" -gt 0 ] ||
         die "$EX_USAGE" "exec needs a command: $PROG exec [options] [folder ...] -- COMMAND [ARGUMENT ...]"
     EXEC_LIMIT=${OPT_TIMEOUT:-0}
+    EXEC_OUTPUT=1
     setup_colour
     setup_run
     for name in $(git rev-parse --local-env-vars 2>/dev/null); do
@@ -3727,15 +3869,15 @@ cmd_doctor() {
     doctor_around
     if [ "$PORCELAIN" -eq 0 ] && [ "${#AROUND[@]}" -gt 0 ]; then
         [ "$SHOWN" -eq 1 ] && put ""
-        put "Around the repositories:"
+        put_title "Around the repositories:"
         for line in "${AROUND[@]}"; do
-            put "  warning: $line"
+            put_styled "  warning: $line" "  ${C_INFO}warning:$C_OFF $line"
         done
         SHOWN=1
     fi
     if [ "$PORCELAIN" -eq 0 ] && [ "$OFFLINE" -eq 0 ] && ! have gh; then
         [ "$SHOWN" -eq 1 ] && put ""
-        put "GitHub was not asked: gh is not installed."
+        put_styled "GitHub was not asked: gh is not installed." "${C_DIM}GitHub was not asked: gh is not installed.$C_OFF"
         SHOWN=1
     fi
     finish
@@ -3883,35 +4025,45 @@ first_remote_url() {
     return 0
 }
 
+setting_row() {
+    # setting_row NAME VALUE SOURCE: one line of "config"
+    if [ "$STYLED" -eq 1 ]; then
+        printf '  %s%-12s%s %-30s %s%s%s\n' "$C_CYAN" "$1" "$C_OFF" "$2" "$C_DIM" "$3" "$C_OFF"
+    else
+        printf '  %-12s %-30s %s\n' "$1" "$2" "$3"
+    fi
+}
+
 cmd_config() {
     local root
-    printf '%s %s, settings in force\n\n' "$PROG" "$GH_BATCH_VERSION"
+    setup_colour
+    printf '%s%s %s%s, settings in force\n\n' "$C_TITLE" "$PROG" "$GH_BATCH_VERSION" "$C_OFF"
     if [ -n "${GH_BATCH_ROOT:-}" ]; then
-        printf '  %-12s %-30s %s\n' "root" "$GH_BATCH_ROOT" "environment (GH_BATCH_ROOT)"
+        setting_row "root" "$GH_BATCH_ROOT" "environment (GH_BATCH_ROOT)"
     elif [ "${#CFG_ROOTS[@]}" -gt 0 ]; then
         for root in "${CFG_ROOTS[@]}"; do
-            printf '  %-12s %-30s %s\n' "root" "$(short_path "$root")" "git config"
+            setting_row "root" "$(short_path "$root")" "git config"
         done
     else
-        printf '  %-12s %-30s %s\n' "root" "(the current folder)" "default"
+        setting_row "root" "(the current folder)" "default"
     fi
-    printf '  %-12s %-30s %s\n' "depth" "$DEPTH" "$SRC_depth"
-    printf '  %-12s %-30s %s\n' "jobs" "$JOBS" "$SRC_jobs"
-    printf '  %-12s %-30s %s\n' "timeout" "$TIMEOUT s" "$SRC_timeout"
-    printf '  %-12s %-30s %s\n' "diverged" "$DIVERGED" "$SRC_diverged"
-    printf '  %-12s %-30s %s\n' "commit" "$( [ "$COMMIT" -eq 1 ] && printf 'true' || printf 'false' )" "$SRC_commit"
-    printf '  %-12s %-30s %s\n' "confirm" "$( [ "$CONFIRM" -eq 1 ] && printf 'true' || printf 'false' )" "$SRC_confirm"
-    printf '  %-12s %-30s %s\n' "message" "$MESSAGE" "$SRC_message"
-    printf '  %-12s %-30s %s\n' "machine" "$MACHINE_NAME" "$SRC_machine"
-    printf '  %-12s %-30s %s\n' "maxFileSize" "$MAX_FILE_MB MB" "$SRC_maxfile"
-    printf '  %-12s %-30s %s\n' "maxNewFiles" "$MAX_NEW_FILES" "$SRC_maxnew"
-    printf '  %-12s %-30s %s\n' "notify" "${NOTIFY_CMD:-(none)}" "$SRC_notify"
-    printf '  %-12s %-30s %s\n' "notifyOn" "$NOTIFY_ON" "$SRC_notifyon"
+    setting_row "depth" "$DEPTH" "$SRC_depth"
+    setting_row "jobs" "$JOBS" "$SRC_jobs"
+    setting_row "timeout" "$TIMEOUT s" "$SRC_timeout"
+    setting_row "diverged" "$DIVERGED" "$SRC_diverged"
+    setting_row "commit" "$( [ "$COMMIT" -eq 1 ] && printf 'true' || printf 'false' )" "$SRC_commit"
+    setting_row "confirm" "$( [ "$CONFIRM" -eq 1 ] && printf 'true' || printf 'false' )" "$SRC_confirm"
+    setting_row "message" "$MESSAGE" "$SRC_message"
+    setting_row "machine" "$MACHINE_NAME" "$SRC_machine"
+    setting_row "maxFileSize" "$MAX_FILE_MB MB" "$SRC_maxfile"
+    setting_row "maxNewFiles" "$MAX_NEW_FILES" "$SRC_maxnew"
+    setting_row "notify" "${NOTIFY_CMD:-(none)}" "$SRC_notify"
+    setting_row "notifyOn" "$NOTIFY_ON" "$SRC_notifyon"
     for root in ${CFG_EXCLUDE[@]+"${CFG_EXCLUDE[@]}"}; do
-        printf '  %-12s %-30s %s\n' "exclude" "$root" "git config"
+        setting_row "exclude" "$root" "git config"
     done
-    printf '\nA setting is changed with: git config --global gh-batch.NAME VALUE\n'
-    printf 'The record of what the tool moved is kept in %s\n' "$(short_path "$STATE_DIR")"
+    printf '\n%sA setting is changed with: git config --global gh-batch.NAME VALUE%s\n' "$C_DIM" "$C_OFF"
+    printf '%sThe record of what the tool moved is kept in %s%s\n' "$C_DIM" "$(short_path "$STATE_DIR")" "$C_OFF"
     exit "$EX_OK"
 }
 

@@ -4,6 +4,10 @@
 
 The versions follow semantic versioning: a change that breaks a command line, a setting or the format of `--porcelain` raises the first number.
 
+## 1.1.0, 13 November 2026
+
+The report is easier to read at a glance. Every repository carries a sign: a tick for what was done, a dot for nothing to do, arrows for commits to push or to pull, a cross for what needs you; the names are bold, the branches cyan, the commits in the yellow of git, the changed files named in words with the colour of their change, and the summary coloured the same way. A spinner shows the progress of a run, and a run of some length says how long it took. The colours are the sixteen of the terminal, so that they follow its theme; a pipe, a notification, `--color never` and `NO_COLOR` keep the plain text, and a terminal that is not UTF-8 gets letters in place of the signs.
+
 ## 1.0.0, 13 November 2026
 
 First release.
