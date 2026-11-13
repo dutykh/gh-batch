@@ -4,7 +4,7 @@
 
 The versions follow semantic versioning: a change that breaks a command line, a setting or the format of `--porcelain` raises the first number.
 
-## 1.3.0, 13 November 2026
+## 1.3.0, 14 November 2026
 
 The command `commit` commits the pending changes of every repository. The list is shown first, and the first line of the commits is asked for: Enter takes the sentence "A Regular Commit to Synchronise", another line replaces it, and a minus sign alone does nothing. The same guards as the evening commit apply, a repository that opted out is left alone, and a repository without a remote is committed and stays on this machine. `commit push` does this and then the push, which asks on its own; declining the push leaves the commits where they are. With `-m`, with `--yes`, or with `gh-batch.message` set, the message is the one given, and the evening push keeps its own work-in-progress line.
 
