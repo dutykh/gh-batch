@@ -1239,14 +1239,16 @@ summary() {
         text="$text${text:+, }$phrase"
         styled="$styled${styled:+, }$(class_colour "$state")$phrase$C_OFF"
     done
-    # A run of some length says how long it took.
+    # On the screen a run of some length says how long it took; the plain
+    # text, which a program or a notification may compare, does not depend
+    # on the clock.
     elapsed=$(( SECONDS - RUN_START ))
     [ "$elapsed" -ge 2 ] && when=" in $elapsed s"
-    head="$(plural "$TOTAL" repository)$when"
+    head=$(plural "$TOTAL" repository)
     # A blank line parts the summary from the lines above it, and only from
     # them: the header already ends with one.
     [ "$SHOWN" -eq 1 ] && put ""
-    put_styled "$head: ${text:-nothing to report}." "$C_BOLD$head$C_OFF: ${styled:-nothing to report}."
+    put_styled "$head: ${text:-nothing to report}." "$C_BOLD$head$when$C_OFF: ${styled:-nothing to report}."
     if [ -n "$ATTENTION_LIST" ]; then
         put_styled "Needs you: $ATTENTION_LIST." "$C_BAD$(mark failed) Needs you:$C_OFF $ATTENTION_LIST."
     fi
