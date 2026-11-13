@@ -1149,6 +1149,216 @@ if describe "notify: the report is handed to a command"; then
         "$( contains "$(cat "$WORLD/note.txt" 2>/dev/null)" "Needs you: fight" && [ "$(cat "$WORLD/note.env" 2>/dev/null)" = "pull attention" ] && echo 0 || echo 1 )"
 fi
 
+# --- clone: an account on GitHub ---------------------------------------------------
+account() {
+    # account LOGIN: the stub gh is logged in as LOGIN, and addresses of
+    # GitHub lead to the servers of the sandbox.
+    printf '%s\n' "$1" > "$GH_STUB_DIR/user"
+    mkdir -p "$GH_STUB_DIR/list" "$GH_STUB_DIR/names"
+    git config --global "url.$SRV/.insteadOf" "https://github.com/"
+}
+
+listed() {
+    # listed OWNER NAME [FORK ARCHIVED PRIVATE SIZE_KB PUSHED]: one more
+    # repository that GitHub lists for OWNER, served by the sandbox.
+    local owner="$1" name="$2"
+    if [ ! -d "$SRV/$owner/$name.git" ]; then
+        mkdir -p "$SRV/$owner"
+        server "$name"
+        mv "$SRV/$name.git" "$SRV/$owner/$name.git"
+    fi
+    printf '%s/%s\037%s\037%s\037%s\037%s\037%s\037https://github.com/%s/%s\037git@github.com:%s/%s.git\n' \
+        "$owner" "$name" "${3:-false}" "${4:-false}" "${5:-true}" "${6:-2048}" "${7:-2026-06-01T10:00:00Z}" \
+        "$owner" "$name" "$owner" "$name" >> "$GH_STUB_DIR/list/$owner"
+}
+
+if describe "clone: the missing repositories of an account"; then
+    world
+    account me
+    listed me alpha
+    listed me beta false false false 4096
+    listed me gamma
+    git clone -q "https://github.com/me/alpha" "$A/alpha"
+    mkdir -p "$A/deep/down"
+    git clone -q "https://github.com/me/beta" "$A/deep/down/other-name"
+    OUTPUT=$(cd "$WORLD" && "$GB" clone 2>&1); RC=$?
+    check "clone: without a destination nothing is cloned" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 2 ] && contains "$OUTPUT" "--into" && echo 0 || echo 1 )"
+    gb clone --into "$A" --dry-run
+    check "clone --dry-run: the list of what is missing, and nothing cloned" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "3 repositories of me on GitHub; 2 already under" && contains "$OUTPUT" "gamma" && ! contains "$OUTPUT" "  beta" && [ ! -e "$A/gamma" ] && echo 0 || echo 1 )"
+    gb clone --into "$A"
+    check "clone: without a terminal the run asks for --yes" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 2 ] && [ ! -e "$A/gamma" ] && echo 0 || echo 1 )"
+    gb clone --into "$A" --yes
+    check "clone: the missing one is cloned, under the address of GitHub" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ -f "$A/gamma/readme.txt" ] && [ "$(git -C "$A/gamma" config remote.origin.url)" = "https://github.com/me/gamma" ] && contains "$OUTPUT" "1 cloned" && echo 0 || echo 1 )"
+    check "clone: a repository present under another name and depth is not cloned again" "beta was cloned twice" \
+        "$( [ ! -e "$A/beta" ] && echo 0 || echo 1 )"
+    check "clone: no temporary folder is left" "found: $(ls -A "$A" | tr '\n' ' ')" \
+        "$( [ -z "$(ls -A "$A" | grep '^\.gh-batch-clone' || true)" ] && echo 0 || echo 1 )"
+    gb clone --into "$A" --yes
+    check "clone: a second run finds nothing missing" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "Nothing is missing" && echo 0 || echo 1 )"
+    git config --global gh-batch.root "$B"
+    OUTPUT=$(cd "$WORLD" && "$GB" clone --yes --porcelain 2>&1); RC=$?
+    check "clone: gh-batch.root is the default destination" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ -d "$B/alpha/.git" ] && [ -d "$B/beta/.git" ] && [ -d "$B/gamma/.git" ] && contains "$OUTPUT" "cloned${TAB}$B/alpha" && echo 0 || echo 1 )"
+fi
+
+if describe "clone: owners, layouts and filters"; then
+    world
+    account me
+    listed me mine
+    listed me forked true false
+    listed me shelved false true
+    listed me old false false true 100 "2020-03-01T00:00:00Z"
+    listed lab tool
+    listed lab data
+    gb clone --into "$A" --yes me lab
+    check "clone: the account goes flat, another owner in its own folder" "got rc=$RC: $(cd "$A" && find . -maxdepth 2 -name .git -prune -o -type d -print | sort | tr '\n' ' ')" \
+        "$( [ -d "$A/mine/.git" ] && [ -d "$A/lab/tool/.git" ] && [ -d "$A/lab/data/.git" ] && [ ! -e "$A/tool" ] && echo 0 || echo 1 )"
+    gb clone --into "$WORLD/flat" --yes --flat lab
+    check "clone --flat: every owner at the top" "got: $(ls "$WORLD/flat" | tr '\n' ' ')" \
+        "$( [ -d "$WORLD/flat/tool/.git" ] && [ ! -e "$WORLD/flat/lab" ] && echo 0 || echo 1 )"
+    gb clone --into "$WORLD/owners" --yes --by-owner --only mine
+    check "clone --by-owner, --only: one repository, under its owner" "got: $(ls "$WORLD/owners" | tr '\n' ' ')" \
+        "$( [ -d "$WORLD/owners/me/mine/.git" ] && [ "$(ls "$WORLD/owners/me" | tr '\n' ' ')" = "mine " ] && echo 0 || echo 1 )"
+    gb clone --into "$WORLD/f1" --dry-run --no-forks --no-archived
+    check "clone --no-forks --no-archived" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "mine" && contains "$OUTPUT" "old" && ! contains "$OUTPUT" "forked" && ! contains "$OUTPUT" "shelved" && echo 0 || echo 1 )"
+    gb clone --into "$WORLD/f2" --dry-run --since 2025-01-01 --except 'fork*'
+    check "clone --since, --except" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "mine" && ! contains "$OUTPUT" "  old" && ! contains "$OUTPUT" "forked" && contains "$OUTPUT" "shelved" && echo 0 || echo 1 )"
+    gb clone --into "$WORLD/f3" --dry-run
+    check "clone: the list shows the sizes and marks the public ones" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "private" && contains "$OUTPUT" "2 MB" && contains "$OUTPUT" "about" && echo 0 || echo 1 )"
+    gb clone --into "$WORLD/f4" --since yesterday
+    check "clone: a date in another form is a usage error" "got rc=$RC" "$( [ "$RC" -eq 2 ] && echo 0 || echo 1 )"
+    gb clone --into "$WORLD/f5" --dry-run nobody
+    check "clone: an owner unknown to GitHub is an error, not an empty list" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 3 ] && contains "$OUTPUT" "nobody" && echo 0 || echo 1 )"
+fi
+
+if describe "clone: folders that are in the way"; then
+    world
+    account me
+    listed me asfile
+    listed me full
+    listed me empty
+    listed me other
+    listed me moved
+    listed me fine
+    : > "$A/asfile"
+    mkdir -p "$A/full" "$A/empty"
+    printf 'mine\n' > "$A/full/notes.txt"
+    git init -q "$A/other"
+    commit "$A/other" x.txt "x" "Unrelated"
+    git -C "$A/other" remote add origin "https://github.com/me/something-else"
+    git clone -q "https://github.com/me/moved" "$A/moved"
+    git -C "$A/moved" remote set-url origin "https://github.com/me/old-name"
+    mkdir -p "$GH_STUB_DIR/names/me"
+    printf 'me/moved\n' > "$GH_STUB_DIR/names/me/old-name"
+    s_other=$(state_of "$A/other")
+    gb clone --into "$A" --yes
+    check "clone: a file, a filled folder and another repository are left alone" "got rc=$RC: $OUTPUT" \
+        "$( [ -f "$A/asfile" ] && [ ! -e "$A/full/.git" ] && [ "$(cat "$A/full/notes.txt")" = "mine" ] && [ "$(state_of "$A/other")" = "$s_other" ] && [ "$RC" -eq 1 ] && echo 0 || echo 1 )"
+    check "clone: each of them is named with its reason" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "asfile is not cloned" && contains "$OUTPUT" "full is not cloned" && contains "$OUTPUT" "other is not cloned" && echo 0 || echo 1 )"
+    check "clone: an empty folder is used, the rest is cloned" "got: $OUTPUT" \
+        "$( [ -d "$A/empty/.git" ] && [ -d "$A/fine/.git" ] && echo 0 || echo 1 )"
+    check "clone: a renamed repository is recognised and its new address given" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "moved is here under an older address" && contains "$OUTPUT" "remote set-url origin https://github.com/me/moved" && echo 0 || echo 1 )"
+    gb clone --into "$A/fine" --dry-run
+    check "clone: no clone inside a repository" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 2 ] && contains "$OUTPUT" "inside a git repository" && echo 0 || echo 1 )"
+fi
+
+if describe "clone: failures leave nothing half-made"; then
+    world
+    account me
+    listed me good
+    listed me broken
+    rm -rf "$SRV/me/broken.git"
+    mkdir -p "$A/.gh-batch-clone.stale.999999" "$A/.gh-batch-clone.alive.$$"
+    gb clone --into "$A" --yes --porcelain
+    check "clone: one failure, the other is cloned" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 1 ] && [ "$(st good)" = "cloned" ] && [ "$(st broken)" = "failed" ] && [ ! -e "$A/broken" ] && echo 0 || echo 1 )"
+    check "clone: the leftover of a dead run is removed, the one of a live run is kept" "found: $(ls -A "$A" | tr '\n' ' ')" \
+        "$( [ ! -e "$A/.gh-batch-clone.stale.999999" ] && [ -d "$A/.gh-batch-clone.alive.$$" ] && [ -z "$(ls -A "$A" | grep 'clone.broken' || true)" ] && echo 0 || echo 1 )"
+    world
+    account me
+    listed me slow
+    printf 'ssh\n' > "$GH_STUB_DIR/protocol"
+    export GIT_SSH_COMMAND="$ROOT/tests/stub/hanging-ssh"
+    start_bg clone --into "$A" --yes --porcelain
+    sleep 1.5
+    kill -INT -- "-$BG_PID" 2>/dev/null
+    ended=1
+    wait_bg 10 && ended=0
+    unset GIT_SSH_COMMAND
+    check "clone: an interrupt ends the clone and leaves no folder" "ended=$ended rc=$RC: $OUTPUT; found: $(ls -A "$A" | tr '\n' ' ')" \
+        "$( [ "$ended" -eq 0 ] && [ "$RC" -eq 130 ] && [ -z "$(ls -A "$A")" ] && echo 0 || echo 1 )"
+fi
+
+if describe "clone: --update pulls what was there"; then
+    world
+    account me
+    listed me here
+    listed me away
+    git clone -q "https://github.com/me/here" "$A/here"
+    git clone -q "https://github.com/me/here" "$B/here"
+    commit "$B/here" n.txt "n" "News"
+    publish "$B/here"
+    gb clone --into "$A" --yes --update
+    check "clone --update: the missing one is cloned, the present one is brought forward" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ -d "$A/away/.git" ] && [ -f "$A/here/n.txt" ] && contains "$OUTPUT" "1 cloned" && contains "$OUTPUT" "1 updated" && echo 0 || echo 1 )"
+fi
+
+if describe "clone: without gh"; then
+    world
+    OUTPUT=$(GH_BATCH_HIDE=gh "$GB" clone --into "$A" --yes 2>&1); RC=$?
+    check "clone: reading an account needs gh, and says so" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 3 ] && contains "$OUTPUT" "gh" && echo 0 || echo 1 )"
+    rm -f "$GH_STUB_DIR/user"
+    gb clone --into "$A" --yes
+    check "clone: a gh that is not logged in is reported" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 3 ] && contains "$OUTPUT" "logged in" && echo 0 || echo 1 )"
+fi
+
+# --- list --manifest and clone --manifest ----------------------------------------------
+if describe "manifest: the layout of one machine is rebuilt on another"; then
+    world
+    server one
+    server two
+    server three
+    clone_to "$A" one
+    mkdir -p "$A/group/sub"
+    clone_to "$A" two "group/sub/second name"
+    clone_to "$A" three
+    git -C "$A/three" checkout -q -b work
+    commit "$A/three" w.txt "w" "Work"
+    git -C "$A/three" push -q -u origin work
+    git init -q "$A/lonely"
+    commit "$A/lonely" f.txt "f" "Alone"
+    OUTPUT=$("$GB" list --manifest "$A" 2>"$WORLD/list.err"); RC=$?
+    printf '%s\n' "$OUTPUT" > "$WORLD/layout.tsv"
+    check "list --manifest: one line per repository with a remote" "got: $OUTPUT; warnings: $(cat "$WORLD/list.err")" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "group/sub/second name${TAB}$SRV/two.git${TAB}main" && contains "$OUTPUT" "three${TAB}$SRV/three.git${TAB}work" && ! contains "$OUTPUT" "lonely$TAB" && contains "$(cat "$WORLD/list.err")" "lonely has no remote" && echo 0 || echo 1 )"
+    clone_to "$B" one
+    OUTPUT=$(GH_BATCH_HIDE=gh "$GB" clone --manifest "$WORLD/layout.tsv" --into "$B" --yes 2>&1); RC=$?
+    check "clone --manifest: the missing ones return to their folders, without gh" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ -f "$B/group/sub/second name/readme.txt" ] && [ -d "$B/three/.git" ] && contains "$OUTPUT" "2 cloned" && contains "$OUTPUT" "1 already under" && echo 0 || echo 1 )"
+    check "clone --manifest: each repository is on the branch of the layout" "three is on $(git -C "$B/three" symbolic-ref --short HEAD)" \
+        "$( [ "$(git -C "$B/three" symbolic-ref --short HEAD)" = "work" ] && [ -f "$B/three/w.txt" ] && echo 0 || echo 1 )"
+    printf '../escape\t%s\tmain\n' "$SRV/one.git" > "$WORLD/bad.tsv"
+    gb clone --manifest "$WORLD/bad.tsv" --into "$B" --yes
+    check "clone --manifest: a folder outside the destination is refused" "got rc=$RC: $OUTPUT" \
+        "$( [ ! -e "$WORLD/escape" ] && contains "$OUTPUT" "leaves the destination" && echo 0 || echo 1 )"
+    gb clone --manifest "$WORLD/layout.tsv" --into "$B" --yes me
+    check "clone: owners and a layout file together are a usage error" "got rc=$RC" "$( [ "$RC" -eq 2 ] && echo 0 || echo 1 )"
+fi
+
 # --- output ------------------------------------------------------------------
 if describe "output: quiet, verbose and colour"; then
     world

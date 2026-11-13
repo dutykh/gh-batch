@@ -8,6 +8,7 @@
 # The answers live in the folder $GH_STUB_DIR:
 #   user               the login of the account
 #   repos/OWNER/NAME   the line answered by "gh api repos/OWNER/NAME"
+#   names/OWNER/NAME   its present name, answered when only .full_name is asked
 #   list/OWNER         the lines answered by "gh repo list OWNER"
 #   protocol           https or ssh, for "gh config get git_protocol"
 # Every call is appended to $GH_STUB_DIR/calls, so that a test can tell
@@ -21,8 +22,12 @@ case "$1 $2" in
         cat "$dir/user" 2>/dev/null || exit 1
         ;;
     "api repos/"*)
-        if [ -f "$dir/$2" ]; then
-            cat "$dir/$2"
+        kind=repos
+        for arg in "$@"; do
+            [ "$arg" = ".full_name" ] && kind=names
+        done
+        if [ -f "$dir/$kind/${2#repos/}" ]; then
+            cat "$dir/$kind/${2#repos/}"
         else
             echo "gh: Not Found (HTTP 404)" >&2
             exit 1

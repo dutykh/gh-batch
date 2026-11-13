@@ -59,6 +59,26 @@ OPT_MESSAGE=""
 OPT_NOTIFY=0
 YES=0
 SET_UPSTREAM=0
+OWNERS=()                 # clone: the accounts or organisations named
+INTO=""
+MANIFEST_IN=""
+SINCE=""
+NO_FORKS=0
+NO_ARCHIVED=0
+LAYOUT="auto"
+UPDATE=0
+DEST=""
+GLOBAL_SSH=""
+C_URL=()                  # clone: one entry per repository to clone
+C_BRANCH=()
+C_MARK=()
+C_SIZE=()
+C_NOTES=()
+C_LISTED=0
+C_WANTED=0
+C_PRESENT=0
+C_BLOCKED=0
+C_TOTAL_KB=0
 DRY_RUN=0
 QUIET=0
 VERBOSE=0
@@ -578,7 +598,7 @@ selected() {
 }
 
 discover() {
-    local roots=() root abs i kept_repos=() kept_names=() name
+    local roots=() root abs i kept_repos=() kept_names=()
     if [ "${#ARGS[@]}" -gt 0 ]; then
         roots=("${ARGS[@]}")
     elif [ -n "${GH_BATCH_ROOT:-}" ]; then
@@ -609,6 +629,13 @@ discover() {
     done
     REPOS=(${kept_repos[@]+"${kept_repos[@]}"})
     NAMES=(${kept_names[@]+"${kept_names[@]}"})
+    fit_names
+    return 0
+}
+
+fit_names() {
+    # The width of the column of names, for the repositories in hand.
+    local name
     NAME_WIDTH=12
     for name in ${NAMES[@]+"${NAMES[@]}"}; do
         [ "${#name}" -gt "$NAME_WIDTH" ] && NAME_WIDTH=${#name}
@@ -2304,7 +2331,7 @@ do_plan() {
             block=$(commit_blocker)
             [ -z "$block" ] && will_commit=1
         else
-            stays="$(describe_pending) not committed: they stay on this machine"
+            stays="$(describe_pending): not committed, they stay on this machine"
         fi
     fi
     if [ "$will_commit" -eq 0 ] && [ "$P_ahead" -eq 0 ] && [ "$P_new" -eq 0 ]; then
@@ -2588,7 +2615,7 @@ confirmed() {
         return 0
     fi
     if [ ! -t 0 ]; then
-        die "$EX_USAGE" "this run would commit or push: confirm it at a terminal, or add --yes"
+        die "$EX_USAGE" "this run changes repositories: confirm it at a terminal, or add --yes"
     fi
     printf 'Proceed? [Y/n] ' >&2
     IFS= read -r answer || answer="n"
@@ -2694,6 +2721,461 @@ notify() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# clone: what an account or a layout file names and this machine lacks
+# ---------------------------------------------------------------------------
+
+clone_destination() {
+    # The folder that receives the clones: --into, else the first folder of
+    # the settings. A mass clone never falls back on the current folder.
+    local dest=""
+    if [ -n "$INTO" ]; then
+        dest=$(expand_tilde "$INTO")
+    elif [ -n "${GH_BATCH_ROOT:-}" ]; then
+        dest=$(expand_tilde "$GH_BATCH_ROOT")
+    elif [ "${#CFG_ROOTS[@]}" -gt 0 ]; then
+        dest=${CFG_ROOTS[0]}
+    else
+        die "$EX_USAGE" "name the folder that receives the clones: --into DIR, or git config --global gh-batch.root DIR"
+    fi
+    if [ ! -d "$dest" ]; then
+        [ -e "$dest" ] && die "$EX_USAGE" "$dest exists and is not a folder"
+        mkdir -p "$dest" || die "$EX_USAGE" "cannot create $dest"
+    fi
+    DEST=$(cd "$dest" && pwd) || die "$EX_USAGE" "cannot enter $dest"
+    if git -C "$DEST" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        die "$EX_USAGE" "$(short_path "$DEST") is inside a git repository: clones do not go there"
+    fi
+}
+
+known_slugs() {
+    # The GitHub names of every repository already under the destination,
+    # whatever its folder: one line "name<US>index" per remote, in $TMP/known.
+    local i=0 name url slug
+    : > "$TMP/known"
+    while [ "$i" -lt "${#REPOS[@]}" ]; do
+        REPO=${REPOS[$i]}
+        GIT=(git -C "$REPO")
+        while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            for url in "$(g remote get-url "$name" 2>/dev/null)" "$(g config --get "remote.$name.url" 2>/dev/null)"; do
+                slug=$(github_slug "$url")
+                [ -n "$slug" ] && printf '%s%s%s\n' "$slug" "$US" "$i" >> "$TMP/known"
+            done
+        done <<EOF
+$(g remote 2>/dev/null)
+EOF
+        i=$(( i + 1 ))
+    done
+    return 0
+}
+
+is_known() {
+    # is_known SLUG -> 0 when a repository under the destination has it
+    local slug index
+    while IFS=$US read -r slug index; do
+        [ "$slug" = "$1" ] && return 0
+    done < "$TMP/known"
+    return 1
+}
+
+moved_here() {
+    # moved_here FOLDER SLUG -> 0 when the repository in FOLDER is SLUG under
+    # an older name: GitHub answers for a renamed or transferred repository
+    # with its present name.
+    local folder="$1" wanted="$2" name url slug now
+    have gh || return 1
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        url=$(git -C "$folder" config --get "remote.$name.url" 2>/dev/null)
+        slug=$(github_slug "$url")
+        [ -n "$slug" ] || continue
+        now=$(GH_PROMPT_DISABLED=1 gh api "repos/$slug" --jq .full_name 2>/dev/null | tr '[:upper:]' '[:lower:]')
+        [ "$now" = "$wanted" ] && return 0
+    done <<EOF
+$(git -C "$folder" remote 2>/dev/null)
+EOF
+    return 1
+}
+
+clone_candidate() {
+    # clone_candidate NAME ADDRESS TARGET SLUG SIZE_KB MARK BRANCH: decide
+    # whether the repository is cloned, is present, or cannot be placed.
+    local name="$1" url="$2" target="$3" slug="$4" size="$5" mark="$6" branch="$7" parent
+    parent=${target%/*}
+    if [ -e "$target/.git" ]; then
+        if [ -z "$slug" ] || moved_here "$target" "$slug"; then
+            C_PRESENT=$(( C_PRESENT + 1 ))
+            [ -n "$slug" ] && C_NOTES+=("$name is here under an older address: git -C $(short_path "$target") remote set-url origin $url")
+        else
+            C_NOTES+=("$name is not cloned: the folder $(short_path "$target") holds another repository")
+            C_BLOCKED=$(( C_BLOCKED + 1 ))
+        fi
+        return 0
+    fi
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        if [ ! -d "$target" ] || [ -n "$(ls -A "$target" 2>/dev/null)" ]; then
+            C_NOTES+=("$name is not cloned: $(short_path "$target") exists and is not a repository")
+            C_BLOCKED=$(( C_BLOCKED + 1 ))
+            return 0
+        fi
+    fi
+    if [ "$parent" != "$DEST" ] && [ -e "$parent/.git" ]; then
+        C_NOTES+=("$name is not cloned: the folder $(short_path "$parent") is a repository itself")
+        C_BLOCKED=$(( C_BLOCKED + 1 ))
+        return 0
+    fi
+    REPOS+=("$target")
+    NAMES+=("$name")
+    C_URL+=("$url")
+    C_BRANCH+=("$branch")
+    C_MARK+=("$mark")
+    is_uint "$size" || size=0
+    C_SIZE+=("$size")
+    C_TOTAL_KB=$(( C_TOTAL_KB + size ))
+    return 0
+}
+
+matches_selection() {
+    # The --only and --except patterns, applied to a name of the server.
+    local saved_exclude=(${CFG_EXCLUDE[@]+"${CFG_EXCLUDE[@]}"}) rc
+    CFG_EXCLUDE=()
+    selected "$1"
+    rc=$?
+    CFG_EXCLUDE=(${saved_exclude[@]+"${saved_exclude[@]}"})
+    return "$rc"
+}
+
+read_account() {
+    # read_account OWNER SELF PROTOCOL: list the repositories of an owner on
+    # GitHub and sort them into present, to clone, and impossible to place.
+    local owner="$1" self="$2" protocol="$3" lines=0
+    local slug fork archived private size pushed https ssh name low low_owner target url mark
+    GH_PROMPT_DISABLED=1 gh repo list "$owner" --limit 4000 \
+        --json nameWithOwner,isFork,isArchived,isPrivate,diskUsage,pushedAt,url,sshUrl \
+        --jq '.[] | [.nameWithOwner, (.isFork|tostring), (.isArchived|tostring), (.isPrivate|tostring), (.diskUsage|tostring), (.pushedAt // ""), .url, .sshUrl] | join("\u001f")' \
+        > "$TMP/list" 2> "$TMP/list.err" ||
+        die "$EX_ENV" "GitHub did not give the repositories of $owner: $(last_line "$TMP/list.err")"
+    while IFS=$US read -r slug fork archived private size pushed https ssh; do
+        [ -n "$slug" ] || continue
+        lines=$(( lines + 1 ))
+        C_LISTED=$(( C_LISTED + 1 ))
+        name=${slug#*/}
+        case "$slug" in
+            */*) ;;
+            *)   continue ;;
+        esac
+        case "${slug%%/*}$name" in
+            *[!A-Za-z0-9._-]*)
+                warn "the name $slug holds an unexpected character and is left out"
+                continue
+                ;;
+        esac
+        [ "$NO_FORKS" -eq 1 ] && [ "$fork" = "true" ] && continue
+        [ "$NO_ARCHIVED" -eq 1 ] && [ "$archived" = "true" ] && continue
+        if [ -n "$SINCE" ] && [ "${pushed%%T*}" \< "$SINCE" ]; then
+            continue
+        fi
+        matches_selection "$name" || continue
+        C_WANTED=$(( C_WANTED + 1 ))
+        low=$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')
+        if is_known "$low"; then
+            C_PRESENT=$(( C_PRESENT + 1 ))
+            continue
+        fi
+        low_owner=$(printf '%s' "${slug%%/*}" | tr '[:upper:]' '[:lower:]')
+        if [ "$LAYOUT" = "flat" ] || { [ "$LAYOUT" = "auto" ] && [ "$low_owner" = "$self" ]; }; then
+            target="$DEST/$name"
+        else
+            target="$DEST/${slug%%/*}/$name"
+            name=$slug
+        fi
+        if [ "$protocol" = "ssh" ] && [ -n "$ssh" ]; then url=$ssh; else url=$https; fi
+        mark="private"
+        [ "$private" = "false" ] && mark="PUBLIC"
+        clone_candidate "$name" "$url" "$target" "$low" "$size" "$mark" ""
+    done < "$TMP/list"
+    [ "$lines" -ge 4000 ] &&
+        warn "$owner has 4000 repositories or more: only the first 4000 were read"
+    return 0
+}
+
+read_manifest() {
+    # read_manifest FILE: the lines "folder, address, branch" of a layout
+    # written by "list --manifest".
+    local path url branch
+    [ -f "$1" ] || die "$EX_USAGE" "no such layout file: $1"
+    while IFS=$TAB read -r path url branch || [ -n "${path:-}" ]; do
+        case "$path" in
+            ""|"#"*) continue ;;
+        esac
+        C_LISTED=$(( C_LISTED + 1 ))
+        case "/$path/" in
+            *"/../"*|//*)
+                warn "the folder $path of the layout leaves the destination and is left out"
+                continue
+                ;;
+        esac
+        case "$url" in
+            ""|*"<hidden>"*)
+                warn "$path has no usable address in the layout and is left out"
+                continue
+                ;;
+        esac
+        matches_selection "$path" || continue
+        C_WANTED=$(( C_WANTED + 1 ))
+        clone_candidate "$path" "$url" "$DEST/${path%/}" "" 0 "" "${branch:-}"
+    done < "$1"
+    return 0
+}
+
+megabytes() {
+    # megabytes KILOBYTES -> "12 MB", or "under 1 MB"
+    if [ "$1" -lt 1024 ]; then
+        printf 'under 1 MB'
+    else
+        printf '%s MB' $(( ($1 + 512) / 1024 ))
+    fi
+}
+
+sweep_leftovers() {
+    # A clone is made under a temporary name beside its place. A name left
+    # by a run that died is removed; the one of a run still alive is kept.
+    local parent="$1" entry pid
+    for entry in "$parent"/.gh-batch-clone.*; do
+        [ -d "$entry" ] || continue
+        pid=${entry##*.}
+        if is_uint "$pid" && kill -0 "$pid" 2>/dev/null; then
+            continue
+        fi
+        rm -rf "$entry"
+    done
+    return 0
+}
+
+do_clone() {
+    # Clone one repository under a temporary name beside its place, then
+    # give it its name: an interrupted run leaves nothing half-made.
+    local target="$REPO" url="${C_URL[$IDX]}" branch="${C_BRANCH[$IDX]}" parent tmp rc note="" attention=0 first
+    R_branch=""
+    parent=${target%/*}
+    if ! mkdir -p "$parent" 2>/dev/null; then
+        emit failed 1 "cannot create the folder $(short_path "$parent")"
+        return 0
+    fi
+    tmp="$parent/.gh-batch-clone.${target##*/}.$$"
+    rm -rf "$tmp"
+    if [ "$USER_SSH" -eq 0 ]; then
+        export GIT_SSH_COMMAND="${GLOBAL_SSH:-ssh} -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+    fi
+    spawn clone env GIT_LFS_SKIP_SMUDGE=1 git -c credential.interactive=false \
+        -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 clone --quiet "$url" "$tmp"
+    await net 0
+    rc=$?
+    if [ "$rc" -eq 130 ]; then
+        rm -rf "$tmp"
+        emit interrupted 1 "stopped during the clone: nothing was left behind"
+        return 0
+    fi
+    if ! git -C "$tmp" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        rm -rf "$tmp"
+        emit failed 1 "the clone failed: $(net_failure "$rc")"
+        return 0
+    fi
+    if [ "$rc" -ne 0 ]; then
+        # The history arrived but the files could not be written.
+        note="; the files could not all be checked out ($(last_line "$ERR"))"
+        attention=1
+    fi
+    [ -d "$target" ] && rmdir "$target" 2>/dev/null
+    if [ -e "$target" ] || ! mv "$tmp" "$target" 2>/dev/null; then
+        rm -rf "$tmp"
+        emit failed 1 "the clone could not take its place at $(short_path "$target")"
+        return 0
+    fi
+    REPO=$target
+    GIT=(git -C "$REPO")
+    # Large files kept with git-lfs were left as pointers by the clone, so
+    # that a failed download cannot lose the clone itself; they come now.
+    if have git-lfs; then
+        first=""
+        IFS= read -r first < <(g lfs ls-files 2>/dev/null)
+        if [ -n "$first" ]; then
+            run_net lfs "${GIT[@]}" lfs pull
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+                note="$note; its large files were not downloaded: run git lfs pull in it"
+                attention=1
+            fi
+        fi
+    elif grep -qs 'filter=lfs' "$REPO/.gitattributes"; then
+        note="$note; it keeps large files with git-lfs, which is not installed"
+        attention=1
+    fi
+    if [ -n "$branch" ]; then
+        R_branch=$(g symbolic-ref -q --short HEAD 2>/dev/null)
+        if [ "$R_branch" != "$branch" ]; then
+            if run_local checkout "${GIT[@]}" checkout --quiet "$branch"; then
+                R_branch=$branch
+            else
+                note="$note; the branch $branch of the layout could not be checked out"
+                attention=1
+            fi
+        fi
+    else
+        R_branch=$(g symbolic-ref -q --short HEAD 2>/dev/null)
+    fi
+    emit cloned "$attention" "into $(short_path "$target")$note"
+    record_move clone "$(printf '%s' "$url" | redact)" ""
+    return 0
+}
+
+show_clone_plan() {
+    local i=0 line
+    put "Plan: clone $(plural "${#REPOS[@]}" repository) into $(short_path "$DEST")$( [ "$C_TOTAL_KB" -gt 0 ] && printf ' (about %s)' "$(megabytes "$C_TOTAL_KB")" )"
+    while [ "$i" -lt "${#REPOS[@]}" ]; do
+        line=$(printf '  %-*s  %-8s %s' "$NAME_WIDTH" "${NAMES[$i]}" "${C_MARK[$i]}" "$( [ "${C_SIZE[$i]}" -gt 0 ] && megabytes "${C_SIZE[$i]}" )")
+        put "${line%"${line##*[! ]}"}"
+        i=$(( i + 1 ))
+    done
+    return 0
+}
+
+cmd_clone() {
+    local owners=() owner self="" protocol="https" i saved_only=() saved_except=() note
+    local present_repos=() present_names=()
+    setup_colour
+    setup_run
+    harden_git
+    clone_destination
+    GLOBAL_SSH=$(git config --global --includes --get core.sshCommand 2>/dev/null)
+    case "$LAYOUT" in
+        auto|flat|owner) ;;
+        *) die "$EX_USAGE" "the layouts are auto, flat and owner, not '$LAYOUT'" ;;
+    esac
+    if [ -n "$SINCE" ]; then
+        case "$SINCE" in
+            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+            *) die "$EX_USAGE" "--since takes a date written as 2026-01-31, not '$SINCE'" ;;
+        esac
+    fi
+
+    # What is already under the destination, the selection left aside: a
+    # repository filtered out is still one that must not be cloned again.
+    saved_only=(${ONLY[@]+"${ONLY[@]}"})
+    saved_except=(${EXCEPT[@]+"${EXCEPT[@]}"})
+    ONLY=(); EXCEPT=()
+    ARGS=("$DEST")
+    discover
+    ONLY=(${saved_only[@]+"${saved_only[@]}"})
+    EXCEPT=(${saved_except[@]+"${saved_except[@]}"})
+    present_repos=(${REPOS[@]+"${REPOS[@]}"})
+    present_names=(${NAMES[@]+"${NAMES[@]}"})
+    known_slugs
+
+    REPOS=(); NAMES=()
+    C_URL=(); C_BRANCH=(); C_MARK=(); C_SIZE=(); C_NOTES=()
+    C_LISTED=0; C_WANTED=0; C_PRESENT=0; C_BLOCKED=0; C_TOTAL_KB=0
+    if [ -n "$MANIFEST_IN" ]; then
+        [ "${#OWNERS[@]}" -eq 0 ] || die "$EX_USAGE" "give either owners or --manifest FILE, not both"
+        read_manifest "$MANIFEST_IN"
+        note="$(plural "$C_LISTED" repository) in $(short_path "$MANIFEST_IN")"
+    else
+        have gh || die "$EX_ENV" "the GitHub CLI (gh) is needed to read an account: https://cli.github.com"
+        self=$(GH_PROMPT_DISABLED=1 gh api user --jq .login 2>"$TMP/list.err" | tr '[:upper:]' '[:lower:]')
+        [ -n "$self" ] || die "$EX_ENV" "gh is not logged in to GitHub (gh auth login): $(last_line "$TMP/list.err")"
+        if [ "${#OWNERS[@]}" -gt 0 ]; then
+            owners=("${OWNERS[@]}")
+        else
+            owners=("$self")
+        fi
+        protocol=$(GH_PROMPT_DISABLED=1 gh config get git_protocol 2>/dev/null)
+        note=""
+        for owner in "${owners[@]}"; do
+            read_account "$owner" "$self" "$protocol"
+            note="$note${note:+, }$owner"
+        done
+        note="$(plural "$C_LISTED" repository) of $note on GitHub"
+    fi
+    fit_names
+
+    if [ "$PORCELAIN" -eq 0 ]; then
+        put "$PROG clone: $note; $C_PRESENT already under $(short_path "$DEST"), ${#REPOS[@]} to clone"
+        put ""
+        for note in ${C_NOTES[@]+"${C_NOTES[@]}"}; do
+            put "  note: $note"
+        done
+        [ "${#C_NOTES[@]}" -gt 0 ] && put ""
+    fi
+    [ "$C_BLOCKED" -gt 0 ] && ATTENTION=1
+
+    if [ "${#REPOS[@]}" -gt 0 ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            if [ "$PORCELAIN" -eq 1 ]; then
+                i=0
+                while [ "$i" -lt "${#REPOS[@]}" ]; do
+                    printf 'planned\t%s\t\t%s\n' "${REPOS[$i]}" "$(printf '%s' "${C_URL[$i]}" | redact)"
+                    i=$(( i + 1 ))
+                done
+            else
+                show_clone_plan
+                put ""
+                put "Nothing was cloned (dry run)."
+            fi
+        else
+            [ "$PORCELAIN" -eq 0 ] && show_clone_plan
+            take_lock
+            if ! confirmed; then
+                put "Nothing was done."
+                exit "$EX_OK"
+            fi
+            [ "$PORCELAIN" -eq 0 ] && put ""
+            sweep_leftovers "$DEST"
+            for owner in ${owners[@]+"${owners[@]}"}; do
+                [ -d "$DEST/$owner" ] && sweep_leftovers "$DEST/$owner"
+            done
+            [ "$JOBS" -gt 4 ] && [ "$SRC_jobs" = "default" ] && JOBS=4
+            pool do_clone clone render
+            summary
+        fi
+    elif [ "$PORCELAIN" -eq 0 ]; then
+        put "Nothing is missing."
+    fi
+
+    if [ "$UPDATE" -eq 1 ] && [ "$STOP" -eq 0 ] && [ "${#present_repos[@]}" -gt 0 ]; then
+        # The repositories that were there before are brought forward, as
+        # "pull" does.
+        REPOS=(); NAMES=()
+        i=0
+        while [ "$i" -lt "${#present_repos[@]}" ]; do
+            if selected "${present_names[$i]}"; then
+                REPOS+=("${present_repos[$i]}")
+                NAMES+=("${present_names[$i]}")
+            fi
+            i=$(( i + 1 ))
+        done
+        if [ "${#REPOS[@]}" -gt 0 ]; then
+            reset_tally
+            fit_names
+            [ "$DRY_RUN" -eq 1 ] && ONLY_LOOK=1
+            [ "$LOCKED" -eq 0 ] && [ "$DRY_RUN" -eq 0 ] && take_lock
+            pick GH_BATCH_JOBS "$CFG_jobs" 8 "$OPT_JOBS"
+            JOBS=$VAL
+            if [ "$PORCELAIN" -eq 0 ]; then
+                put ""
+                put "Then, the pull of the $(plural "${#REPOS[@]}" repository) already here:"
+            fi
+            pool do_pull pull render
+            [ "$STOP" -eq 0 ] && [ "$ONLY_LOOK" -eq 0 ] && remember_run pull
+            summary
+        fi
+    fi
+    notify
+    [ "$STOP" -eq 1 ] && exit "$EX_INTERRUPT"
+    [ "$ATTENTION" -eq 1 ] && exit "$EX_ATTENTION"
+    exit "$EX_OK"
+}
+
 cmd_list() {
     local i=0 url branch
     setup_colour
@@ -2784,6 +3266,8 @@ COMMANDS
   push        push every repository that has new commits, after committing
               what is pending when asked to (the evening command)
   sync        pull, then push
+  clone       clone what is missing: a whole GitHub account, or the entries
+              of a layout file written by "list --manifest"
   status      what is pending in every repository, without touching the network
   fetch       look at the servers, change no file, say what pull would do
   list        the repositories found; --manifest writes their layout
@@ -2810,7 +3294,7 @@ COMMON OPTIONS
 
 EXIT STATUS
   0 nothing needs you, 1 at least one repository needs you, 2 bad usage,
-  3 git is missing or another $PROG is at work, 130 stopped by a signal.
+  3 git or gh is missing or another $PROG is at work, 130 stopped by a signal.
 
 SETTINGS
   git config --global gh-batch.root ~/workspace    the folder searched by default
@@ -2923,6 +3407,47 @@ OPTIONS
 EOF
 }
 
+help_clone() {
+    cat <<EOF
+$PROG clone [options] [owner ...]
+$PROG clone --manifest FILE [options]
+
+Clone the repositories that are missing under the destination folder.
+
+In the first form the list comes from GitHub, through gh: every repository
+of the account that gh is logged in to, or of the owners named (accounts or
+organisations). A repository counts as present when one of the clones under
+the destination has it as a remote, whatever the name and the depth of its
+folder, also when it was renamed or transferred since. The missing ones are
+cloned into DEST/name for the account itself and DEST/owner/name for any
+other owner.
+
+In the second form the list is a layout file, as "$PROG list --manifest"
+writes it: each repository returns to the folder it had, on its branch. No
+gh is needed, and the servers may be any.
+
+The list is shown with the sizes, one confirmation is asked, then four
+repositories are cloned at a time. Each clone is made under a temporary
+name and renamed when complete: an interrupted run leaves nothing half-made.
+A folder that exists and is not the repository is never touched.
+
+OPTIONS
+      --into DIR       the destination (default: the folder of gh-batch.root)
+      --manifest FILE  clone the entries of a layout file
+  -u, --update         also pull the repositories that are present already
+      --only GLOB      clone only the names that match, repeatable
+      --except GLOB    leave out the names that match, repeatable
+      --since DATE     only the repositories pushed since DATE (2026-01-31)
+      --no-forks       leave the forks out
+      --no-archived    leave the archived repositories out
+      --flat           DEST/name for every owner
+      --by-owner       DEST/owner/name for every owner
+  -y, --yes            do not ask for the confirmation
+  -n, --dry-run        show the list and clone nothing
+  and the common options, see: $PROG help
+EOF
+}
+
 help_status() {
     cat <<EOF
 $PROG status [options] [folder ...]
@@ -2985,6 +3510,7 @@ show_help() {
         pull)    help_pull ;;
         push)    help_push ;;
         sync)    help_sync ;;
+        clone)   help_clone ;;
         status)  help_status ;;
         fetch)   help_fetch ;;
         list)    help_list ;;
@@ -3022,7 +3548,19 @@ parse_options() {
             -m|--message)   need_value "$@"; OPT_MESSAGE=$2; shift 2 ;;
             --message=*)    OPT_MESSAGE=${1#*=}; shift ;;
             -y|--yes)       YES=1; shift ;;
-            -u|--set-upstream) SET_UPSTREAM=1; shift ;;
+            -u)
+                if [ "$COMMAND" = "clone" ]; then UPDATE=1; else SET_UPSTREAM=1; fi
+                shift ;;
+            --set-upstream) SET_UPSTREAM=1; shift ;;
+            --update)       UPDATE=1; shift ;;
+            --into)         need_value "$@"; INTO=$2; shift 2 ;;
+            --into=*)       INTO=${1#*=}; shift ;;
+            --since)        need_value "$@"; SINCE=$2; shift 2 ;;
+            --since=*)      SINCE=${1#*=}; shift ;;
+            --no-forks)     NO_FORKS=1; shift ;;
+            --no-archived)  NO_ARCHIVED=1; shift ;;
+            --flat)         LAYOUT="flat"; shift ;;
+            --by-owner)     LAYOUT="owner"; shift ;;
             --notify)       OPT_NOTIFY=1; shift ;;
             -n|--dry-run)   DRY_RUN=1; shift ;;
             -v|--verbose)   VERBOSE=1; shift ;;
@@ -3030,7 +3568,13 @@ parse_options() {
             -l|--long)      LONG=1; shift ;;
             --porcelain)    PORCELAIN=1; shift ;;
             --absolute)     ABSOLUTE=1; shift ;;
-            --manifest)     MANIFEST_OUT=1; shift ;;
+            --manifest)
+                if [ "$COMMAND" = "clone" ]; then
+                    need_value "$@"; MANIFEST_IN=$2; shift 2
+                else
+                    MANIFEST_OUT=1; shift
+                fi ;;
+            --manifest=*)   MANIFEST_IN=${1#*=}; shift ;;
             --color|--colour)       need_value "$@"; COLOR_MODE=$2; shift 2 ;;
             --color=*|--colour=*)   COLOR_MODE=${1#*=}; shift ;;
             --no-color|--no-colour) COLOR_MODE="never"; shift ;;
@@ -3046,6 +3590,7 @@ parse_options() {
 positional() {
     case "$COMMAND" in
         help)   HELP_TOPIC=$1 ;;
+        clone)  OWNERS+=("$1") ;;
         config) die "$EX_USAGE" "config takes no argument" ;;
         *)      ARGS+=("$1") ;;
     esac
@@ -3060,7 +3605,7 @@ main() {
     COMMAND=$1
     shift
     case "$COMMAND" in
-        pull|push|sync|status|fetch|list|config|help) ;;
+        pull|push|sync|clone|status|fetch|list|config|help) ;;
         *) die "$EX_USAGE" "no such command: $COMMAND (see $PROG help)" ;;
     esac
     parse_options "$@"
@@ -3075,6 +3620,7 @@ main() {
         pull|fetch) cmd_pull ;;
         push)       cmd_push ;;
         sync)       cmd_sync ;;
+        clone)      cmd_clone ;;
         status)     cmd_status ;;
         list)       cmd_list ;;
         config)     cmd_config ;;
