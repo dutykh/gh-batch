@@ -1,0 +1,10 @@
+#!/bin/sh
+#
+# Stub ssh for the test suite of gh-batch: a server that never answers.
+# The tests point GIT_SSH_COMMAND at this file to exercise the deadline of a
+# network step and the stop of a run by a signal.
+#
+# Author: Dr. Denys Dutykh (Mathematics Department, Khalifa University of
+#         Science and Technology, Abu Dhabi, UAE).
+
+exec sleep 600
