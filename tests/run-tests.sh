@@ -1310,6 +1310,9 @@ if describe "clone: owners, layouts and filters"; then
     gb clone --into "$WORLD/f3" --dry-run
     check "clone: the list shows the sizes and marks the public ones" "got: $OUTPUT" \
         "$( contains "$OUTPUT" "private" && contains "$OUTPUT" "2 MB" && contains "$OUTPUT" "about" && echo 0 || echo 1 )"
+    gb clone --into "$WORLD/f6" --dry-run --only old
+    check "clone: the first line says how many the filters kept, a small total is under 1 MB" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "4 repositories of me on GitHub, 1 of them selected; 0 already under" && contains "$OUTPUT" "into $WORLD/f6 (under 1 MB)" && ! contains "$OUTPUT" "about under" && echo 0 || echo 1 )"
     gb clone --into "$WORLD/f4" --since yesterday
     check "clone: a date in another form is a usage error" "got rc=$RC" "$( [ "$RC" -eq 2 ] && echo 0 || echo 1 )"
     gb clone --into "$WORLD/f5" --dry-run nobody

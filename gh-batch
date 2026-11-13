@@ -3196,8 +3196,13 @@ do_clone() {
 }
 
 show_clone_plan() {
-    local i=0 line
-    put "Plan: clone $(plural "${#REPOS[@]}" repository) into $(short_path "$DEST")$( [ "$C_TOTAL_KB" -gt 0 ] && printf ' (about %s)' "$(megabytes "$C_TOTAL_KB")" )"
+    local i=0 line size=""
+    if [ "$C_TOTAL_KB" -ge 1024 ]; then
+        size=" (about $(megabytes "$C_TOTAL_KB"))"
+    elif [ "$C_TOTAL_KB" -gt 0 ]; then
+        size=" (under 1 MB)"
+    fi
+    put "Plan: clone $(plural "${#REPOS[@]}" repository) into $(short_path "$DEST")$size"
     while [ "$i" -lt "${#REPOS[@]}" ]; do
         line=$(printf '  %-*s  %-8s %s' "$NAME_WIDTH" "${NAMES[$i]}" "${C_MARK[$i]}" "$( [ "${C_SIZE[$i]}" -gt 0 ] && megabytes "${C_SIZE[$i]}" )")
         put "${line%"${line##*[! ]}"}"
@@ -3265,6 +3270,9 @@ cmd_clone() {
     fit_names
 
     if [ "$PORCELAIN" -eq 0 ]; then
+        # The counts that follow concern the repositories that the filters
+        # kept, which the first words say when they kept fewer.
+        [ "$C_WANTED" -lt "$C_LISTED" ] && note="$note, $C_WANTED of them selected"
         put "$PROG clone: $note; $C_PRESENT already under $(short_path "$DEST"), ${#REPOS[@]} to clone"
         put ""
         for note in ${C_NOTES[@]+"${C_NOTES[@]}"}; do
