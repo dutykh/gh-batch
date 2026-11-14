@@ -1,0 +1,29 @@
+# Dr. Denys Dutykh (Mathematics Department, Khalifa University of Science and Technology, Abu Dhabi, UAE)
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "gh-batch: one command for many git repositories"
+type: software
+authors:
+  - family-names: Dutykh
+    given-names: Denys
+    affiliation: "Khalifa University of Science and Technology"
+    orcid: "https://orcid.org/0000-0001-5247-2788"
+repository-code: "https://github.com/dutykh/gh-batch"
+license: LGPL-2.1-or-later
+version: 1.4.0
+date-released: "2026-11-14"
+keywords:
+  - bash
+  - git
+  - cli
+  - gh-extension
+  - github-cli
+  - multi-repo
+  - developer-tools
+  - shell
+abstract: >-
+  Bash program, also an extension of the GitHub CLI, that pulls, commits, pushes, resets and clones
+  every git repository under a folder, several at a time, with one line of report for each repository
+  that changed or needs attention. It never forces a push and never loses work: a conflict is undone
+  at once, nothing is committed unless asked for, a push waits for one confirmation, and a reset
+  keeps the previous commit under a reference of its own.

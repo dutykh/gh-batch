@@ -67,7 +67,7 @@ Done:
 Needs you: lecture-notes (not committed).
 ```
 
-**During the day**, when the pending changes should become a commit before anything is sent, one command shows the list and asks for the message. Enter takes the sentence below. Another line replaces it, and a minus sign alone does nothing. `gh-batch commit push` then goes on to the push and asks for it separately, so a refusal there leaves the commits on this machine.
+**During the day**, when the pending changes should become a commit before anything is sent, one command shows the list and asks for the message. Enter takes the sentence below. Another line replaces it, and a minus sign alone does nothing. The form `gh-batch commit push` then goes on to the push and asks for it separately, so a refusal there leaves the commits on this machine.
 
 ```text
 $ gh-batch commit
@@ -151,8 +151,9 @@ Without that setting, every command works on the folders named on its command li
 |---|---|
 | `pull` | Fetch every repository and bring it forward. |
 | `push` | Push every repository that has new commits, after committing what is pending when asked to. |
-| `commit` | Commit what is pending, asking for the message. `commit push` then pushes. |
+| `commit` | Commit what is pending, asking for the message; `commit push` then pushes. |
 | `sync` | Pull, then push. |
+| `reset` | Set every branch to the one it follows on its server, safely: its commit is kept first, and commits that the server lacks are dropped only with `--discard-local`. |
 | `clone` | Clone what is missing: a whole GitHub account with its organisations, or the entries of a layout file. |
 | `status` | Show what is pending in every repository, without touching the network. |
 | `fetch` | Look at the servers, change no file, say what `pull` would do. |
@@ -172,12 +173,14 @@ Every command takes folders as arguments. A folder is searched for repositories 
 | `--depth N` | Levels searched below each folder (3). |
 | `--only GLOB`, `--except GLOB` | Keep, or leave out, the repositories whose name matches; both can be repeated. |
 | `-n`, `--dry-run` | Show what would be done and change nothing. |
-| `-y`, `--yes` | Do not ask before committing, pushing or cloning. |
+| `-y`, `--yes` | Do not ask before committing, pushing, cloning or dropping commits. |
 | `-v`, `--verbose` | Show every repository, not only those that changed. |
 | `-q`, `--quiet` | Show only what needs you. |
 | `--porcelain` | One line per repository, with fields separated by tabs. |
 | `--timeout SEC` | Give up on a server that does not answer (300). |
-| `--color WHEN` | `auto`, `always` or `never`; `NO_COLOR` is honoured. |
+| `--color WHEN`, `--no-color` | `auto`, `always` or `never`, and `--no-color` is `never`; `NO_COLOR` is honoured. |
+| `-h`, `--help` | Print the help, or the help of the command that comes before it. |
+| `--version` | Print the version, as `gh-batch version` does. |
 
 ### pull
 
@@ -202,7 +205,7 @@ flowchart TD
 
 When only the server has new commits, the branch is moved forward. Files with uncommitted changes that the new commits do not touch stay as they are. If they would be touched, or if an untracked or ignored file stands where a new file must be written, git refuses, nothing changes, and the repository is reported as blocked with the names of the files. A file deleted here without a commit is the one exception, because git does not count a missing file as a change it could overwrite: when the new commits change it, it comes back in its new version, and the report names it.
 
-When both sides have new commits, the setting `gh-batch.diverged` decides. With `report`, the default, nothing is tried. With `rebase`, your commits are replayed on top of those of the server; with `merge`, the two histories are joined by a merge commit. At the first conflict the attempt is undone at once, the tool verifies that the commit, the branch and every pending change are what they were, and the conflicting files are named together with the command to run by hand.
+When both sides have new commits, the setting `gh-batch.diverged` decides. With `report`, the default, nothing is tried. With `rebase`, your commits are replayed on top of those of the server; with `merge`, the two histories are joined by a merge commit. The option `--diverged report`, `--diverged rebase` or `--diverged merge` makes that choice for one run, whatever the setting says, and it holds wherever commits of the server are taken: in `fetch`, which says what `pull` would try, in `push` and `sync`, and in `clone --update`. At the first conflict the attempt is undone at once, the tool verifies that the commit, the branch and every pending change are what they were, and the conflicting files are named together with the command to run by hand.
 
 A replay is tried only when it is safe. It is refused, and the repository reported as diverged with the reason, when a tracked file has uncommitted changes, when a merge commit is among your commits, when some of them are already on a server, when the history of the server was rewritten, when the commits are signed (signing them again could ask for a passphrase), when the clone is shallow, or when a file that the server added exists here untracked or ignored.
 
@@ -228,7 +231,7 @@ flowchart TD
     take --> pushed
 ```
 
-**The automatic commit** is off by default: pending changes are then only reported, as what stays on this machine. With `--commit`, or with `git config --global gh-batch.commit true`, every pending change of every repository is committed first: files modified, deleted or new, the ignored ones excepted. The message is `Work in progress, DATE (MACHINE)`, followed by the list of the files; `-m TEXT` or the setting `gh-batch.message` gives another first line, in which `%d` is the date, `%t` the time, `%h` the machine and `%n` the number of files.
+**The automatic commit** is off by default: pending changes are then only reported, as what stays on this machine. With `--commit`, or with `git config --global gh-batch.commit true`, every pending change of every repository is committed first: files modified, deleted or new, the ignored ones excepted. The option `--no-commit` turns the automatic commit off for one run, whatever the settings say. The message is `Work in progress, DATE (MACHINE)`, followed by the list of the files; `-m TEXT` or the setting `gh-batch.message` gives another first line, in which `%d` is the date, `%t` the time, `%h` the machine and `%n` the number of files.
 
 Four guards leave a repository uncommitted and name it in the report: a new file whose name suggests a secret (`.env`, a private key, a credentials file, and the like), a file above `gh-batch.maxFileSize` (50 MB), more new files at once than `gh-batch.maxNewFiles` (200, the sign of a missing `.gitignore`), and a folder that is a git repository of its own and is not ignored. The commits that already exist are still pushed. When a commit is refused, by a hook for instance, the staging area is put back exactly as it was.
 
@@ -246,15 +249,60 @@ The command `gh-batch commit` is the commit on its own, for the moment in the da
 Commit message [A Regular Commit to Synchronise], or - to do nothing:
 ```
 
-Enter takes that sentence. A line that is typed replaces it. A minus sign alone, or the end of the input, does nothing. The list of the files follows the first line in the commit, as it does for the evening commit. `-m TEXT` gives the first line in advance, and the question is then the usual confirmation; `%d` is the date, `%t` the time, `%h` the machine and `%n` the number of files. When `gh-batch.message` has been set, that text replaces the sentence, in the question and in the commit. Without a terminal the run needs `--yes`. With `gh-batch.confirm false` nothing is asked.
+Enter takes that sentence. A line that is typed replaces it. A minus sign alone, or the end of the input, does nothing. The list of the files follows the first line in the commit, as it does for the evening commit. The option `-m TEXT` gives the first line in advance, and the question is then the usual confirmation; `%d` is the date, `%t` the time, `%h` the machine and `%n` the number of files. When `gh-batch.message` has been set, that text replaces the sentence, in the question and in the commit. Without a terminal the run needs `--yes`. With `gh-batch.confirm false` nothing is asked.
 
 The four guards of the evening commit apply here too, and a refusal by a hook puts the staging area back as it was. A repository that sets `gh-batch.commit` to false, or `gh-batch.pullOnly`, is left alone. A detached HEAD is left alone. A repository without a remote is committed, and the report says that the commit stays on this machine. The evening push is unchanged: it still commits only when asked, and then under its own line, `Work in progress, DATE (MACHINE)`, unless `-m` or `gh-batch.message` says otherwise.
 
-`gh-batch commit push` runs the push once the commits are made. The push has its own list and its own confirmation, including the commits that were already waiting. Declining it leaves the new commits on this machine. The word `push` is that request. A folder that is itself named push is given as a path, for example `./push`.
+The form `gh-batch commit push` runs the push once the commits are made. The push has its own list and its own confirmation, including the commits that were already waiting. Declining it leaves the new commits on this machine. The word `push` is that request. A folder that is itself named push is given as a path, for example `./push`.
 
 ### sync
 
 The command `gh-batch sync` runs the pull, prints its summary, then runs the push with its list and its confirmation. It accepts the options of both.
+
+### reset
+
+The command `gh-batch reset` sets the branch of every repository to the branch it follows on its server. It does what `git fetch` followed by `git reset --hard @{u}` does by hand, without the losses that a hard reset can cause: it throws away uncommitted changes, overwrites the untracked files that stand in its way, and leaves the commits it drops in the reflog only, until git clears it. After the fetch, a repository that is level with its server is left as it is, and one whose server only has new commits is moved forward, as `pull` would move it. A branch that holds commits which the server lacks is not moved: the report gives their number and their first subjects, and the reset waits for the option `--discard-local`. With that option the plan is shown, one confirmation is asked (`--yes` skips it), and the branch and its files are then set to those of the server.
+
+Before any branch moves, its commit is kept under a reference of its own, `refs/gh-batch/before-reset/BRANCH/DATE-TIME`, and the report prints the one command that puts the branch and its files back. A repository with uncommitted changes to tracked files is left alone, and so are a detached HEAD, an operation in progress, a branch that follows nothing and a repository without remote. Untracked and ignored files are never deleted or overwritten: when one of them stands where the server has a file, git refuses and nothing changes. Nothing is pushed, and `--dry-run` fetches and only says what would be done.
+
+The command was made for a history rewritten on the server. Here a folder of data was removed from every commit of a paper with `git filter-repo`, on another machine, and the result was pushed by force. This clone still holds the three old commits, which the server no longer has, so `pull` reports it as diverged, and with `gh-batch.diverged rebase` it would try to replay them. The command `reset` recognises the rewrite and leaves the clone alone:
+
+```text
+$ gh-batch reset
+gh-batch reset: 3 repositories under ~/workspace
+
+  diverged      paper-solitons  main     the history of the server was rewritten; 3 commits here that the server lacks, and 2 new ones there: left to you (--discard-local drops those here)
+        0673a4d Add the figures of section 4
+        e6e7a01 Write the introduction
+        86a09ec Add the data of the experiments
+
+3 repositories: 2 level with the server, 1 diverged.
+Needs you: paper-solitons (diverged).
+```
+
+With `--discard-local` the clone takes the new history:
+
+```text
+$ gh-batch reset --discard-local --only paper-solitons
+gh-batch reset: 1 repository under ~/workspace
+
+Plan:
+  to do         paper-solitons  main     the history of the server was rewritten; drop 3 commits that the server lacks, and take 2 new ones
+        0673a4d Add the figures of section 4
+        e6e7a01 Write the introduction
+        86a09ec Add the data of the experiments
+
+To do: a reset in 1 repository, dropping commits that the server lacks.
+Proceed? [Y/n]
+
+Done:
+  reset         paper-solitons  main     the history of the server was rewritten; dropped 3 commits that the server lacks, took 2 new ones; the commit before is kept as refs/gh-batch/before-reset/main/20261114-201514
+        to restore: git -C ~/workspace/paper-solitons checkout --no-track --no-overwrite-ignore -B main refs/gh-batch/before-reset/main/20261114-201514
+
+1 repository: 1 reset.
+```
+
+The files that only the old commits held, the removed folder among them, leave the working tree, and the backup keeps them. One of them comes back on its own, as an untracked file, with `git restore --source=REF -- PATH`, where `REF` is the name of the backup. The backups of a repository are listed by `git for-each-ref refs/gh-batch`, and one that is no longer needed goes with `git update-ref -d REF`.
 
 ### clone
 
@@ -287,7 +335,7 @@ Plan: clone 3 repositories into ~/workspace (about 14 MB)
 Proceed? [Y/n]
 ```
 
-The same choices can be typed by hand: `gh-batch.OWNER.folder NAME` names the folder of an owner, and holds also when that owner is named on the command line; `gh-batch.OWNER.skip true` leaves an organisation out until it is named. A folder is a path below the destination, no deeper than the other commands search (`a/b` at most with the default depth of three), and a dot stands for the destination itself. With `--yes`, with `--dry-run` or without a terminal nothing is asked and the folder proposed is taken. The setting `gh-batch.orgs false` keeps `clone` to the account alone, as `--no-orgs` does for one run. An organisation that GitHub refuses to list is named in the report and does not stop the others.
+The same choices can be typed by hand: `gh-batch.OWNER.folder NAME` names the folder of an owner, and holds also when that owner is named on the command line; `gh-batch.OWNER.skip true` leaves an organisation out until it is named. A folder is a path below the destination, no deeper than the other commands search (`a/b` at most with the default depth of three), and a dot stands for the destination itself. With `--yes`, with `--dry-run` or without a terminal nothing is asked and the folder proposed is taken. The setting `gh-batch.orgs false` keeps `clone` to the account alone, as `--no-orgs` does for one run; `--orgs` reads the organisations for one run all the same. An organisation that GitHub refuses to list is named in the report and does not stop the others.
 
 Four repositories are cloned at a time. Each clone is made under a temporary name beside its place and renamed when it is complete, so an interrupted run leaves nothing half-made, and the leftover of a run that died is removed by the next one. A folder that exists and is not the repository is never touched: it is named in the report. Large files kept with git-lfs are downloaded in a second step, so that a failed download cannot lose the clone.
 
@@ -389,7 +437,7 @@ The command `list` prints the names of the repositories found, their full paths 
 
 ## What gh-batch never does
 
-It never forces a push, never deletes a branch or a file of yours, never resets a repository, never cleans a working tree, never drops a stash and never skips a hook. It never leaves a conflict, a half-finished rebase or a half-finished merge behind. It never commits unless the commit command, the option or the setting says so, and then never a repository that opted out. It never pushes a branch onto a branch of another name unless git itself was configured to do so. It never asks a question in the middle of a run: git is run so that a missing password is an error, not a prompt, and its own questions, the folder of an organisation met for the first time and the one confirmation, come before anything is changed. A test of the suite reads the source and fails if a forced push, a hard reset or a cleaning command ever appears in it.
+It never forces a push, never deletes a branch, never cleans a working tree, never drops a stash and never skips a hook. It never deletes or overwrites a file that git does not track. It never sets a branch back from commits that its server lacks, except in `reset --discard-local`, and then only after one confirmation and once the commit is kept under a reference of its own, with the command that restores it. It never leaves a conflict, a half-finished rebase or a half-finished merge behind. It never commits unless the commit command, the option or the setting says so, and then never a repository that opted out. It never pushes a branch onto a branch of another name unless git itself was configured to do so. It never asks a question in the middle of a run: git is run so that a missing password is an error, not a prompt, and its own questions, the folder of an organisation met for the first time and the one confirmation, come before anything is changed. A test of the suite reads the source and fails if a forced push, a hard reset or a cleaning command ever appears in it; `reset` itself moves a branch with a checkout, which refuses to overwrite what git does not track.
 
 ## Settings
 
@@ -403,7 +451,7 @@ The settings live in git's own configuration, so there is no new file to learn. 
 | `gh-batch.timeout` | 300 | Seconds after which a silent server is given up. |
 | `gh-batch.diverged` | `report` | What `pull` does when both sides have commits: `report`, `rebase` or `merge`. |
 | `gh-batch.commit` | `false` | Commit pending changes before the push. |
-| `gh-batch.confirm` | `true` | Ask once before committing, pushing or cloning. |
+| `gh-batch.confirm` | `true` | Ask once before committing, pushing, cloning or dropping commits. |
 | `gh-batch.message` | `Work in progress, %d (%h)` | First line of the commits made by `push --commit`. The command `commit` uses it too, when it has been set; otherwise its sentence is "A Regular Commit to Synchronise". |
 | `gh-batch.machine` | the name of the host | The machine named in those commits. |
 | `gh-batch.maxFileSize` | 50 | Megabytes above which a file stops the automatic commit; 0 for no limit. |
@@ -436,8 +484,9 @@ A report has one line per repository that changed or needs you, in the order of 
 
 | Word | Meaning |
 |---|---|
-| `updated`, `rebased`, `merged` | The branch was brought forward by `pull`. |
-| `up to date`, `clean`, `nothing` | Nothing to do. |
+| `updated`, `rebased`, `merged` | The branch was brought forward by `pull`, or by `reset` for `updated`. |
+| `reset` | The branch was set to the one of its server by `reset --discard-local`, its commit kept. |
+| `up to date`, `level`, `clean`, `nothing` | Nothing to do. |
 | `ahead`, `behind`, `pending`, `stash` | Commits to push, commits to pull, uncommitted changes, stashes. |
 | `pushed`, `cloned`, `committed`, `to do` | Done by `push`, `clone` or `commit`, or about to be done. |
 | `blocked` | New commits wait on the server, and taking them would overwrite a change here. |
@@ -453,7 +502,7 @@ On a terminal every line carries a sign and a colour: a green tick for what was 
 
 The exit status is 0 when nothing needs you, 1 when at least one repository needs you, 2 for a bad invocation, 3 when git or `gh` is missing or another `gh-batch` is at work, and 130 when the run was stopped by a signal. With `--porcelain` each repository is one line of four fields separated by tabs: the state, the path, the branch and the message.
 
-Every move of a branch is recorded with its date in `~/.local/state/gh-batch/journal.tsv`: the fast-forwards, the rebases, the commits and the pushes, with the commits before and after. The same folder keeps the date of the last pull and of the last push, which `status` shows.
+Every move of a branch is recorded with its date in `~/.local/state/gh-batch/journal.tsv`: the fast-forwards, the rebases, the resets, the commits and the pushes, with the commits before and after. The same folder keeps the date of the last pull and of the last push, which `status` shows.
 
 ## Runs that nobody watches
 
@@ -510,7 +559,7 @@ One run at a time may change repositories; a second one is refused while the fir
 
 ## Limits
 
-Submodules are not updated: the repository that holds them is, and git then shows them as changed. A linked worktree is skipped, since its main repository is the one to handle. Only the branch that is checked out is pulled and pushed. A repository cloned without its full history is brought forward, but never rebased. The marks, the listing of an account and the remote part of the health check speak to GitHub only; everything else works with any git server. Windows was not tried.
+Submodules are not updated: the repository that holds them is, and git then shows them as changed. A linked worktree is skipped, since its main repository is the one to handle. Only the branch that is checked out is pulled, reset and pushed. A repository cloned without its full history is brought forward, but never rebased. The marks, the listing of an account and the remote part of the health check speak to GitHub only; everything else works with any git server. Windows was not tried.
 
 ## Tests
 

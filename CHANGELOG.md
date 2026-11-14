@@ -4,9 +4,15 @@
 
 The versions follow semantic versioning: a change that breaks a command line, a setting or the format of `--porcelain` raises the first number.
 
+## 1.4.0, 14 November 2026
+
+The command `reset` sets the branch of every repository to the branch it follows on its server, as a fetch and a hard reset would, without the losses of a hard reset. A repository level with its server is left as it is, and one that only lacks the new commits of the server is moved forward. Commits that the server lacks are named, with their number and their first subjects, and dropped only with `--discard-local`, after the plan and one confirmation. Before any branch moves, its commit is kept under a reference of its own, `refs/gh-batch/before-reset/BRANCH/DATE-TIME`, and the report prints the one command that puts the branch and its files back. Uncommitted changes to tracked files, an operation in progress, a detached HEAD and a branch that follows nothing leave a repository alone; untracked and ignored files are never deleted or overwritten, since the move is a checkout that refuses to overwrite them; nothing is pushed, and `--dry-run` only says what would be done. When the history of the server was rewritten and pushed by force, as after `git filter-repo`, the report says so: that is the case the command was made for, where `pull` can only report the old commits as diverged.
+
+The README names five options that the program had and that it never mentioned: `--diverged`, `--no-commit`, `--orgs`, `--no-color` and `--version`. The help of `clone` lists `--orgs` too, and the completion offers it. A citation file lets GitHub show how to cite the program.
+
 ## 1.3.0, 14 November 2026
 
-The command `commit` commits the pending changes of every repository. The list is shown first, and the first line of the commits is asked for: Enter takes the sentence "A Regular Commit to Synchronise", another line replaces it, and a minus sign alone does nothing. The same guards as the evening commit apply, a repository that opted out is left alone, and a repository without a remote is committed and stays on this machine. `commit push` does this and then the push, which asks on its own; declining the push leaves the commits where they are. With `-m`, with `--yes`, or with `gh-batch.message` set, the message is the one given, and the evening push keeps its own work-in-progress line.
+The command `commit` commits the pending changes of every repository. The list is shown first, and the first line of the commits is asked for: Enter takes the sentence "A Regular Commit to Synchronise", another line replaces it, and a minus sign alone does nothing. The same guards as the evening commit apply, a repository that opted out is left alone, and a repository without a remote is committed and stays on this machine. The form `commit push` does this and then the push, which asks on its own; declining the push leaves the commits where they are. With `-m`, with `--yes`, or with `gh-batch.message` set, the message is the one given, and the evening push keeps its own work-in-progress line.
 
 ## 1.2.0, 13 November 2026
 
