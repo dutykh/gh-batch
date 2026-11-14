@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# gh-batch: fetch, pull, commit, push and clone many git repositories with one command.
+# gh-batch: fetch, pull, reset, commit, push and clone many git repositories with one command.
 #
 # Author: Dr. Denys Dutykh (Mathematics Department, Khalifa University of
 #         Science and Technology, Abu Dhabi, UAE).
@@ -17,7 +17,8 @@
 #
 # Layout of the file: diagnostics, settings, discovery of the repositories,
 # the engine that runs them in parallel, what git says about one repository,
-# the update of one repository, the commands, the help texts, main.
+# the update of one repository, the commands (reset among them, after
+# commit), the help texts, main.
 
 # Most functions are reached through a name handed to the engine (the worker
 # of a command, the function that prints a result), which the linter cannot
@@ -28,7 +29,7 @@ set -uo pipefail
 
 : "${HOME:=/}"
 
-GH_BATCH_VERSION="1.3.0"
+GH_BATCH_VERSION="1.4.0"
 PROG="gh-batch"
 
 TAB=$(printf '\t')
@@ -63,6 +64,9 @@ YES=0
 SET_UPSTREAM=0
 ALSO_PUSH=0               # commit: push once the commits are made
 COMMITS_MADE=0            # commit: a commit was attempted in this run
+DISCARD_LOCAL=0           # reset: drop the commits that the server lacks
+RESET_STAMP=""            # reset: the date and time in the names of the backups
+PLAN_DROPS=0              # reset: repositories whose reset drops commits
 EXEC_CMD=()               # exec: the command and its arguments
 EXEC_LIMIT=0
 F_DIRTY=0                 # exec: keep only the repositories in these states
@@ -1021,8 +1025,8 @@ state_label() {
 
 state_class() {
     case "$1" in
-        updated|rebased|merged|pushed|committed|cloned|ok) printf 'good' ;;
-        uptodate|clean|present|skipped|nothing|healthy) printf 'dim' ;;
+        updated|rebased|merged|reset|pushed|committed|cloned|ok) printf 'good' ;;
+        uptodate|level|clean|present|skipped|nothing|healthy) printf 'dim' ;;
         ahead|behind|pending|stash|localonly|noupstream|detached|planned|active|warning) printf 'info' ;;
         *)                                         printf 'bad' ;;
     esac
@@ -1046,7 +1050,9 @@ state_phrase() {
         notcommitted) printf '%s not committed' "$n" ;;
         rebased)      printf '%s rebased' "$n" ;;
         merged)       printf '%s merged' "$n" ;;
+        reset)        printf '%s reset' "$n" ;;
         uptodate)     printf '%s up to date' "$n" ;;
+        level)        printf '%s level with the server' "$n" ;;
         clean)        printf '%s clean' "$n" ;;
         pending)      printf '%s with pending changes' "$n" ;;
         stash)        printf '%s with a stash' "$n" ;;
@@ -1071,7 +1077,7 @@ state_phrase() {
     esac
 }
 
-STATE_ORDER="updated rebased merged pushed committed planned cloned ok uptodate clean nothing present pending stash ahead behind localonly noupstream detached skipped healthy warning problem diverged conflict blocked rejected notcommitted failed gone unfinished halfupdated busy unreadable interrupted lost"
+STATE_ORDER="updated rebased merged reset pushed committed planned cloned ok uptodate level clean nothing present pending stash ahead behind localonly noupstream detached skipped healthy warning problem diverged conflict blocked rejected notcommitted failed gone unfinished halfupdated busy unreadable interrupted lost"
 
 tally() {
     local var="N_$1"
@@ -1122,7 +1128,7 @@ mark() {
     # cross for what needs the user; letters when the terminal is not UTF-8.
     local u a
     case "$1" in
-        updated|rebased|merged|pushed|committed|cloned|ok|healthy) u='✓'; a='+' ;;
+        updated|rebased|merged|reset|pushed|committed|cloned|ok|healthy) u='✓'; a='+' ;;
         ahead)                 u='↑'; a='^' ;;
         behind)                u='↓'; a='v' ;;
         diverged)              u='⇅'; a='x' ;;
@@ -1130,7 +1136,7 @@ mark() {
         warning)               u='⚠'; a='!' ;;
         pending|stash|active)  u='●'; a='*' ;;
         localonly|noupstream|detached) u='○'; a='o' ;;
-        uptodate|clean|nothing|present|skipped) u='·'; a='-' ;;
+        uptodate|level|clean|nothing|present|skipped) u='·'; a='-' ;;
         *)                     u='✗'; a='x' ;;
     esac
     if [ "$UNICODE" -eq 1 ]; then printf '%s' "$u"; else printf '%s' "$a"; fi
@@ -1929,9 +1935,12 @@ conflict_files() {
     printf '%s' "$list"
 }
 
-level_with_server() {
-    # The whole morning logic for the repository already inspected: fetch,
-    # compare, bring forward. Sets U_state, U_attn, U_msg, U_details, U_move.
+fetch_and_compare() {
+    # The first half of the morning logic, which "reset" shares: the states
+    # that leave a repository alone, the fetch, and the comparison of the
+    # branch with the one it follows. Returns 0 with U_head, U_up, U_ahead
+    # and U_behind set, or 1 when the repository is settled: U_state and
+    # U_msg then say why.
     local rc counts
     U_state=""; U_attn=0; U_msg=""; U_details=""; U_move=""
     U_head=""; U_up=""; U_ahead=0; U_behind=0
@@ -1943,33 +1952,33 @@ level_with_server() {
     if [ "$R_busy" -eq 1 ]; then
         U_state="busy"; U_attn=1
         U_msg="another git process holds its index (index.lock): try again later"
-        return 0
+        return 1
     fi
     if [ -n "$R_operation" ]; then
         U_state="unfinished"; U_attn=1
         U_msg="$R_operation is in progress: finish or abort it first"
-        return 0
+        return 1
     fi
     if [ "$R_unmerged" -gt 0 ]; then
         U_state="unfinished"; U_attn=1
         U_msg="$(plural "$R_unmerged" file) with unresolved conflicts"
-        return 0
+        return 1
     fi
     if [ "$R_remotes" -eq 0 ]; then
         U_state="localonly"; U_msg="it has no remote: it exists on this machine only"
-        return 0
+        return 1
     fi
     if [ "$R_detached" -eq 1 ]; then
         U_state="detached"; U_msg="HEAD is detached: there is no branch to bring forward"
-        return 0
+        return 1
     fi
     if [ "$R_unborn" -eq 1 ]; then
         U_state="skipped"; U_msg="it has no commit yet"
-        return 0
+        return 1
     fi
     if [ -z "$R_up_ref" ] || [ "$R_up_remote" = "." ] || [ -z "$R_up_remote" ]; then
         U_state="noupstream"; U_msg="the branch $R_branch follows no branch of a server"
-        return 0
+        return 1
     fi
 
     net_setup
@@ -1977,11 +1986,11 @@ level_with_server() {
     rc=$?
     case "$rc" in
         0) ;;
-        2) U_state="interrupted"; U_attn=1; U_msg="stopped during the fetch"; return 0 ;;
+        2) U_state="interrupted"; U_attn=1; U_msg="stopped during the fetch"; return 1 ;;
         3) U_state="gone"; U_attn=1
            U_msg="the branch ${R_up_rref#refs/heads/} is no longer on $R_up_remote: choose what $R_branch should follow"
-           return 0 ;;
-        *) U_state="failed"; U_attn=1; U_msg="the fetch failed: $F_msg"; return 0 ;;
+           return 1 ;;
+        *) U_state="failed"; U_attn=1; U_msg="the fetch failed: $F_msg"; return 1 ;;
     esac
     U_head=$(g rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)
     U_up=$(g rev-parse -q --verify "$R_up_ref^{commit}" 2>/dev/null)
@@ -1990,12 +1999,19 @@ level_with_server() {
     U_behind=${counts##*"$TAB"}
     if ! is_uint "$U_ahead" || ! is_uint "$U_behind"; then
         U_state="failed"; U_attn=1; U_msg="the two histories could not be compared"
-        return 0
+        return 1
     fi
     if stopped; then
         U_state="interrupted"; U_attn=1; U_msg="stopped after the fetch, before any change"
-        return 0
+        return 1
     fi
+    return 0
+}
+
+level_with_server() {
+    # The whole morning logic for the repository already inspected: fetch,
+    # compare, bring forward. Sets U_state, U_attn, U_msg, U_details, U_move.
+    fetch_and_compare || return 0
 
     if [ "$U_behind" -eq 0 ]; then
         if [ "$U_ahead" -eq 0 ]; then
@@ -3417,6 +3433,344 @@ notify_child() {
 }
 
 # ---------------------------------------------------------------------------
+# reset: every branch level with the branch it follows on its server, the
+# commit it had kept under a reference of its own
+# ---------------------------------------------------------------------------
+
+shell_word() {
+    # shell_word TEXT -> TEXT as one word of a command line: as it is when
+    # it holds only characters that a shell leaves alone, else between
+    # single quotes.
+    case "$1" in
+        ""|*[!A-Za-z0-9._/@%+=:,~-]*)
+            printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+            ;;
+        *)  printf '%s' "$1" ;;
+    esac
+}
+
+shell_path() {
+    # shell_path PATH -> the path in a command shown to the user: short
+    # (~/...) when it can be typed as it is, else whole and quoted.
+    local short
+    short=$(short_path "$1")
+    case "$short" in
+        *[!A-Za-z0-9._/@%+=:,~-]*) shell_word "$1" ;;
+        *)                         printf '%s' "$short" ;;
+    esac
+}
+
+gap_words() {
+    # gap_words -> what separates the branch from the one it follows, in
+    # words, once fetch_and_compare has counted.
+    if [ "$U_ahead" -eq 0 ]; then
+        printf '%s on the server' "$(plural "$U_behind" "new commit")"
+    elif [ "$U_behind" -eq 0 ]; then
+        printf '%s here that the server lacks' "$(plural "$U_ahead" commit)"
+    else
+        printf '%s here that the server lacks, and %s there' \
+            "$(plural "$U_ahead" commit)" "$(plural "$U_behind" "new one")"
+    fi
+}
+
+server_rewrote() {
+    # server_rewrote -> 0 when the branch of the server once held a commit
+    # of this branch that it holds no more: its history was rewritten and
+    # pushed by force since this clone last saw it. The positions of the
+    # remote branch that git recorded here tell.
+    local fork rc
+    fork=$(g merge-base --fork-point "$R_up_ref" "$U_head" 2>/dev/null) || return 1
+    [ -n "$fork" ] || return 1
+    g merge-base --is-ancestor "$fork" "$U_up" 2>/dev/null
+    rc=$?
+    # 1 says "not an ancestor"; any other failure says nothing.
+    [ "$rc" -eq 1 ]
+}
+
+drop_words() {
+    # drop_words -> what a reset with --discard-local does to the branch
+    local text
+    text="drop $(plural "$U_ahead" commit) that the server lacks"
+    [ "$U_behind" -gt 0 ] && text="$text, and take $(plural "$U_behind" "new one")"
+    printf '%s' "$text"
+}
+
+keep_backup() {
+    # Before the branch moves, its commit is kept under a reference of its
+    # own, refs/gh-batch/before-reset/BRANCH/DATE-TIME, outside the branches
+    # and the remote branches, which keeps the commit and its files from
+    # the garbage collection of git. A name taken already, by a run in the
+    # same second, gets a number. Sets B_ref; returns 1, with the words of
+    # git in B_why, when no reference can be written.
+    local name n=1
+    B_ref=""; B_why=""
+    name="refs/gh-batch/before-reset/$R_branch/$RESET_STAMP"
+    while :; do
+        # An empty old value makes git refuse a name that exists already.
+        if g update-ref "$name" "$U_head" "" 2> "$W/backup.err"; then
+            B_ref=$name
+            return 0
+        fi
+        if [ "$n" -ge 9 ]; then
+            B_why=$(last_line "$W/backup.err")
+            return 1
+        fi
+        n=$(( n + 1 ))
+        name="refs/gh-batch/before-reset/$R_branch/$RESET_STAMP-$n"
+    done
+}
+
+drop_backup() {
+    # The branch did not move: the reference written for the move goes, if
+    # it still points where it was made to point.
+    [ -n "$B_ref" ] && g update-ref -d "$B_ref" "$U_head" >/dev/null 2>&1
+    B_ref=""
+    return 0
+}
+
+restore_line() {
+    # The one command that puts the branch and its files back where they
+    # were. It is as careful as the reset: git refuses to overwrite a
+    # pending change, or a file that it does not track.
+    printf 'to restore: git -C %s checkout --no-track --no-overwrite-ignore -B %s %s' \
+        "$(shell_path "$REPO")" "$(shell_word "$R_branch")" "$(shell_word "$B_ref")"
+}
+
+discard_local() {
+    # The branch has commits that the server lacks, and --discard-local
+    # lets them go: the branch and its files are set to the commit of the
+    # server, as a checkout sets them, so that git refuses to overwrite a
+    # file or a folder that it does not track, ignored or not, and nothing
+    # changes then. A file that only the dropped commits held leaves the
+    # working tree; the backup reference keeps it.
+    local before after now rc files
+    if ! lfs_prefetch; then
+        U_state="failed"; U_attn=1
+        U_msg="the large files of the server could not be downloaded: $(net_failure "$?")"
+        return 0
+    fi
+    before=$(snapshot)
+    mark_inflight
+    run_local reset "${GIT[@]}" -c gc.auto=0 -c maintenance.auto=false \
+        checkout --quiet --no-track --no-overwrite-ignore -B "$R_branch" "$U_up"
+    rc=$?
+    unmark_inflight
+    now=$(g rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)
+    if [ "$rc" -eq 0 ] && [ "$now" = "$U_up" ] &&
+        [ "$(g symbolic-ref -q HEAD 2>/dev/null)" = "refs/heads/$R_branch" ]; then
+        U_state="reset"
+        U_msg="dropped $(plural "$U_ahead" commit) that the server lacks"
+        [ "$U_behind" -gt 0 ] && U_msg="$U_msg, took $(plural "$U_behind" "new one")"
+        U_move="reset$US$U_head$US$U_up"
+        return 0
+    fi
+    after=$(snapshot)
+    if [ "$after" = "$before" ]; then
+        U_state="blocked"; U_attn=1
+        files=$(refused_files)
+        if [ -n "$files" ]; then
+            U_msg="the reset would overwrite what git does not track here, in $files: nothing was changed"
+        else
+            U_msg="git refused the reset ($(last_line "$ERR")): nothing was changed"
+        fi
+    else
+        U_state="halfupdated"; U_attn=1
+        U_msg="the reset stopped half-way from ${U_head:0:9} to ${U_up:0:9}: look at it with git status"
+    fi
+    return 0
+}
+
+do_reset_plan() {
+    # The first pass of "reset": fetch, compare the branch with the one it
+    # follows, decide. Nothing moves but the remote branches that the fetch
+    # brings up to date. A repository with a move to make leaves a marker
+    # for the second pass: the move, the branch, the two commits seen, the
+    # two counts and whether the server rewrote its history.
+    local gap rewritten=0 kind text hint state
+    repo_begin || return 0
+    if ! fetch_and_compare; then
+        emit_update
+        return 0
+    fi
+    if [ "$U_ahead" -eq 0 ] && [ "$U_behind" -eq 0 ]; then
+        emit level 0 ""
+        return 0
+    fi
+    gap=$(gap_words)
+    if [ "$U_ahead" -gt 0 ] && server_rewrote; then
+        rewritten=1
+        gap="the history of the server was rewritten; $gap"
+    fi
+    if [ "$R_tracked" -gt 0 ]; then
+        emit pending 1 "$gap, and uncommitted changes to tracked files: left to you"
+        [ "$U_ahead" -gt 0 ] && details "$(incoming "$U_up" "$U_head" "$U_ahead")"
+        return 0
+    fi
+    if [ "$U_ahead" -eq 0 ]; then
+        kind="fast-forward"
+        emit planned 0 "take $(plural "$U_behind" "new commit") from the server"
+        details "$(incoming "$U_head" "$U_up" "$U_behind")"
+    elif [ "$DISCARD_LOCAL" -eq 0 ]; then
+        if [ "$U_behind" -eq 0 ]; then
+            state="ahead"
+            hint="--discard-local drops $( [ "$U_ahead" -eq 1 ] && printf 'it' || printf 'them' )"
+        else
+            state="diverged"
+            hint="--discard-local drops those here"
+        fi
+        emit "$state" 1 "$gap: left to you ($hint)"
+        details "$(incoming "$U_up" "$U_head" "$U_ahead")"
+        return 0
+    else
+        kind="discard"
+        text=$(drop_words)
+        [ "$rewritten" -eq 1 ] && text="the history of the server was rewritten; $text"
+        emit planned 0 "$text"
+        details "$(incoming "$U_up" "$U_head" "$U_ahead")"
+    fi
+    printf '%s\n' "$kind$US$R_branch$US$U_head$US$U_up$US$U_ahead$US$U_behind$US$rewritten" > "$TMP/rplan/$IDX.go"
+    printf 'P%s%s\n' "$US" "$( [ "$kind" = "discard" ] && printf 1 || printf 0 )"
+    return 0
+}
+
+render_reset_plan() {
+    # render_reset_plan INDEX FILE: count the moves that the first pass of
+    # "reset" planned; nothing is printed before every repository answered.
+    local kind drops
+    while IFS=$US read -r kind drops _; do
+        [ "$kind" = "P" ] || continue
+        PLAN_GO=$(( PLAN_GO + 1 ))
+        [ "$drops" = "1" ] && PLAN_DROPS=$(( PLAN_DROPS + 1 ))
+    done < "$2"
+    return 0
+}
+
+reset_plan_words() {
+    local text
+    text="To do: a reset in $(plural "$PLAN_GO" repository)"
+    if [ "$PLAN_DROPS" -gt 0 ] && [ "$PLAN_DROPS" -eq "$PLAN_GO" ]; then
+        text="$text, dropping commits that the server lacks"
+    elif [ "$PLAN_DROPS" -gt 0 ]; then
+        text="$text, $PLAN_DROPS of them dropping commits that the server lacks"
+    fi
+    printf '%s.' "$text"
+}
+
+show_reset_plan() {
+    # The list shown before a reset drops commits: what will be done, and
+    # what is left aside and why.
+    local i=0 count="${#REPOS[@]}"
+    put_title "Plan:"
+    while [ "$i" -lt "$count" ]; do
+        if [ -f "$TMP/rplan/$i.res" ]; then
+            read_record "$TMP/rplan/$i.res"
+            if [ "$REC_state" = "planned" ] || [ "$REC_attention" = 1 ]; then
+                print_record "$i"
+            fi
+        fi
+        i=$(( i + 1 ))
+    done
+    put ""
+    put_title "$(reset_plan_words)"
+    return 0
+}
+
+do_reset() {
+    # The second pass of "reset": the move that the plan decided, made
+    # only when the repository is still as the plan saw it, after its
+    # commit is kept. A repository without a marker keeps the answer of the
+    # plan.
+    local p_kind p_branch p_head p_up p_ahead p_behind p_rewritten head up
+    if [ ! -e "$TMP/rplan/$IDX.go" ]; then
+        cat "$TMP/rplan/$IDX.res"
+        return 0
+    fi
+    IFS=$US read -r p_kind p_branch p_head p_up p_ahead p_behind p_rewritten < "$TMP/rplan/$IDX.go"
+    repo_begin || return 0
+    if [ "$R_busy" -eq 1 ] || [ -n "$R_operation" ] || [ "$R_unmerged" -gt 0 ] || [ "$R_detached" -eq 1 ]; then
+        emit unfinished 1 "its state changed since the plan: nothing was done"
+        return 0
+    fi
+    if [ "$R_tracked" -gt 0 ]; then
+        emit pending 1 "uncommitted changes to tracked files appeared since the plan: nothing was done"
+        return 0
+    fi
+    head=$(g rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)
+    up=""
+    [ -n "$R_up_ref" ] && up=$(g rev-parse -q --verify "$R_up_ref^{commit}" 2>/dev/null)
+    if [ "$R_branch" != "$p_branch" ] || [ "$head" != "$p_head" ] || [ "$up" != "$p_up" ]; then
+        emit unfinished 1 "its state changed since the plan: nothing was done"
+        return 0
+    fi
+    if stopped; then
+        emit interrupted 1 "stopped before the reset: nothing was changed"
+        return 0
+    fi
+    U_state=""; U_attn=0; U_msg=""; U_details=""; U_move=""
+    U_head=$head; U_up=$up; U_ahead=$p_ahead; U_behind=$p_behind
+    if ! keep_backup; then
+        emit failed 1 "the commit could not be kept under refs/gh-batch ($B_why): nothing was changed"
+        return 0
+    fi
+    net_setup
+    if [ "$p_kind" = "discard" ]; then
+        discard_local
+        if [ "$U_state" = "reset" ] && [ "$p_rewritten" = "1" ]; then
+            U_msg="the history of the server was rewritten; $U_msg"
+        fi
+    else
+        fast_forward
+    fi
+    case "$U_state" in
+        updated|reset|halfupdated)
+            U_msg="$U_msg; the commit before is kept as $B_ref"
+            U_details="$U_details${U_details:+$NL}$(restore_line)"
+            ;;
+        *)
+            drop_backup
+            ;;
+    esac
+    emit_update
+}
+
+cmd_reset() {
+    local i=0
+    begin_command change
+    no_repository && exit "$EX_OK"
+    RESET_STAMP=$(date '+%Y%m%d-%H%M%S')
+    header ""
+    PLAN_GO=0; PLAN_DROPS=0
+    pool do_reset_plan rplan render_reset_plan
+    if [ "$STOP" -eq 0 ] && [ "$PLAN_GO" -gt 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+        # Commits are dropped only after one confirmation; a fast-forward
+        # loses nothing and needs none, as with pull.
+        if [ "$PLAN_DROPS" -gt 0 ]; then
+            show_before_asking show_reset_plan
+            if ! confirmed; then
+                put "Nothing was done."
+                exit "$EX_OK"
+            fi
+            if [ "$PORCELAIN" -eq 0 ]; then
+                put ""
+                put_title "Done:"
+            fi
+        fi
+        pool do_reset rwork render
+        finish
+    fi
+    # Nothing to move, only a look, or a stop: the plan is the report.
+    while [ "$i" -lt "${#REPOS[@]}" ]; do
+        [ -f "$TMP/rplan/$i.res" ] && render "$i" "$TMP/rplan/$i.res"
+        i=$(( i + 1 ))
+    done
+    if [ "$DRY_RUN" -eq 1 ] && [ "$PLAN_GO" -gt 0 ] && [ "$PORCELAIN" -eq 0 ] && [ "$STOP" -eq 0 ]; then
+        put ""
+        put_title "$(reset_plan_words) Nothing was changed (dry run)."
+    fi
+    finish
+}
+
+# ---------------------------------------------------------------------------
 # clone: what an account or a layout file names and this machine lacks
 # ---------------------------------------------------------------------------
 
@@ -4628,7 +4982,7 @@ _gh_batch() {
     local cur prev words cword commands options
     cur=${COMP_WORDS[COMP_CWORD]}
     prev=${COMP_WORDS[COMP_CWORD-1]}
-    commands="pull push commit sync clone status fetch log exec doctor list config completion help"
+    commands="pull push commit sync reset clone status fetch log exec doctor list config completion help"
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=($(compgen -W "$commands --help --version" -- "$cur"))
         return 0
@@ -4646,7 +5000,8 @@ _gh_batch() {
         pull|fetch) options="$options --diverged --notify" ;;
         push|sync)  options="$options --commit --no-commit --message --set-upstream --diverged --notify" ;;
         commit)     options="$options --message --notify" ;;
-        clone)      options="$options --into --manifest --update --since --no-forks --no-archived --no-orgs --flat --by-owner" ;;
+        reset)      options="$options --discard-local --notify" ;;
+        clone)      options="$options --into --manifest --update --since --no-forks --no-archived --orgs --no-orgs --flat --by-owner" ;;
         status)     options="$options --long" ;;
         log)        options="$options --since --until --author --all-authors --long" ;;
         exec)       options="$options --dirty --clean --ahead --behind" ;;
@@ -4679,6 +5034,7 @@ _gh_batch() {
         'push:commit what is pending when asked to, then push'
         'commit:commit what is pending, and push afterwards when asked'
         'sync:pull, then push'
+        'reset:set every branch to the one it follows on its server, safely'
         'clone:clone what is missing from an account or a layout file'
         'status:what is pending in every repository'
         'fetch:look at the servers and say what pull would do'
@@ -4712,7 +5068,9 @@ _gh_batch() {
                 '--commit[commit pending changes before the push]' \
                 '--no-commit[push only what is committed already]' \
                 '(-m --message)'{-m,--message}'[the first line of the commits]:text:' \
+                '--discard-local[let reset drop the commits that the server lacks]' \
                 '--into[the folder that receives the clones]:folder:_files -/' \
+                '--orgs[clone the organisations too, whatever gh-batch.orgs says]' \
                 '--no-orgs[clone the account without its organisations]' \
                 '--manifest[a layout file]:file:_files' \
                 '*:folder:_files -/'
@@ -4841,6 +5199,9 @@ COMMANDS
   commit      commit what is pending, asking for the message; with "push"
               afterwards, push once the commits are made
   sync        pull, then push
+  reset       set every branch to the one it follows on its server, safely:
+              its commit is kept first, and commits that the server lacks
+              are dropped only with --discard-local
   clone       clone what is missing: a whole GitHub account with its
               organisations, or the entries of a layout file written by
               "list --manifest"
@@ -4863,13 +5224,13 @@ COMMON OPTIONS
       --except GLOB  leave out the repositories whose name matches, repeatable
   -n, --dry-run      show what would be done and change nothing
   -y, --yes          do not ask for a commit message, or before committing,
-                     pushing or cloning
+                     pushing, cloning or dropping commits
   -v, --verbose      show every repository, not only those that changed
   -q, --quiet        show only what needs you
       --porcelain    one line per repository, fields separated by tabs:
                      state, path, branch, message
       --timeout SEC  give up on a server that does not answer (default 300)
-      --color WHEN   auto, always or never
+      --color WHEN   auto, always or never; --no-color is never
   -h, --help         this text, or the help of the command given
       --version      the version
 
@@ -5039,6 +5400,44 @@ OPTIONS
 EOF
 }
 
+help_reset() {
+    cat <<EOF
+$PROG reset [options] [folder ...]
+
+Set the branch of every repository to the branch it follows on its server,
+as a fetch and a hard reset onto that branch would, but without losing
+anything. After the fetch, for each repository:
+
+  level with the server         nothing is done
+  new commits on the server     the branch moves forward (a fast-forward)
+  commits here that the         nothing is done and the commits are named,
+  server lacks                  unless --discard-local is given: the branch
+                                and its files are then set to those of the
+                                server, after one confirmation
+
+Before a branch moves, its commit is kept under a reference of its own,
+refs/gh-batch/before-reset/BRANCH/DATE-TIME, and the report prints the one
+command that puts the branch and its files back. A repository with
+uncommitted changes to tracked files is left alone, and so are a detached
+HEAD, an operation in progress, a branch that follows nothing and a
+repository without remote. Untracked and ignored files are never deleted
+or overwritten: when one stands in the way, git refuses and nothing
+changes. Nothing is pushed.
+
+The command is made for a history rewritten on the server, a folder
+removed from every commit and the result pushed by force: the clones on
+the other machines still hold the old commits, which pull reports as
+diverged, and "$PROG reset --discard-local" sets them to the new history.
+
+OPTIONS
+      --discard-local  let the reset drop the commits that the server lacks
+  -y, --yes            do not ask before dropping commits
+  -n, --dry-run        fetch, then only say what would be done
+      --notify         send the report through the command of gh-batch.notify
+  and the common options, see: $PROG help
+EOF
+}
+
 help_clone() {
     cat <<EOF
 $PROG clone [options] [owner ...]
@@ -5081,6 +5480,7 @@ OPTIONS
       --no-forks       leave the forks out
       --no-archived    leave the archived repositories out
       --no-orgs        the account only, without its organisations
+      --orgs           the organisations too, even when gh-batch.orgs is false
       --flat           DEST/name for every owner
       --by-owner       DEST/folder/name for every owner, the account too,
                        the folder being the name of the owner unless
@@ -5263,6 +5663,7 @@ show_help() {
         push)    help_push ;;
         commit)  help_commit ;;
         sync)    help_sync ;;
+        reset)   help_reset ;;
         clone)   help_clone ;;
         status)  help_status ;;
         fetch)   help_fetch ;;
@@ -5302,6 +5703,7 @@ parse_options() {
             --except=*)     EXCEPT+=("${1#*=}"); shift ;;
             --commit)       OPT_COMMIT="true"; shift ;;
             --no-commit)    OPT_COMMIT="false"; shift ;;
+            --discard-local) DISCARD_LOCAL=1; shift ;;
             -m|--message)   need_value "$@"; OPT_MESSAGE=$2; shift 2 ;;
             --message=*)    OPT_MESSAGE=${1#*=}; shift ;;
             -y|--yes)       YES=1; shift ;;
@@ -5402,7 +5804,7 @@ main() {
     COMMAND=$1
     shift
     case "$COMMAND" in
-        pull|push|commit|sync|clone|status|fetch|log|exec|doctor|list|config|completion|help) ;;
+        pull|push|commit|sync|reset|clone|status|fetch|log|exec|doctor|list|config|completion|help) ;;
         *) die "$EX_USAGE" "no such command: $COMMAND (see $PROG help)" ;;
     esac
     parse_options "$@"
@@ -5419,6 +5821,7 @@ main() {
         push)       cmd_push ;;
         commit)     cmd_commit ;;
         sync)       cmd_sync ;;
+        reset)      cmd_reset ;;
         clone)      cmd_clone ;;
         log)        LOG_SINCE=$SINCE; cmd_log ;;
         exec)       cmd_exec ;;

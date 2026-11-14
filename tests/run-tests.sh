@@ -1368,6 +1368,183 @@ if describe "sync: pull, then push"; then
         "$( [ "$(state_of "$A/behind")" = "$s_b" ] && [ "$(git -C "$SRV/ahead.git" rev-parse main)" = "$srv_a" ] && contains "$OUTPUT" "dry run" && echo 0 || echo 1 )"
 fi
 
+# --- reset ----------------------------------------------------------------------------
+backups() {
+    # backups DIR -> the backup references of a repository, one per line:
+    # the commit, a space, the name
+    git -C "$1" for-each-ref --format='%(objectname) %(refname)' refs/gh-batch
+}
+
+restore_command() {
+    # restore_command -> the command that the last report gave to restore
+    printf '%s\n' "$OUTPUT" | sed -n 's/^ *to restore: //p'
+}
+
+backup_of() {
+    # backup_of DIR COMMIT -> 0 when DIR holds one backup reference, named
+    # after the branch main and the date and time, and it keeps COMMIT. The
+    # pattern is matched here, not inside a command substitution, where the
+    # bash 3.2 of macOS misreads the parenthesis of a case.
+    local list
+    list=$(backups "$1")
+    [ -n "$list" ] && [ "$(printf '%s\n' "$list" | wc -l | tr -d ' ')" = 1 ] || return 1
+    case "$list" in
+        "$2 refs/gh-batch/before-reset/main/"[0-9]*-[0-9]*) return 0 ;;
+    esac
+    return 1
+}
+
+if describe "reset: level, behind, and commits here that the server lacks"; then
+    world
+    repo same
+    repo behind
+    repo ahead
+    commit "$B/behind" news.txt "news" "Add the news"
+    publish "$B/behind"
+    commit "$A/ahead" mine.txt "mine" "Local work"
+    old_behind=$(head_of "$A/behind")
+    remember ahead
+    gb reset --porcelain "$A"
+    check "reset: level, moved forward, and commits that the server lacks kept" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 1 ] && [ "$(st same)" = "level" ] && [ "$(st behind)" = "updated" ] && [ "$(st ahead)" = "ahead" ] && contains "$(msg ahead)" "1 commit here that the server lacks" && contains "$(msg ahead)" "--discard-local" && echo 0 || echo 1 )"
+    check "reset: the branch behind is where the server is, its commit before kept" "refs: $(backups "$A/behind")" \
+        "$( [ "$(head_of "$A/behind")" = "$(head_of "$B/behind")" ] && backup_of "$A/behind" "$old_behind" && echo 0 || echo 1 )"
+    check "reset: without --discard-local the commits that the server lacks stay, untouched" "it changed" \
+        "$( untouched ahead && [ -z "$(backups "$A/ahead")" ] && [ -z "$(backups "$A/same")" ] && echo 0 || echo 1 )"
+    gb reset --verbose "$A"
+    check "reset: the report names the commits kept and sums up" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "Local work" && contains "$OUTPUT" "2 level with the server" && contains "$OUTPUT" "Needs you: ahead (ahead)" && echo 0 || echo 1 )"
+fi
+
+if describe "reset --discard-local: one confirmation, a backup, and the way back"; then
+    world
+    repo ahead
+    commit "$A/ahead" mine.txt "mine" "Local work"
+    old=$(head_of "$A/ahead")
+    printf 'notes\n' > "$A/ahead/notes.txt"
+    gb reset --discard-local "$A"
+    check "reset --discard-local: without a terminal the run asks for --yes and does nothing" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 2 ] && contains "$OUTPUT" "--yes" && [ "$(head_of "$A/ahead")" = "$old" ] && [ -z "$(backups "$A/ahead")" ] && echo 0 || echo 1 )"
+    gb reset --discard-local --porcelain "$A"
+    check "reset --discard-local --porcelain: nothing can be asked" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 2 ] && contains "$OUTPUT" "porcelain" && [ "$(head_of "$A/ahead")" = "$old" ] && echo 0 || echo 1 )"
+    asked 'n\n' reset --discard-local "$A"
+    check "reset --discard-local: the plan is shown, and declining does nothing" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "Plan:" && contains "$OUTPUT" "drop 1 commit that the server lacks" && contains "$OUTPUT" "Nothing was done." && [ "$(head_of "$A/ahead")" = "$old" ] && [ -z "$(backups "$A/ahead")" ] && echo 0 || echo 1 )"
+    asked '\n' reset --discard-local "$A"
+    check "reset --discard-local: Enter drops the commit, the branch is where the server is" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ "$(head_of "$A/ahead")" = "$(git -C "$SRV/ahead.git" rev-parse main)" ] && [ ! -e "$A/ahead/mine.txt" ] && [ -z "$(git -C "$A/ahead" status --porcelain --untracked-files=no)" ] && contains "$OUTPUT" "1 reset" && echo 0 || echo 1 )"
+    backup=$(git -C "$A/ahead" for-each-ref --format='%(refname)' refs/gh-batch)
+    check "reset --discard-local: the old commit is kept under refs/gh-batch/before-reset/main" "refs: $(backups "$A/ahead")" \
+        "$( backup_of "$A/ahead" "$old" && echo 0 || echo 1 )"
+    check "reset --discard-local: an untracked file stays" "notes.txt is gone" \
+        "$( [ "$(cat "$A/ahead/notes.txt" 2>/dev/null)" = "notes" ] && echo 0 || echo 1 )"
+    restore=$(restore_command)
+    check "reset --discard-local: the report prints the command that restores" "got: $OUTPUT" \
+        "$( contains "$restore" "checkout --no-track --no-overwrite-ignore -B main $backup" && echo 0 || echo 1 )"
+    eval "$restore" >/dev/null 2>&1
+    check "reset --discard-local: that command brings back the commit and its files" "head: $(head_of "$A/ahead")" \
+        "$( [ "$(head_of "$A/ahead")" = "$old" ] && [ "$(cat "$A/ahead/mine.txt" 2>/dev/null)" = "mine" ] && [ "$(cat "$A/ahead/notes.txt")" = "notes" ] && [ "$(git -C "$A/ahead" rev-parse --abbrev-ref 'main@{upstream}')" = "origin/main" ] && echo 0 || echo 1 )"
+    check "reset --discard-local: the journal records the reset" "journal: $(cat "$GH_BATCH_STATE_DIR/journal.tsv" 2>/dev/null)" \
+        "$( contains "$(cat "$GH_BATCH_STATE_DIR/journal.tsv" 2>/dev/null)" "${TAB}reset${TAB}reset${TAB}$A/ahead${TAB}$old${TAB}" && echo 0 || echo 1 )"
+    gb reset --discard-local --yes --porcelain "$A"
+    check "reset --discard-local: a second reset keeps a second backup" "refs: $(backups "$A/ahead")" \
+        "$( [ "$(st ahead)" = "reset" ] && [ "$(backups "$A/ahead" | wc -l | tr -d ' ')" = 2 ] && echo 0 || echo 1 )"
+    server spaced
+    clone_to "$A" spaced "two words"
+    commit "$A/two words" mine.txt "mine" "Local work"
+    old_spaced=$(head_of "$A/two words")
+    gb reset --discard-local --yes --only "two words" "$A"
+    restore=$(restore_command)
+    eval "$restore" >/dev/null 2>&1
+    check "reset: the command that restores is quoted where a name holds a space" "got: $restore" \
+        "$( contains "$restore" "'$A/two words'" && [ "$(head_of "$A/two words")" = "$old_spaced" ] && echo 0 || echo 1 )"
+fi
+
+if describe "reset --discard-local: a history rewritten on the server, with a new root"; then
+    world
+    repo paper
+    commit "$B/paper" private/draft.txt "draft" "Add the private folder"
+    commit "$B/paper" text.txt "text" "Write the text"
+    publish "$B/paper"
+    git -C "$A/paper" pull -q --ff-only
+    old=$(head_of "$A/paper")
+    printf 'scratch\n' > "$A/paper/scratch.txt"
+    # The history is written again without the folder, from a new first
+    # commit, and pushed by force, as git filter-repo leaves it.
+    git init -q "$WORLD/new"
+    commit "$WORLD/new" readme.txt "first line" "Start paper again"
+    commit "$WORLD/new" text.txt "text" "Write the text"
+    git -C "$WORLD/new" push -q --force "$SRV/paper.git" HEAD:refs/heads/main
+    gb pull --porcelain "$A"
+    check "rewritten history: pull reports it as diverged and changes nothing" "got: $(st paper) $(msg paper)" \
+        "$( [ "$(st paper)" = "diverged" ] && [ "$(head_of "$A/paper")" = "$old" ] && echo 0 || echo 1 )"
+    gb reset --porcelain "$A"
+    check "rewritten history: reset names the rewrite, and waits for --discard-local" "got: $(st paper) $(msg paper)" \
+        "$( [ "$RC" -eq 1 ] && [ "$(st paper)" = "diverged" ] && contains "$(msg paper)" "the history of the server was rewritten" && [ "$(head_of "$A/paper")" = "$old" ] && [ -z "$(backups "$A/paper")" ] && echo 0 || echo 1 )"
+    gb reset --discard-local --yes --porcelain "$A"
+    check "rewritten history: after reset --discard-local the clone equals the server" "got rc=$RC: $OUTPUT; status: $(git -C "$A/paper" status --porcelain | tr '\n' '|')" \
+        "$( [ "$RC" -eq 0 ] && [ "$(st paper)" = "reset" ] && [ "$(head_of "$A/paper")" = "$(git -C "$SRV/paper.git" rev-parse main)" ] && [ -z "$(git -C "$A/paper" status --porcelain --untracked-files=no)" ] && [ "$(git -C "$A/paper" ls-files | tr '\n' ' ')" = "readme.txt text.txt " ] && [ ! -e "$A/paper/private" ] && echo 0 || echo 1 )"
+    check "rewritten history: the backup reference holds the old head, the untracked file stays" "refs: $(backups "$A/paper")" \
+        "$( [ "$(git -C "$A/paper" for-each-ref --format='%(objectname)' refs/gh-batch)" = "$old" ] && [ "$(git -C "$A/paper" show "$old:private/draft.txt")" = "draft" ] && [ "$(cat "$A/paper/scratch.txt")" = "scratch" ] && echo 0 || echo 1 )"
+    gb pull --porcelain "$A"
+    check "rewritten history: afterwards pull finds it up to date" "got: $(st paper)" \
+        "$( [ "$(st paper)" = "uptodate" ] && echo 0 || echo 1 )"
+fi
+
+if describe "reset: what is left alone, and the files that git does not track"; then
+    world
+    for r in edited staged nobranch detached untracked inway; do
+        repo "$r"
+        commit "$B/$r" news.txt "news" "News for $r"
+        publish "$B/$r"
+    done
+    printf 'mine\n' >> "$A/edited/readme.txt"
+    printf 'staged\n' > "$A/staged/new.txt"
+    git -C "$A/staged" add new.txt
+    git -C "$A/nobranch" checkout -q -b topic
+    git -C "$A/detached" checkout -q --detach
+    printf 'keep\n' > "$A/untracked/keep.txt"
+    printf 'my news\n' > "$A/inway/news.txt"
+    remember edited staged nobranch detached inway
+    gb reset --porcelain "$A"
+    check "reset: uncommitted changes, staged or not, leave a repository alone" "got: $(st edited) $(msg edited); $(st staged)" \
+        "$( [ "$(st edited)" = "pending" ] && [ "$(st staged)" = "pending" ] && contains "$(msg edited)" "1 new commit on the server, and uncommitted changes to tracked files: left to you" && untouched edited staged && echo 0 || echo 1 )"
+    check "reset: a branch that follows nothing and a detached HEAD are left alone" "got: $(st nobranch), $(st detached)" \
+        "$( [ "$(st nobranch)" = "noupstream" ] && [ "$(st detached)" = "detached" ] && untouched nobranch detached && echo 0 || echo 1 )"
+    check "reset: untracked files are kept through the move" "got: $(st untracked) $(msg untracked)" \
+        "$( [ "$(st untracked)" = "updated" ] && [ "$(cat "$A/untracked/keep.txt")" = "keep" ] && [ -f "$A/untracked/news.txt" ] && echo 0 || echo 1 )"
+    check "reset: an untracked file in the way stops the move, and no backup stays" "got: $(st inway) $(msg inway); refs: $(backups "$A/inway")" \
+        "$( [ "$(st inway)" = "blocked" ] && contains "$(msg inway)" "news.txt" && [ "$(cat "$A/inway/news.txt")" = "my news" ] && untouched inway && [ -z "$(backups "$A/inway")" ] && echo 0 || echo 1 )"
+    check "reset: no backup where nothing moved, and the exit status is 1" "got rc=$RC" \
+        "$( [ "$RC" -eq 1 ] && [ -z "$(backups "$A/edited")$(backups "$A/staged")$(backups "$A/nobranch")$(backups "$A/detached")" ] && echo 0 || echo 1 )"
+    repo ignored
+    commit "$A/ignored" mine.txt "mine" "Local work"
+    commit "$B/ignored" cache.dat "server cache" "Add a cache file"
+    publish "$B/ignored"
+    printf 'cache.dat\n' > "$A/ignored/.git/info/exclude"
+    printf 'my cache\n' > "$A/ignored/cache.dat"
+    remember ignored
+    gb reset --discard-local --yes --porcelain --only ignored "$A"
+    check "reset --discard-local: an ignored file in the way is not overwritten, nothing changes" "got: $(st ignored) $(msg ignored)" \
+        "$( [ "$(st ignored)" = "blocked" ] && contains "$(msg ignored)" "cache.dat" && [ "$(cat "$A/ignored/cache.dat")" = "my cache" ] && untouched ignored && [ -z "$(backups "$A/ignored")" ] && echo 0 || echo 1 )"
+fi
+
+if describe "reset --dry-run: look, change nothing"; then
+    world
+    repo behind
+    repo ahead
+    commit "$B/behind" news.txt "news" "News from the server"
+    publish "$B/behind"
+    commit "$A/ahead" mine.txt "mine" "Local work"
+    remember behind ahead
+    gb reset --dry-run --discard-local "$A"
+    check "reset --dry-run: what would be done is said" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "take 1 new commit from the server" && contains "$OUTPUT" "News from the server" && contains "$OUTPUT" "drop 1 commit that the server lacks" && contains "$OUTPUT" "Nothing was changed (dry run)." && echo 0 || echo 1 )"
+    check "reset --dry-run: no branch, no file and no reference moved" "a repository changed" \
+        "$( untouched behind ahead && [ -z "$(backups "$A/behind")$(backups "$A/ahead")" ] && echo 0 || echo 1 )"
+fi
+
 # --- notification ---------------------------------------------------------------------
 if describe "notify: the report is handed to a command"; then
     world
@@ -2052,7 +2229,7 @@ if describe "completion: scripts for bash and zsh, help for every command"; then
     gb completion fish
     check "completion: another shell is a usage error" "got rc=$RC" "$( [ "$RC" -eq 2 ] && echo 0 || echo 1 )"
     all=0
-    for c in pull push commit sync clone status fetch log exec doctor list config completion; do
+    for c in pull push commit sync reset clone status fetch log exec doctor list config completion; do
         gb help "$c"
         if [ "$RC" -ne 0 ] || ! contains "$OUTPUT" "gh-batch $c"; then
             all=1
