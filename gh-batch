@@ -17,8 +17,10 @@
 #
 # Layout of the file: diagnostics, settings, discovery of the repositories,
 # the engine that runs them in parallel, what git says about one repository,
-# the update of one repository, the commands (reset among them, after
-# commit), the help texts, main.
+# the update of one repository (what stands in the way, the stash that
+# carries uncommitted changes, the replay with the server first), the
+# commands (reset among them, after commit, then tidy and the forks with
+# doctor), the help texts, main.
 
 # Most functions are reached through a name handed to the engine (the worker
 # of a command, the function that prints a result), which the linter cannot
@@ -29,7 +31,7 @@ set -uo pipefail
 
 : "${HOME:=/}"
 
-GH_BATCH_VERSION="1.4.0"
+GH_BATCH_VERSION="1.5.0"
 PROG="gh-batch"
 
 TAB=$(printf '\t')
@@ -57,6 +59,7 @@ OPT_JOBS=""
 OPT_DEPTH=""
 OPT_TIMEOUT=""
 OPT_DIVERGED=""
+OPT_CONFLICTS=""
 OPT_COMMIT=""
 OPT_MESSAGE=""
 OPT_NOTIFY=0
@@ -65,7 +68,10 @@ SET_UPSTREAM=0
 ALSO_PUSH=0               # commit: push once the commits are made
 COMMITS_MADE=0            # commit: a commit was attempted in this run
 DISCARD_LOCAL=0           # reset: drop the commits that the server lacks
-RESET_STAMP=""            # reset: the date and time in the names of the backups
+RUN_STAMP=""              # the date and time in the names of the backups and kept folders
+TIDY_UNTIL=""             # tidy: what is of this day (YYYYMMDD) or older is removed
+LW_oldest=""
+LW_words=""
 PLAN_DROPS=0              # reset: repositories whose reset drops commits
 EXEC_CMD=()               # exec: the command and its arguments
 EXEC_LIMIT=0
@@ -82,6 +88,7 @@ LOG_REPOS=0
 ALL_AUTHORS=0
 OFFLINE=0                 # doctor: do not ask GitHub
 DOCTOR_DAYS=7             # doctor: pending work older than this is reported
+DAYS_GIVEN=0              # --days was given (tidy has its own default)
 SHELL_NAME=""
 ROOTS_ABS=()              # the folders searched, as absolute paths
 ALL_REPOS=()              # every repository found, before --only and --except
@@ -127,6 +134,7 @@ JOBS=8
 DEPTH=3
 TIMEOUT=300
 DIVERGED="report"
+CONFLICTS="report"        # who wins the lines that both sides changed: report, server
 COMMIT=0                  # commit pending changes before the push
 COMMIT_FORCED=0           # the choice came from the command line or the environment
 CONFIRM=1                 # ask once before committing or pushing
@@ -141,6 +149,7 @@ SRC_jobs="default"
 SRC_depth="default"
 SRC_timeout="default"
 SRC_diverged="default"
+SRC_conflicts="default"
 SRC_commit="default"
 SRC_confirm="default"
 SRC_orgs="default"
@@ -158,6 +167,7 @@ CFG_depth=""
 CFG_jobs=""
 CFG_timeout=""
 CFG_diverged=""
+CFG_conflicts=""
 CFG_commit=""
 CFG_confirm=""
 CFG_message=""
@@ -188,6 +198,8 @@ ASKING=0                  # a question waits for its answer
 ISOLATE="none"            # how a child gets its own process group: setm, perl, none
 USER_SSH=0                # the caller chose the ssh command through the environment
 FETCH_PORCELAIN=0         # git is new enough for "fetch --porcelain"
+MT_WRITE=0                # git is new enough for "merge-tree --write-tree" (2.38)
+MT_BASE=0                 # and for its option --merge-base (2.40)
 STAT_STYLE=""             # gnu or bsd, for the age of files
 NOW=0
 TODAY=""
@@ -220,8 +232,37 @@ EXEC_OUTPUT=0             # the lines of detail are what a command of the user w
 SHOWN=0                   # a line of the report was written since its header
 ATTENTION=0
 ATTENTION_LIST=""
+KEPT_LIST=""              # what was kept aside, for the summary
 TOTAL=0
 ONLY_LOOK=0               # fetch and "pull --dry-run": look, change no file
+
+# The update of one repository, see clear_extras: what it adds to its report,
+# and what it moved aside.
+U_extra_msg=""
+U_extra=""
+U_kept=""
+U_carry=""
+U_move=""
+OB_lines=""
+OB_moves=""
+OB_n=0
+K_dir=""
+S_oid=""
+S_note=""
+B_ref=""
+B_why=""
+A_why=""
+CF_words=""
+IW_n=0
+IW_words=""
+KEPT_n=0
+KEPT_words=""
+SP_n=0
+SP_words=""
+AT_ok=0
+AT_rc=0
+AT_now=""
+R_icase=0
 
 # ---------------------------------------------------------------------------
 # Diagnostics
@@ -423,6 +464,7 @@ load_settings() {
             gh-batch.jobs)      CFG_jobs=$val ;;
             gh-batch.timeout)   CFG_timeout=$val ;;
             gh-batch.diverged)  CFG_diverged=$val ;;
+            gh-batch.conflicts) CFG_conflicts=$val ;;
             gh-batch.commit)    CFG_commit=${val:-true} ;;
             gh-batch.confirm)   CFG_confirm=${val:-true} ;;
             gh-batch.message)   CFG_message=$val ;;
@@ -456,6 +498,7 @@ resolve_settings() {
     pick GH_BATCH_DEPTH "$CFG_depth" 3 "$OPT_DEPTH";            DEPTH=$VAL; SRC_depth=$SRC
     pick GH_BATCH_TIMEOUT "$CFG_timeout" 300 "$OPT_TIMEOUT";    TIMEOUT=$VAL; SRC_timeout=$SRC
     pick GH_BATCH_DIVERGED "$CFG_diverged" report "$OPT_DIVERGED"; DIVERGED=$VAL; SRC_diverged=$SRC
+    pick GH_BATCH_CONFLICTS "$CFG_conflicts" report "$OPT_CONFLICTS"; CONFLICTS=$VAL; SRC_conflicts=$SRC
 
     { is_uint "$JOBS" && [ "$JOBS" -ge 1 ]; } ||
         die "$EX_USAGE" "the number of jobs must be a positive integer, not '$JOBS'"
@@ -466,6 +509,10 @@ resolve_settings() {
     case "$DIVERGED" in
         report|rebase|merge) ;;
         *) die "$EX_USAGE" "the choices for diverged histories are report, rebase and merge, not '$DIVERGED'" ;;
+    esac
+    case "$CONFLICTS" in
+        report|server) ;;
+        *) die "$EX_USAGE" "the choices for the lines that both sides changed are report and server, not '$CONFLICTS'" ;;
     esac
 
     pick GH_BATCH_COMMIT "$CFG_commit" false "$OPT_COMMIT"
@@ -524,6 +571,18 @@ check_git() {
     if [ "$major" -gt 2 ] || [ "$minor" -ge 41 ]; then
         FETCH_PORCELAIN=1
     fi
+    # The merges computed without a working tree, which tell beforehand
+    # whether two sets of changes touch the same lines. GH_BATCH_HIDE may
+    # name merge-tree, so that the paths taken without it can be tried.
+    if [ "$major" -gt 2 ] || [ "$minor" -ge 38 ]; then
+        MT_WRITE=1
+    fi
+    if [ "$major" -gt 2 ] || [ "$minor" -ge 40 ]; then
+        MT_BASE=1
+    fi
+    case " ${GH_BATCH_HIDE:-} " in
+        *" merge-tree "*) MT_WRITE=0; MT_BASE=0 ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
@@ -576,6 +635,7 @@ setup_run() {
     trap 'on_signal' INT TERM HUP PIPE
     NOW=$(date +%s)
     RUN_START=$SECONDS
+    RUN_STAMP=$(date '+%Y%m%d-%H%M%S')
     TODAY=$(date '+%Y-%m-%d')
     CLOCK=$(date '+%H:%M')
     if stat -c %Y / >/dev/null 2>&1; then
@@ -651,7 +711,7 @@ take_lock() {
 report_unfinished_updates() {
     # A marker is written before a working tree is moved and removed after:
     # one that remains names a repository whose update was cut short.
-    local marker pid path
+    local marker pid path line notes
     for marker in "$STATE_DIR"/inflight.*; do
         [ -f "$marker" ] || continue
         pid=${marker##*/inflight.}
@@ -659,9 +719,15 @@ report_unfinished_updates() {
         if is_uint "$pid" && kill -0 "$pid" 2>/dev/null; then
             continue
         fi
-        path=$(cat "$marker" 2>/dev/null)
+        path=""; notes=""
+        {
+            IFS= read -r path
+            while IFS= read -r line; do
+                [ -n "$line" ] && notes="$notes; $line"
+            done
+        } < "$marker" 2>/dev/null
         [ -n "$path" ] &&
-            warn "an earlier run was cut short while it updated $(short_path "$path"): look at it with git status"
+            warn "an earlier run was cut short while it updated $(short_path "$path"): look at it with git status$notes"
         rm -f "$marker"
     done
 }
@@ -1010,6 +1076,13 @@ record_move() {
     printf 'J%s%s%s%s%s%s\n' "$US" "$1" "$US" "$2" "$US" "$3"
 }
 
+record_kept() {
+    # record_kept WORDS: what this repository kept aside, for the line
+    # "Kept aside" of the summary.
+    [ -n "$1" ] && printf 'K%s%s\n' "$US" "$(one_line "$1")"
+    return 0
+}
+
 state_label() {
     case "$1" in
         uptodate)     printf 'up to date' ;;
@@ -1025,7 +1098,7 @@ state_label() {
 
 state_class() {
     case "$1" in
-        updated|rebased|merged|reset|pushed|committed|cloned|ok) printf 'good' ;;
+        updated|rebased|merged|reset|pushed|committed|cloned|tidied|ok) printf 'good' ;;
         uptodate|level|clean|present|skipped|nothing|healthy) printf 'dim' ;;
         ahead|behind|pending|stash|localonly|noupstream|detached|planned|active|warning) printf 'info' ;;
         *)                                         printf 'bad' ;;
@@ -1051,6 +1124,7 @@ state_phrase() {
         rebased)      printf '%s rebased' "$n" ;;
         merged)       printf '%s merged' "$n" ;;
         reset)        printf '%s reset' "$n" ;;
+        tidied)       printf '%s tidied' "$n" ;;
         uptodate)     printf '%s up to date' "$n" ;;
         level)        printf '%s level with the server' "$n" ;;
         clean)        printf '%s clean' "$n" ;;
@@ -1077,7 +1151,7 @@ state_phrase() {
     esac
 }
 
-STATE_ORDER="updated rebased merged reset pushed committed planned cloned ok uptodate level clean nothing present pending stash ahead behind localonly noupstream detached skipped healthy warning problem diverged conflict blocked rejected notcommitted failed gone unfinished halfupdated busy unreadable interrupted lost"
+STATE_ORDER="updated rebased merged reset tidied pushed committed planned cloned ok uptodate level clean nothing present pending stash ahead behind localonly noupstream detached skipped healthy warning problem diverged conflict blocked rejected notcommitted failed gone unfinished halfupdated busy unreadable interrupted lost"
 
 tally() {
     local var="N_$1"
@@ -1260,12 +1334,13 @@ read_record() {
     # read_record FILE: the record of one repository into the REC_* variables.
     local kind a b c d
     REC_state=""; REC_attention=0; REC_branch=""; REC_message=""
-    REC_lines=(); REC_moves=()
+    REC_lines=(); REC_moves=(); REC_kept=()
     while IFS=$US read -r kind a b c d; do
         case "$kind" in
             S) REC_state=$a; REC_attention=$b; REC_branch=$c; REC_message=$d ;;
             D) REC_lines+=("$a") ;;
             J) REC_moves+=("$a$US$b$US$c") ;;
+            K) REC_kept+=("$a") ;;
         esac
     done < "$1"
     if [ -z "$REC_state" ]; then
@@ -1313,6 +1388,9 @@ EOF
         ATTENTION=1
         ATTENTION_LIST="$ATTENTION_LIST${ATTENTION_LIST:+, }${NAMES[$idx]} ($(state_label "$REC_state"))"
     fi
+    for move in ${REC_kept[@]+"${REC_kept[@]}"}; do
+        KEPT_LIST="$KEPT_LIST${KEPT_LIST:+, }${NAMES[$idx]} ($move)"
+    done
     if [ "$PORCELAIN" -eq 1 ]; then
         printf '%s\t%s\t%s\t%s\n' "$REC_state" "${REPOS[$idx]}" "$REC_branch" "$REC_message"
         return 0
@@ -1356,6 +1434,11 @@ summary() {
     # them: the header already ends with one.
     [ "$SHOWN" -eq 1 ] && put ""
     put_styled "$head: ${text:-nothing to report}." "$C_BOLD$head$when$C_OFF: ${styled:-nothing to report}."
+    # What was moved aside to let the server's version in: nothing is lost,
+    # and nothing needs to be done, but it is worth knowing.
+    if [ -n "$KEPT_LIST" ]; then
+        put_styled "Kept aside: $KEPT_LIST." "${C_INFO}Kept aside:$C_OFF $KEPT_LIST."
+    fi
     if [ -n "$ATTENTION_LIST" ]; then
         put_styled "Needs you: $ATTENTION_LIST." "$C_BAD$(mark failed) Needs you:$C_OFF $ATTENTION_LIST."
     fi
@@ -1515,7 +1598,7 @@ repo_settings() {
     # the repository from the general one.
     local line scope key val
     R_skip=0; R_pullonly=0; R_sshcmd=""; R_sshvariant=""; R_lowspeed=0; R_gpgsign=0
-    R_commit_eff=""; R_commit_local=""; R_autosetup=0; R_pushdefault=""
+    R_commit_eff=""; R_commit_local=""; R_autosetup=0; R_pushdefault=""; R_icase=0
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         scope=${line%%"$TAB"*}
@@ -1538,9 +1621,10 @@ repo_settings() {
             commit.gpgsign)     if truthy "$val"; then R_gpgsign=1; else R_gpgsign=0; fi ;;
             push.autosetupremote) if truthy "$val"; then R_autosetup=1; else R_autosetup=0; fi ;;
             push.default)       R_pushdefault=$val ;;
+            core.ignorecase)    if truthy "$val"; then R_icase=1; else R_icase=0; fi ;;
         esac
     done <<EOF
-$(g config --show-scope --get-regexp '^(gh-batch\.|core\.sshcommand$|ssh\.variant$|http\.lowspeed|commit\.gpgsign$|push\.autosetupremote$|push\.default$)' 2>/dev/null)
+$(g config --show-scope --get-regexp '^(gh-batch\.|core\.sshcommand$|ssh\.variant$|http\.lowspeed|commit\.gpgsign$|push\.autosetupremote$|push\.default$|core\.ignorecase$)' 2>/dev/null)
 EOF
     return 0
 }
@@ -1604,6 +1688,14 @@ mark_inflight() {
 
 unmark_inflight() {
     [ -n "$STATE_DIR" ] && rm -f "$STATE_DIR/inflight.$$.$IDX"
+    return 0
+}
+
+note_inflight() {
+    # note_inflight TEXT: one more line for the marker of the update in
+    # progress, which a later run prints if this one is cut short.
+    [ -n "$STATE_DIR" ] && [ -f "$STATE_DIR/inflight.$$.$IDX" ] || return 0
+    printf '%s\n' "$(one_line "$1")" >> "$STATE_DIR/inflight.$$.$IDX" 2>/dev/null
     return 0
 }
 
@@ -1750,17 +1842,456 @@ written_back() {
     fi
 }
 
+clear_extras() {
+    # What the steps below add to the report of an update, cleared for each
+    # repository: a clause for the message (U_extra_msg), lines of detail
+    # (U_extra), the words of the line "Kept aside" (U_kept), and their
+    # working state.
+    U_extra_msg=""; U_extra=""; U_kept=""
+    K_dir=""; S_oid=""; S_note=""; B_ref=""; B_why=""; A_why=""; CF_words=""
+    IW_n=0; IW_words=""; KEPT_n=0; KEPT_words=""; SP_n=0; SP_words=""
+    OB_lines=""; OB_moves=""; OB_n=0
+    : > "$W/inway"; : > "$W/aside"; : > "$W/kept"; : > "$W/copied"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# What stands where the server puts a file, and where it is kept
+# ---------------------------------------------------------------------------
+
+untracked_here() {
+    # untracked_here PATH -> 0 when git tracks nothing at PATH, nor below it.
+    # The path is taken literally, and without regard to case on a system
+    # that does not tell the cases apart.
+    local magic="literal"
+    [ "${R_icase:-0}" -eq 1 ] && magic="literal,icase"
+    ! g ls-files --error-unmatch -- ":($magic)$1" >/dev/null 2>&1
+}
+
+files_in_way() {
+    # files_in_way FROM TO: the paths that the commits from FROM to TO add
+    # and that exist here as something git does not track (a file, a link
+    # or a folder at the place of the new file, or a file or a link where a
+    # folder must be made for it). Git would refuse to write over an
+    # untracked file, and some of its commands silently write over an
+    # ignored one. They go to $W/inway, separated by NUL; IW_n counts them
+    # and IW_words names the first five. A link is never followed.
+    local meta path lead rest part seen="$US"
+    : > "$W/inway"; IW_n=0; IW_words=""
+    while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+        case "$meta" in *" 160000 "*) continue ;; esac
+        lead=""; rest=$path
+        while [ -n "$rest" ]; do
+            case "$rest" in
+                */*) part=${rest%%/*}; rest=${rest#*/} ;;
+                *)   part=$rest; rest="" ;;
+            esac
+            lead="${lead:+$lead/}$part"
+            if [ -L "$REPO/$lead" ] || { [ -e "$REPO/$lead" ] && { [ -z "$rest" ] || [ ! -d "$REPO/$lead" ]; }; }; then
+                case "$seen" in
+                    *"$US$lead$US"*) ;;
+                    *)
+                        if untracked_here "$lead"; then
+                            seen="$seen$lead$US"
+                            printf '%s\0' "$lead" >> "$W/inway"
+                            IW_n=$(( IW_n + 1 ))
+                            [ "$IW_n" -le 5 ] && IW_words="$IW_words${IW_words:+, }$lead"
+                        fi
+                        ;;
+                esac
+                break
+            fi
+            [ -d "$REPO/$lead" ] || break
+        done
+    done < <(g diff --raw -z --no-abbrev --no-renames --no-color --no-ext-diff --diff-filter=A "$1" "$2" 2>/dev/null)
+    [ "$IW_n" -gt 5 ] && IW_words="$IW_words and $(( IW_n - 5 )) more"
+    return 0
+}
+
+kept_folder() {
+    # The folder of this run that receives what is kept aside: inside the
+    # git folder of the repository, where nothing is ever committed, and
+    # created once per repository and run. Sets K_dir; returns 1, with
+    # A_why, when it cannot be made.
+    local gitdir base n=1
+    [ -n "$K_dir" ] && [ -d "$K_dir" ] && return 0
+    gitdir=$(g rev-parse --absolute-git-dir 2>/dev/null)
+    if [ -z "$gitdir" ] || [ ! -d "$gitdir" ]; then
+        A_why="the git folder of the repository could not be found"
+        return 1
+    fi
+    base="$gitdir/gh-batch/kept"
+    if ! mkdir -p "$base" 2>/dev/null; then
+        A_why="the folder $(short_path "$base") could not be made"
+        return 1
+    fi
+    K_dir="$base/$RUN_STAMP"
+    while ! mkdir "$K_dir" 2>/dev/null; do
+        n=$(( n + 1 ))
+        if [ "$n" -gt 9 ]; then
+            K_dir=""
+            A_why="no folder could be made in $(short_path "$base")"
+            return 1
+        fi
+        K_dir="$base/$RUN_STAMP-$n"
+    done
+    note_inflight "what it set aside is in $(short_path "$K_dir")"
+    return 0
+}
+
+kept_label() {
+    # How a report names the kept folder: from the top of the repository
+    # when it lies inside, else from the home folder.
+    case "$K_dir" in
+        "$REPO"/*) printf '%s' "${K_dir#"$REPO"/}" ;;
+        *)         short_path "$K_dir" ;;
+    esac
+}
+
+prune_kept() {
+    # The empty folders of the kept folder go, and the kept folder itself
+    # when nothing is left in it.
+    local kept
+    [ -n "$K_dir" ] && [ -d "$K_dir" ] || return 0
+    find "$K_dir" -depth -type d -empty -exec rmdir {} \; 2>/dev/null
+    if [ ! -d "$K_dir" ]; then
+        kept=${K_dir%/*}
+        rmdir "$kept" "${kept%/*}" 2>/dev/null
+        K_dir=""
+    fi
+    return 0
+}
+
+same_entry() {
+    # same_entry A B -> 0 when A and B are two links to the same place, or
+    # two regular files with the same bytes.
+    if [ -L "$1" ] || [ -L "$2" ]; then
+        [ -L "$1" ] && [ -L "$2" ] && [ "$(readlink "$1")" = "$(readlink "$2")" ]
+        return
+    fi
+    [ -f "$1" ] && [ -f "$2" ] && cmp -s -- "$1" "$2"
+}
+
+set_aside() {
+    # Every path of $W/inway is moved, by a rename, into the kept folder;
+    # $W/aside lists the paths moved. Returns 1, with A_why, when one cannot
+    # be moved, after the others went back.
+    local path dest
+    : > "$W/aside"
+    [ "$IW_n" -gt 0 ] || return 0
+    kept_folder || return 1
+    while IFS= read -r -d '' path; do
+        dest="$K_dir/$path"
+        case "$path" in
+            */*) mkdir -p "$K_dir/${path%/*}" 2>/dev/null ;;
+        esac
+        if [ -e "$dest" ] || [ -L "$dest" ] || ! mv -- "$REPO/$path" "$dest" 2>/dev/null; then
+            A_why="$path could not be moved aside"
+            put_back
+            return 1
+        fi
+        printf '%s\0' "$path" >> "$W/aside"
+    done < "$W/inway"
+    return 0
+}
+
+put_back() {
+    # Every path of $W/aside goes back to its place when the place is free;
+    # $W/aside keeps those that could not.
+    local path
+    if [ -s "$W/aside" ]; then
+        : > "$W/aside.left"
+        while IFS= read -r -d '' path; do
+            if [ ! -e "$REPO/$path" ] && [ ! -L "$REPO/$path" ]; then
+                case "$path" in
+                    */*) mkdir -p "$REPO/${path%/*}" 2>/dev/null ;;
+                esac
+                mv -- "$K_dir/$path" "$REPO/$path" 2>/dev/null && continue
+            fi
+            printf '%s\0' "$path" >> "$W/aside.left"
+        done < "$W/aside"
+        mv -f "$W/aside.left" "$W/aside"
+    fi
+    prune_kept
+    return 0
+}
+
+settle_aside() {
+    # After an update that went through: a path whose place stayed free goes
+    # back there; a copy identical to what git wrote is removed; the others
+    # stay kept, listed in $W/kept, counted in KEPT_n, named in KEPT_words.
+    local path
+    KEPT_n=0; KEPT_words=""
+    : > "$W/kept"
+    if [ -s "$W/aside" ]; then
+        while IFS= read -r -d '' path; do
+            if [ ! -e "$REPO/$path" ] && [ ! -L "$REPO/$path" ]; then
+                case "$path" in
+                    */*) mkdir -p "$REPO/${path%/*}" 2>/dev/null ;;
+                esac
+                mv -- "$K_dir/$path" "$REPO/$path" 2>/dev/null && continue
+            elif same_entry "$K_dir/$path" "$REPO/$path"; then
+                rm -f -- "$K_dir/$path" 2>/dev/null && continue
+            fi
+            printf '%s\0' "$path" >> "$W/kept"
+            KEPT_n=$(( KEPT_n + 1 ))
+            [ "$KEPT_n" -le 5 ] && KEPT_words="$KEPT_words${KEPT_words:+, }$path"
+        done < "$W/aside"
+        : > "$W/aside"
+    fi
+    [ "$KEPT_n" -gt 5 ] && KEPT_words="$KEPT_words and $(( KEPT_n - 5 )) more"
+    prune_kept
+    return 0
+}
+
+kept_report() {
+    # The clause and the lines of detail for the files that made way for
+    # those of the server and stay kept.
+    local label path n=0 lines=""
+    [ "$KEPT_n" -gt 0 ] || return 0
+    label=$(kept_label)
+    if [ "$KEPT_n" -eq 1 ]; then
+        U_extra_msg="$U_extra_msg; $KEPT_words, which git did not track here, made way for the version of the server: this machine's copy is kept in $label"
+        U_kept="$U_kept${U_kept:+, }$KEPT_words"
+    else
+        U_extra_msg="$U_extra_msg; $KEPT_n files that git did not track here made way for those of the server ($KEPT_words): this machine's copies are kept in $label"
+        U_kept="$U_kept${U_kept:+, }$KEPT_n files"
+    fi
+    while IFS= read -r -d '' path; do
+        { [ -f "$K_dir/$path" ] && [ ! -L "$K_dir/$path" ]; } || continue
+        n=$(( n + 1 ))
+        [ "$n" -le 3 ] || break
+        lines="$lines${lines:+$NL}to compare: git -C $(shell_path "$REPO") diff --no-index -- $(shell_word "$label/$path") $(shell_word "$path")"
+    done < "$W/kept"
+    lines="$lines${lines:+$NL}to take $( [ "$KEPT_n" -eq 1 ] && printf 'it' || printf 'them' ) back: cp -Rp $(shell_path "$K_dir")/. $(shell_path "$REPO")"
+    U_extra="$U_extra${U_extra:+$NL}$lines"
+    return 0
+}
+
+refused_words() {
+    # What git named when it refused to overwrite, sorted into the changes
+    # of tracked files and the files it does not track: "your uncommitted
+    # changes in a, b" or "x, which git does not track here".
+    local list mine="" theirs="" line
+    list=$(refused_files)
+    [ -n "$list" ] || return 0
+    while IFS= read -r line; do
+        case "$line" in
+            "$TAB"*)
+                line=${line#"$TAB"}
+                if untracked_here "$line"; then
+                    theirs="$theirs${theirs:+, }$line"
+                else
+                    mine="$mine${mine:+, }$line"
+                fi
+                ;;
+        esac
+    done < "$ERR"
+    if [ -n "$mine" ] && [ -n "$theirs" ]; then
+        printf 'your uncommitted changes in %s, and %s, which git does not track here' "$mine" "$theirs"
+    elif [ -n "$mine" ]; then
+        printf 'your uncommitted changes in %s' "$mine"
+    elif [ -n "$theirs" ]; then
+        printf '%s, which git does not track here' "$theirs"
+    else
+        printf '%s' "$list"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Uncommitted changes carried over an update in a stash of the tool's own
+# ---------------------------------------------------------------------------
+
+carry_ok() {
+    # 0 when the uncommitted changes to tracked files can travel in a stash:
+    # git can tell beforehand whether they still apply (2.40 or newer), and
+    # none of them is of a kind that a stash refuses or loses (a submodule,
+    # a file added with --intent-to-add, a file that git stopped tracking
+    # while it stays on the disk).
+    local record path
+    [ "$MT_BASE" -eq 1 ] || return 1
+    while IFS= read -r -d '' record; do
+        case "$record" in
+            "1 "??" S"*|"2 "??" S"*) return 1 ;;
+            "1 .A "*) return 1 ;;
+            "1 D"?" "*)
+                path=${record#* * * * * * * * }
+                if [ -e "$REPO/$path" ] || [ -L "$REPO/$path" ]; then
+                    return 1
+                fi
+                ;;
+        esac
+    done < <(g status --porcelain=v2 -z --untracked-files=no --no-renames 2>/dev/null)
+    return 0
+}
+
+stash_fits() {
+    # stash_fits STASH COMMIT -> 0 when the changes kept in STASH apply on
+    # top of COMMIT without touching the lines that COMMIT changed. Else
+    # CF_words names the files where they clash.
+    local rc name n=0 first=1
+    CF_words=""
+    g merge-tree --write-tree --name-only --no-messages -z --merge-base="$1^1" "$2" "$1" > "$W/fits" 2>/dev/null
+    rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    while IFS= read -r -d '' name; do
+        if [ "$first" -eq 1 ]; then
+            first=0
+            continue
+        fi
+        [ -n "$name" ] || continue
+        n=$(( n + 1 ))
+        [ "$n" -le 3 ] && CF_words="$CF_words${CF_words:+, }$name"
+    done < "$W/fits"
+    [ "$n" -gt 3 ] && CF_words="$CF_words and $(( n - 3 )) more"
+    [ -n "$CF_words" ] || CF_words="the files they change"
+    return 1
+}
+
+stash_away() {
+    # stash_away WHAT: the uncommitted changes to tracked files go into a
+    # stash of the tool's own, named after the run, so that WHAT finds a
+    # clean working tree; untracked files stay where they are. Sets S_oid;
+    # returns 1 when that could not be done.
+    local prev now
+    S_oid=""
+    prev=$(g rev-parse -q --verify refs/stash 2>/dev/null)
+    run_local stash "${GIT[@]}" -c gc.auto=0 -c maintenance.auto=false \
+        stash push --quiet --message "gh-batch $RUN_STAMP: uncommitted changes of $R_branch, before the $1"
+    now=$(g rev-parse -q --verify refs/stash 2>/dev/null)
+    if [ -z "$now" ] || [ "$now" = "$prev" ]; then
+        return 1
+    fi
+    S_oid=$now
+    if [ "$(g rev-parse -q --verify "$S_oid^1" 2>/dev/null)" != "$U_head" ] ||
+        [ -n "$(g status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+        stash_back
+        S_oid=""
+        return 1
+    fi
+    note_inflight "uncommitted changes of $R_branch wait in its stash: git -C $(shell_path "$REPO") stash list"
+    return 0
+}
+
+stash_gone() {
+    # 0 when the tool's own stash has left the top of the list, applied.
+    [ "$(g rev-parse -q --verify refs/stash 2>/dev/null)" != "$S_oid" ] || return 1
+    S_oid=""
+    return 0
+}
+
+stash_back() {
+    # Put the tool's own stash back into the working tree. Returns 0 when
+    # it was applied and is gone (S_note says when the staging could not
+    # follow), 1 when it stays and nothing changed, 2 when it stays and a
+    # part of it is in the working tree. Only that stash is ever applied,
+    # and only while it is on top of the list.
+    S_note=""
+    [ -n "$S_oid" ] || return 0
+    [ "$(g rev-parse -q --verify refs/stash 2>/dev/null)" = "$S_oid" ] || return 1
+    run_local pop "${GIT[@]}" stash pop --quiet --index
+    stash_gone && return 0
+    if [ -z "$(conflict_files)" ] && [ -z "$(g status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+        # The staging needs the exact lines around each change, which the
+        # new commits may have moved: the changes go back unstaged.
+        run_local pop "${GIT[@]}" -c stash.index=false stash pop --quiet
+        if stash_gone; then
+            S_note="no longer staged"
+            return 0
+        fi
+    fi
+    if [ -n "$(conflict_files)" ]; then
+        run_local undo "${GIT[@]}" reset --quiet --merge
+    fi
+    [ -z "$(g status --porcelain --untracked-files=no 2>/dev/null)" ] && return 1
+    return 2
+}
+
+common_files() {
+    # common_files A1 B1 A2 B2 -> the files changed both from A1 to B1 and
+    # from A2 to B2, the first three named.
+    local name list="" n=0 other
+    other="$US$(g diff --name-only --no-renames "$3" "$4" 2>/dev/null | tr '\n' "$US")"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        case "$other" in
+            *"$US$name$US"*)
+                n=$(( n + 1 ))
+                [ "$n" -le 3 ] && list="$list${list:+, }$name"
+                ;;
+        esac
+    done <<EOF
+$(g diff --name-only --no-renames "$1" "$2" 2>/dev/null)
+EOF
+    [ "$n" -gt 3 ] && list="$list and $(( n - 3 )) more"
+    printf '%s' "$list"
+}
+
+stash_report() {
+    # stash_report RESULT [FILES]: the words for uncommitted changes that
+    # travelled in the stash (RESULT 0) or that wait there (1 or 2).
+    case "$1" in
+        0)
+            if [ -n "${2:-}" ]; then
+                U_carry="your uncommitted changes were kept, merged with the new version of $2"
+            else
+                U_carry="your uncommitted changes were kept"
+            fi
+            [ -n "$S_note" ] && U_carry="$U_carry, $S_note"
+            ;;
+        *)
+            U_attn=1
+            if [ -n "$CF_words" ]; then
+                U_extra_msg="$U_extra_msg; your uncommitted changes touch the same lines as the new commits, in $CF_words: the server's version is in place, and they wait in the stash"
+            else
+                U_extra_msg="$U_extra_msg; your uncommitted changes could not be put back: they wait in the stash"
+            fi
+            [ "$1" = 2 ] && U_extra_msg="$U_extra_msg, a part of them back in the files"
+            U_extra="$U_extra${U_extra:+$NL}to bring them back: git -C $(shell_path "$REPO") stash pop"
+            U_kept="$U_kept${U_kept:+, }uncommitted changes, in the stash"
+            ;;
+    esac
+    return 0
+}
+
+undo_move() {
+    # The branch and its files go back to the commit of before, after an
+    # update that went through but must not stay.
+    run_local back "${GIT[@]}" -c gc.auto=0 -c maintenance.auto=false \
+        checkout --quiet --no-track --no-overwrite-ignore -B "$R_branch" "$U_head"
+    [ "$(g rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" = "$U_head" ]
+}
+
+# ---------------------------------------------------------------------------
+# The update itself
+# ---------------------------------------------------------------------------
+
+ff_once() {
+    run_local ff "${GIT[@]}" -c gc.auto=0 -c maintenance.auto=false -c merge.autoStash=false \
+        merge --ff-only --no-squash --no-overwrite-ignore --no-stat --quiet "$U_up"
+}
+
 fast_forward() {
     # The branch is strictly behind: move it forward. Pending changes that
-    # the new commits do not touch stay; otherwise git refuses and nothing
-    # changes. A file deleted here without a commit is the exception: git
-    # does not count a missing file as a change it would overwrite, and
-    # writes the new version of a file that the new commits change. The
-    # report names such files.
-    local before after now rc files pending back
+    # the new commits do not touch stay. What git does not track and stands
+    # where the server puts a file makes way for it, kept in the git folder
+    # of the repository. Uncommitted changes that the new commits touch
+    # travel in a stash of the tool's own when they still apply on top of
+    # them; when they clash the repository is blocked, or, with
+    # gh-batch.conflicts server, the server's version is taken and the
+    # changes wait in the stash. A file deleted here without a commit is the
+    # exception git makes: it does not count a missing file as a change it
+    # would overwrite, and writes the new version of a file that the new
+    # commits change. The report names such files.
+    local before after now rc files pending back mid s0 carry=0 left="" both=""
+    U_carry=""
     if ! lfs_prefetch; then
         U_state="failed"; U_attn=1
         U_msg="the large files of the new commits could not be downloaded: $(net_failure "$?")"
+        return 0
+    fi
+    if stopped; then
+        U_state="interrupted"; U_attn=1; U_msg="stopped before the update: nothing was changed"
         return 0
     fi
     pending=$(( R_tracked + R_untracked ))
@@ -1768,18 +2299,74 @@ fast_forward() {
     if [ "$R_tracked" -gt 0 ]; then
         g diff --no-color --name-only --diff-filter=D -z > "$W/deleted" 2>/dev/null
     fi
+    files_in_way "$U_head" "$U_up"
     before=$(snapshot)
     mark_inflight
-    run_local ff "${GIT[@]}" -c gc.auto=0 -c maintenance.auto=false -c merge.autoStash=false \
-        merge --ff-only --no-squash --no-overwrite-ignore --no-stat --quiet "$U_up"
+    if ! set_aside; then
+        unmark_inflight
+        U_state="blocked"; U_attn=1
+        U_msg="$(plural "$U_behind" "new commit") on the server would write over what git does not track here, and $A_why: nothing was changed"
+        return 0
+    fi
+    mid=$(snapshot)
+    ff_once
     rc=$?
-    unmark_inflight
     now=$(g rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)
+    # Uncommitted changes in the way: they travel in a stash when git tells
+    # beforehand that they apply on top of the new commits.
+    if [ "$rc" -ne 0 ] && [ "$now" = "$U_head" ] && [ "$R_tracked" -gt 0 ] &&
+        [ "$(snapshot)" = "$mid" ] && carry_ok; then
+        s0=$(g stash create 2>/dev/null)
+        if [ -n "$s0" ]; then
+            if stash_fits "$s0" "$U_up"; then
+                carry=1
+            elif [ "$CONFLICTS" = "server" ]; then
+                carry=2
+            else
+                put_back
+                unmark_inflight
+                U_state="blocked"; U_attn=1
+                U_msg="$(plural "$U_behind" "new commit") on the server and your uncommitted changes touch the same lines, in $CF_words: nothing was changed"
+                return 0
+            fi
+            if stash_away "fast-forward"; then
+                both=$(common_files "$S_oid^1" "$S_oid" "$U_head" "$U_up")
+                if [ "$carry" -eq 1 ] && ! stash_fits "$S_oid" "$U_up"; then
+                    if [ "$CONFLICTS" = "server" ]; then
+                        carry=2
+                    else
+                        stash_back
+                        carry=0
+                    fi
+                fi
+                if [ "$carry" -gt 0 ]; then
+                    ff_once
+                    rc=$?
+                    now=$(g rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)
+                fi
+            else
+                carry=0
+            fi
+        fi
+    fi
     if [ "$rc" -eq 0 ] && [ "$now" = "$U_up" ]; then
+        if [ "$carry" -eq 1 ]; then
+            stash_back
+            left=$?
+            [ "$left" -eq 0 ] && left=""
+            [ -n "$left" ] && CF_words=""
+        elif [ "$carry" -eq 2 ]; then
+            left=1
+        fi
+        settle_aside
+        unmark_inflight
         U_state="updated"
         U_msg="$(plural "$U_behind" "new commit")"
         back=$(written_back "$W/deleted")
-        if [ "$pending" -gt 0 ]; then
+        if [ "$carry" -eq 1 ] && [ -z "$left" ]; then
+            stash_report 0 "$both"
+            U_msg="$U_msg ($U_carry)"
+        elif [ -z "$left" ] && [ "$pending" -gt 0 ]; then
             inspect
             if [ $(( R_tracked + R_untracked )) -gt 0 ] && [ -n "$back" ]; then
                 U_msg="$U_msg (your other pending changes were kept)"
@@ -1788,47 +2375,309 @@ fast_forward() {
             fi
         fi
         [ -n "$back" ] && U_msg="$U_msg; $back"
+        kept_report
+        [ -n "$left" ] && stash_report "$left"
+        U_msg="$U_msg$U_extra_msg"
         U_details=$(incoming "$U_head" "$U_up" "$U_behind")
         U_move="fast-forward$US$U_head$US$U_up"
         return 0
     fi
+    # The update did not go through: everything goes back, then the
+    # repository is compared with what it was.
+    [ -n "$S_oid" ] && stash_back
+    put_back
+    unmark_inflight
     after=$(snapshot)
-    if [ "$after" = "$before" ]; then
+    if [ "$after" = "$before" ] && [ ! -s "$W/aside" ]; then
         U_state="blocked"; U_attn=1
-        files=$(refused_files)
+        ERR="$W/ff.err"
+        files=$(refused_words)
         if [ -n "$files" ]; then
-            U_msg="$(plural "$U_behind" "new commit") on the server would overwrite your changes in $files: nothing was changed"
+            U_msg="$(plural "$U_behind" "new commit") on the server would write over $files: nothing was changed"
         else
-            U_msg="$(plural "$U_behind" "new commit") on the server could not be taken, git refused the update ($(last_line "$ERR")): nothing was changed"
+            U_msg="$(plural "$U_behind" "new commit") on the server could not be taken, git refused the update ($(last_line "$W/ff.err")): nothing was changed"
         fi
     else
         U_state="halfupdated"; U_attn=1
         U_msg="the update stopped half-way from ${U_head:0:9} to ${U_up:0:9}: look at it with git status"
+        [ -s "$W/aside" ] && U_msg="$U_msg; what was set aside is in $(short_path "$K_dir")"
     fi
     return 0
 }
 
-in_the_way() {
-    # in_the_way BASE -> the first file added on the server that exists here
-    # without being tracked. A replay would stop on an untracked file and
-    # silently replace an ignored one.
-    local path
-    while IFS= read -r -d '' path; do
-        if [ -e "$REPO/$path" ] || [ -L "$REPO/$path" ]; then
-            if ! g ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
-                printf '%s' "$path"
+attempt() {
+    # attempt KIND [server]: the rebase or the merge of the commits of the
+    # server; with "server", the version of the server is taken in the
+    # lines that both sides changed (in a rebase "ours" is the side of the
+    # server, in a merge "theirs"). Sets AT_ok to 1 when it went through.
+    local x=()
+    if [ -n "${2:-}" ]; then
+        if [ "$1" = "rebase" ]; then x=(-X ours); else x=(-X theirs); fi
+    fi
+    if [ "$1" = "rebase" ]; then
+        run_local rebase "${GIT[@]}" -c gc.auto=0 -c maintenance.auto=false \
+            -c rebase.autoStash=false -c rebase.updateRefs=false -c rebase.rebaseMerges=false \
+            -c rebase.autoSquash=false -c rebase.backend=merge -c merge.directoryRenames=conflict \
+            rebase --no-fork-point --quiet ${x[@]+"${x[@]}"} "$U_up"
+    else
+        run_local merge "${GIT[@]}" -c gc.auto=0 -c maintenance.auto=false -c merge.autoStash=false \
+            merge --no-edit --no-squash --no-ff --no-overwrite-ignore --no-stat --quiet ${x[@]+"${x[@]}"} "$U_up"
+    fi
+    AT_rc=$?
+    AT_now=$(g rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)
+    inspect
+    AT_ok=0
+    if [ "$AT_rc" -eq 0 ] && [ -z "$R_operation" ] && [ "$R_unmerged" -eq 0 ] && [ "$R_detached" -eq 0 ] &&
+        g merge-base --is-ancestor "$U_up" "$AT_now" 2>/dev/null; then
+        AT_ok=1
+    fi
+    return 0
+}
+
+abort_attempt() {
+    # abort_attempt KIND: the rebase or the merge that stopped is undone.
+    if [ -n "$R_operation" ]; then
+        run_local abort "${GIT[@]}" "$1" --abort
+    fi
+    inspect
+    return 0
+}
+
+clash_files() {
+    # clash_files BASE: the files where both sides changed the same lines,
+    # as a merge of the two ends sees them (git 2.38 or newer), to $W/clash,
+    # and the files that both sides changed since BASE, to $W/both, each
+    # separated by NUL. SP_words names the first ones of the first list, or
+    # of the second when git cannot tell the first.
+    local name n=0 first=1 theirs rc
+    : > "$W/clash"; : > "$W/both"
+    SP_n=0; SP_words=""
+    if [ "$MT_WRITE" -eq 1 ]; then
+        g merge-tree --write-tree --name-only --no-messages -z "$U_up" "$U_head" > "$W/mt" 2>/dev/null
+        rc=$?
+        if [ "$rc" -eq 1 ]; then
+            while IFS= read -r -d '' name; do
+                if [ "$first" -eq 1 ]; then
+                    first=0
+                    continue
+                fi
+                [ -n "$name" ] && printf '%s\0' "$name" >> "$W/clash"
+            done < "$W/mt"
+        fi
+    fi
+    theirs="$US$(g diff --name-only --no-renames "$1" "$U_up" 2>/dev/null | tr '\n' "$US")"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        case "$theirs" in
+            *"$US$name$US"*) printf '%s\0' "$name" >> "$W/both" ;;
+        esac
+    done <<EOF
+$(g diff --name-only --no-renames "$1" "$U_head" 2>/dev/null)
+EOF
+    while IFS= read -r -d '' name; do
+        n=$(( n + 1 ))
+        [ "$n" -le 5 ] && SP_words="$SP_words${SP_words:+, }$name"
+    done < <(if [ -s "$W/clash" ]; then cat "$W/clash"; else cat "$W/both"; fi)
+    [ "$n" -gt 5 ] && SP_words="$SP_words and $(( n - 5 )) more"
+    SP_n=$n
+    return 0
+}
+
+server_first() {
+    # server_first BASE: before the replay is made again with the version
+    # of the server first, the commit of the branch is kept under
+    # refs/gh-batch/before-pull, and this machine's version of each file
+    # that both sides changed is copied into the kept folder (the working
+    # tree is then the one of the commit). Returns 1 when either cannot be
+    # done, with nothing left behind.
+    local name
+    keep_backup before-pull || return 1
+    clash_files "$1"
+    if ! kept_folder; then
+        drop_backup
+        return 1
+    fi
+    : > "$W/copied"
+    while IFS= read -r -d '' name; do
+        [ -e "$REPO/$name" ] || [ -L "$REPO/$name" ] || continue
+        [ -e "$K_dir/$name" ] || [ -L "$K_dir/$name" ] && continue
+        case "$name" in
+            */*) mkdir -p "$K_dir/${name%/*}" 2>/dev/null ;;
+        esac
+        if ! cp -Rp -- "$REPO/$name" "$K_dir/$name" 2>/dev/null; then
+            remove_copies
+            drop_backup
+            return 1
+        fi
+        printf '%s\0' "$name" >> "$W/copied"
+    done < <(cat "$W/clash" "$W/both")
+    return 0
+}
+
+remove_copies() {
+    # The copies made by server_first go, when the replay did not stay.
+    local name
+    if [ -s "$W/copied" ]; then
+        while IFS= read -r -d '' name; do
+            rm -rf -- "${K_dir:?}/$name" 2>/dev/null
+        done < "$W/copied"
+        : > "$W/copied"
+    fi
+    prune_kept
+    return 0
+}
+
+only_old_commits() {
+    # 0 when every commit of the branch that the server lacks was once on
+    # the server, as the positions of the remote branch recorded here (its
+    # reflog) show: nothing of this machine is then at stake.
+    local olds=() line n
+    while IFS= read -r line; do
+        [ -n "$line" ] && olds+=("$line")
+    done <<EOF
+$(g reflog show --format=%H "$R_up_ref" -- 2>/dev/null)
+EOF
+    [ "${#olds[@]}" -gt 0 ] || return 1
+    n=$(g rev-list --count "$U_head" --not "$U_up" "${olds[@]}" 2>/dev/null)
+    [ "$n" = "0" ]
+}
+
+move_to_server() {
+    # The branch and its files are set to the commit of the server, as a
+    # checkout sets them. What git does not track and stands in the way is
+    # set aside first; uncommitted changes travel in a stash. A file that
+    # only the commits left behind held leaves the working tree; the backup
+    # reference keeps it. Sets U_state to "reset" when it went through.
+    local before after now rc files carry=0 left=""
+    U_carry=""
+    if ! lfs_prefetch; then
+        U_state="failed"; U_attn=1
+        U_msg="the large files of the server could not be downloaded: $(net_failure "$?")"
+        return 0
+    fi
+    if stopped; then
+        U_state="interrupted"; U_attn=1; U_msg="stopped before the move: nothing was changed"
+        return 0
+    fi
+    files_in_way "$U_head" "$U_up"
+    before=$(snapshot)
+    mark_inflight
+    if ! set_aside; then
+        unmark_inflight
+        U_state="blocked"; U_attn=1
+        U_msg="the move would write over what git does not track here, and $A_why: nothing was changed"
+        return 0
+    fi
+    if [ "$R_tracked" -gt 0 ]; then
+        if ! stash_away "move"; then
+            put_back
+            unmark_inflight
+            U_state="blocked"; U_attn=1
+            U_msg="your uncommitted changes could not be set aside in a stash: nothing was changed"
+            return 0
+        fi
+        carry=1
+    fi
+    run_local reset "${GIT[@]}" -c gc.auto=0 -c maintenance.auto=false \
+        checkout --quiet --no-track --no-overwrite-ignore -B "$R_branch" "$U_up"
+    rc=$?
+    now=$(g rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)
+    if [ "$rc" -eq 0 ] && [ "$now" = "$U_up" ] &&
+        [ "$(g symbolic-ref -q HEAD 2>/dev/null)" = "refs/heads/$R_branch" ]; then
+        if [ "$carry" -eq 1 ]; then
+            if stash_fits "$S_oid" "$U_up"; then
+                stash_back
+                left=$?
+                [ "$left" -eq 0 ] && left=""
+            elif [ "$CONFLICTS" = "server" ]; then
+                left=1
+            else
+                undo_move
+                stash_back
+                put_back
+                unmark_inflight
+                U_state="blocked"; U_attn=1
+                U_msg="your uncommitted changes touch the same lines as the commits of the server, in $CF_words: nothing was changed"
                 return 0
             fi
         fi
-    done < <(g diff --name-only --no-renames --diff-filter=A -z "$1" "$U_up" 2>/dev/null)
+        settle_aside
+        unmark_inflight
+        U_state="reset"
+        U_msg="dropped $(plural "$U_ahead" commit) that the server lacks"
+        [ "$U_behind" -gt 0 ] && U_msg="$U_msg, took $(plural "$U_behind" "new one")"
+        if [ "$carry" -eq 1 ] && [ -z "$left" ]; then
+            stash_report 0
+            U_msg="$U_msg ($U_carry)"
+        fi
+        kept_report
+        [ -n "$left" ] && stash_report "$left"
+        U_msg="$U_msg$U_extra_msg"
+        U_move="reset$US$U_head$US$U_up"
+        return 0
+    fi
+    [ -n "$S_oid" ] && stash_back
+    put_back
+    unmark_inflight
+    after=$(snapshot)
+    if [ "$after" = "$before" ] && [ ! -s "$W/aside" ]; then
+        U_state="blocked"; U_attn=1
+        ERR="$W/reset.err"
+        files=$(refused_words)
+        if [ -n "$files" ]; then
+            U_msg="the move would write over $files: nothing was changed"
+        else
+            U_msg="git refused the move ($(last_line "$W/reset.err")): nothing was changed"
+        fi
+    else
+        U_state="halfupdated"; U_attn=1
+        U_msg="the move stopped half-way from ${U_head:0:9} to ${U_up:0:9}: look at it with git status"
+        [ -s "$W/aside" ] && U_msg="$U_msg; what was set aside is in $(short_path "$K_dir")"
+    fi
+    return 0
+}
+
+follow_rewrite() {
+    # The server rewrote its history, and every commit here that it lacks
+    # was once on it: nothing of this machine is at stake, and the branch
+    # takes the new history, its commit kept first under refs/gh-batch.
+    local old
+    if ! keep_backup before-pull; then
+        U_state="diverged"; U_attn=1
+        U_msg="the history of the server was rewritten, and the commit could not be kept under refs/gh-batch ($B_why): nothing was changed"
+        return 0
+    fi
+    old=$(incoming "$U_up" "$U_head" "$U_ahead")
+    move_to_server
+    case "$U_state" in
+        reset)
+            U_msg="the history of the server was rewritten; this clone held only its old commits ($U_ahead), replaced by $(plural "$U_behind" "new one"); the commit before is kept as $B_ref${U_carry:+ ($U_carry)}$U_extra_msg"
+            U_details=$old
+            U_extra="$U_extra${U_extra:+$NL}$(restore_line)"
+            U_kept="$U_kept${U_kept:+, }the $(plural "$U_ahead" "old commit") of the server, under refs/gh-batch"
+            ;;
+        halfupdated)
+            U_msg="$U_msg; the commit before is kept as $B_ref"
+            U_extra="$U_extra${U_extra:+$NL}$(restore_line)"
+            ;;
+        *)
+            drop_backup
+            ;;
+    esac
     return 0
 }
 
 reconcile() {
     # Both sides have new commits. Following the setting, report, or replay
-    # the local commits on top (rebase), or join the histories (merge); a
-    # conflict is undone and reported.
-    local reason="" count base fork blocker before after now rc files kind both
+    # the local commits on top (rebase), or join the histories (merge). A
+    # conflict is undone; with gh-batch.conflicts server the attempt is then
+    # made again with the version of the server in the lines that both
+    # sides changed, after the branch and this machine's version of those
+    # files are kept. What git does not track and stands in the way is set
+    # aside, and uncommitted changes travel in a stash.
+    local reason="" count base fork before after now files kind both why="" sp=0 carry=0 left="" replayed text
+    local name shown
+    U_carry=""
     both="$(plural "$U_ahead" commit) here and $U_behind on the server"
     if [ "$DIVERGED" = "report" ]; then
         U_state="diverged"; U_attn=1
@@ -1836,10 +2685,13 @@ reconcile() {
         return 0
     fi
     base=$(g merge-base "$U_head" "$U_up" 2>/dev/null)
-    if [ "$R_tracked" -gt 0 ]; then
+    if [ "$R_tracked" -gt 0 ] && ! carry_ok; then
         reason="files with uncommitted changes are in the working tree"
     elif [ -z "$base" ]; then
         reason="the two histories have no common commit"
+    elif server_rewrote && only_old_commits; then
+        follow_rewrite
+        return 0
     elif [ "$DIVERGED" = "rebase" ]; then
         count=$(g rev-list --merges --count "$U_up..$U_head" 2>/dev/null)
         fork=$(g merge-base --fork-point "$R_up_ref" "$U_head" 2>/dev/null)
@@ -1855,10 +2707,6 @@ reconcile() {
             reason="the history on the server was rewritten"
         fi
     fi
-    if [ -z "$reason" ] && [ "$DIVERGED" = "rebase" ]; then
-        blocker=$(in_the_way "$base")
-        [ -n "$blocker" ] && reason="the file $blocker, untracked here, was added on the server"
-    fi
     if [ -n "$reason" ]; then
         U_state="diverged"; U_attn=1
         U_msg="$both: not reconciled automatically, because $reason"
@@ -1869,58 +2717,166 @@ reconcile() {
         U_msg="the large files of the new commits could not be downloaded: $(net_failure "$?")"
         return 0
     fi
+    if stopped; then
+        U_state="interrupted"; U_attn=1; U_msg="stopped before the update: nothing was changed"
+        return 0
+    fi
 
+    kind=$DIVERGED
+    files_in_way "$U_head" "$U_up"
     before=$(snapshot)
     mark_inflight
-    if [ "$DIVERGED" = "rebase" ]; then
-        kind="rebase"
-        run_local rebase "${GIT[@]}" -c gc.auto=0 -c maintenance.auto=false \
-            -c rebase.autoStash=false -c rebase.updateRefs=false -c rebase.rebaseMerges=false \
-            -c rebase.autoSquash=false -c rebase.backend=merge -c merge.directoryRenames=conflict \
-            rebase --no-fork-point --quiet "$U_up"
-        rc=$?
-    else
-        kind="merge"
-        run_local merge "${GIT[@]}" -c gc.auto=0 -c maintenance.auto=false -c merge.autoStash=false \
-            merge --no-edit --no-squash --no-ff --no-overwrite-ignore --no-stat --quiet "$U_up"
-        rc=$?
-    fi
-    now=$(g rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)
-    inspect
-    if [ "$rc" -eq 0 ] && [ -z "$R_operation" ] && [ "$R_unmerged" -eq 0 ] && [ "$R_detached" -eq 0 ] &&
-        g merge-base --is-ancestor "$U_up" "$now" 2>/dev/null; then
+    if ! set_aside; then
         unmark_inflight
+        U_state="blocked"; U_attn=1
+        U_msg="$both: the $kind would write over what git does not track here, and $A_why: nothing was changed"
+        return 0
+    fi
+    if [ "$R_tracked" -gt 0 ]; then
+        if ! stash_away "$kind"; then
+            put_back
+            unmark_inflight
+            U_state="diverged"; U_attn=1
+            U_msg="$both: not reconciled automatically, because your uncommitted changes could not be set aside in a stash"
+            return 0
+        fi
+        carry=1
+    fi
+    attempt "$kind"
+    if [ "$AT_ok" -eq 0 ]; then
+        files=$(conflict_files)
+        abort_attempt "$kind"
+        now=$(g rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)
+        if [ "$CONFLICTS" = "server" ] && [ -n "$files" ] && [ "$now" = "$U_head" ] && [ -z "$R_operation" ]; then
+            if stopped; then
+                why=", and the run was stopped before the version of the server was tried"
+            elif server_first "$base"; then
+                sp=1
+                attempt "$kind" server
+                if [ "$AT_ok" -eq 0 ]; then
+                    files=$(conflict_files)
+                    abort_attempt "$kind"
+                    why=", even with the version of the server first"
+                fi
+            fi
+        fi
+    fi
+
+    if [ "$AT_ok" -eq 1 ]; then
+        now=$AT_now
+        if [ "$carry" -eq 1 ]; then
+            if stash_fits "$S_oid" "$now"; then
+                stash_back
+                left=$?
+                [ "$left" -eq 0 ] && left=""
+                [ -n "$left" ] && CF_words=""
+            elif [ "$CONFLICTS" = "server" ]; then
+                left=1
+            else
+                # The changes would clash with the result: the branch goes
+                # back, and they with it.
+                undo_move
+                stash_back
+                [ "$sp" -eq 1 ] && { remove_copies; drop_backup; }
+                put_back
+                unmark_inflight
+                inspect
+                U_state="diverged"; U_attn=1
+                U_msg="$both: not reconciled automatically, because your uncommitted changes touch the same lines as the result, in $CF_words"
+                if [ "$(snapshot)" != "$before" ] || [ -s "$W/aside" ]; then
+                    U_state="halfupdated"
+                    U_msg="the $kind could not be undone cleanly; the branch was at ${U_head:0:9}: look at it with git status"
+                fi
+                return 0
+            fi
+        fi
+        settle_aside
+        unmark_inflight
+        replayed=$(g rev-list --count "$U_up..$now" 2>/dev/null)
         if [ "$kind" = "rebase" ]; then
             U_state="rebased"
             U_msg="your $(plural "$U_ahead" commit) replayed on top of $(plural "$U_behind" "new one")"
+            if is_uint "$replayed" && [ "$replayed" -lt "$U_ahead" ]; then
+                text="$(( U_ahead - replayed ))"
+                if [ "$text" -eq 1 ]; then
+                    U_msg="$U_msg (1 of them was left empty by the version of the server and dropped)"
+                else
+                    U_msg="$U_msg ($text of them were left empty by the version of the server and dropped)"
+                fi
+            fi
         else
             U_state="merged"
             U_msg="your $(plural "$U_ahead" commit) merged with $(plural "$U_behind" "new one")"
         fi
+        if [ "$sp" -eq 1 ]; then
+            prune_kept
+            if [ -n "$SP_words" ] && [ -s "$W/clash" ]; then
+                text="; the version of the server taken where both sides changed the same lines ($SP_words)"
+            else
+                text="; the version of the server taken where both sides changed the same lines, among $SP_words"
+            fi
+            if [ -s "$W/copied" ] && [ -n "$K_dir" ]; then
+                text="$text: this machine's versions are kept in $(kept_label), the commit before as $B_ref"
+                U_kept="$U_kept${U_kept:+, }this machine's version of $(plural "$SP_n" file) where the server won"
+            else
+                text="$text: the commit before is kept as $B_ref"
+                U_kept="$U_kept${U_kept:+, }the commit before, where the server won"
+            fi
+            U_extra_msg="$text$U_extra_msg"
+        fi
+        if [ "$carry" -eq 1 ] && [ -z "$left" ]; then
+            stash_report 0
+            U_msg="$U_msg ($U_carry)"
+        fi
+        kept_report
+        [ -n "$left" ] && stash_report "$left"
+        U_msg="$U_msg$U_extra_msg"
         U_details=$(incoming "$U_head" "$U_up" "$U_behind")
+        if [ "$sp" -eq 1 ]; then
+            if [ -s "$W/copied" ] && [ -n "$K_dir" ]; then
+                shown=0
+                while IFS= read -r -d '' name; do
+                    { [ -f "$K_dir/$name" ] && [ ! -L "$K_dir/$name" ]; } || continue
+                    shown=$(( shown + 1 ))
+                    [ "$shown" -le 3 ] || break
+                    U_extra="$U_extra${U_extra:+$NL}to compare: git -C $(shell_path "$REPO") diff --no-index -- $(shell_word "$(kept_label)/$name") $(shell_word "$name")"
+                done < "$W/copied"
+            fi
+            U_extra="$U_extra${U_extra:+$NL}$(restore_line)"
+        fi
         U_move="$kind$US$U_head$US$now"
         return 0
     fi
 
-    # The attempt did not go through: collect what conflicts, undo, verify.
-    files=$(conflict_files)
-    if [ -n "$R_operation" ]; then
-        run_local abort "${GIT[@]}" "$kind" --abort
+    # The attempt did not go through: everything goes back, then the
+    # repository is compared with what it was.
+    [ "$carry" -eq 1 ] && stash_back
+    if [ "$sp" -eq 1 ]; then
+        remove_copies
+        drop_backup
     fi
+    put_back
+    unmark_inflight
     inspect
     after=$(snapshot)
-    unmark_inflight
-    if [ "$after" = "$before" ]; then
+    if [ "$after" = "$before" ] && [ ! -s "$W/aside" ]; then
         if [ -n "$files" ]; then
             U_state="conflict"; U_attn=1
-            U_msg="$both, and they conflict in $files: nothing was changed, the $kind is yours (git pull --$( [ "$kind" = rebase ] && printf 'rebase' || printf 'no-rebase' ))"
+            U_msg="$both, and they conflict in $files$why: nothing was changed, the $kind is yours (git pull --$( [ "$kind" = rebase ] && printf 'rebase' || printf 'no-rebase' ))"
         else
             U_state="blocked"; U_attn=1
-            U_msg="$both: git refused the $kind ($(last_line "$W/$kind.err")), nothing was changed"
+            ERR="$W/$kind.err"
+            files=$(refused_words)
+            if [ -n "$files" ]; then
+                U_msg="$both: the $kind would write over $files, nothing was changed"
+            else
+                U_msg="$both: git refused the $kind ($(last_line "$W/$kind.err")), nothing was changed"
+            fi
         fi
     else
         U_state="halfupdated"; U_attn=1
         U_msg="the $kind could not be undone cleanly; the branch was at ${U_head:0:9}: look at it with git status"
+        [ -s "$W/aside" ] && U_msg="$U_msg; what was set aside is in $(short_path "$K_dir")"
     fi
     return 0
 }
@@ -1944,6 +2900,7 @@ fetch_and_compare() {
     local rc counts
     U_state=""; U_attn=0; U_msg=""; U_details=""; U_move=""
     U_head=""; U_up=""; U_ahead=0; U_behind=0
+    clear_extras
 
     if [ "$R_busy" -eq 1 ]; then
         sleep 1
@@ -2010,9 +2967,33 @@ fetch_and_compare() {
 
 level_with_server() {
     # The whole morning logic for the repository already inspected: fetch,
-    # compare, bring forward. Sets U_state, U_attn, U_msg, U_details, U_move.
+    # compare, bring forward; then the other branches that only lack the
+    # new commits of the server. Sets U_state, U_attn, U_msg, U_details,
+    # U_move, and the extras of clear_extras.
     fetch_and_compare || return 0
+    bring_level
+    other_branches_forward
+    if [ "$OB_n" -gt 0 ] || [ -n "$OB_lines" ]; then
+        if [ "$U_state" = "uptodate" ]; then
+            if [ "$ONLY_LOOK" -eq 1 ]; then
+                U_state="behind"
+            else
+                U_state="updated"
+            fi
+            U_msg=${OB_lines%%"$NL"*}
+            case "$OB_lines" in
+                *"$NL"*) U_extra="${OB_lines#*"$NL"}${U_extra:+$NL$U_extra}" ;;
+            esac
+        else
+            U_extra="$OB_lines${U_extra:+$NL$U_extra}"
+        fi
+    fi
+    return 0
+}
 
+bring_level() {
+    # The branch that is checked out, once fetched and compared.
+    local text
     if [ "$U_behind" -eq 0 ]; then
         if [ "$U_ahead" -eq 0 ]; then
             U_state="uptodate"
@@ -2022,16 +3003,29 @@ level_with_server() {
         return 0
     fi
     if [ "$ONLY_LOOK" -eq 1 ]; then
+        # What pull would set aside is named; nothing is moved.
+        files_in_way "$U_head" "$U_up"
+        if [ "$IW_n" -eq 1 ]; then
+            text="; $IW_words, which git does not track here, would make way for the version of the server and be kept"
+        elif [ "$IW_n" -gt 1 ]; then
+            text="; $IW_n files that git does not track here ($IW_words) would make way for those of the server and be kept"
+        else
+            text=""
+        fi
         if [ "$U_ahead" -eq 0 ]; then
-            U_state="behind"; U_msg="$(plural "$U_behind" "new commit") on the server: pull will bring them"
+            U_state="behind"; U_msg="$(plural "$U_behind" "new commit") on the server: pull will bring them$text"
             U_details=$(incoming "$U_head" "$U_up" "$U_behind")
         else
             U_state="diverged"
             U_msg="$(plural "$U_ahead" commit) here and $U_behind on the server"
             if [ "$DIVERGED" = "report" ]; then
                 U_attn=1; U_msg="$U_msg: pull will leave it to you"
+            elif server_rewrote && only_old_commits; then
+                U_msg="the history of the server was rewritten, and this clone holds only its old commits: pull will take the new history, the old one kept under refs/gh-batch"
+            elif [ "$CONFLICTS" = "server" ]; then
+                U_msg="$U_msg: pull will try a $DIVERGED, the version of the server taken where both sides changed the same lines$text"
             else
-                U_msg="$U_msg: pull will try a $DIVERGED"
+                U_msg="$U_msg: pull will try a $DIVERGED$text"
             fi
         fi
         return 0
@@ -2044,13 +3038,64 @@ level_with_server() {
     return 0
 }
 
+other_branches_forward() {
+    # The other local branches that follow the branch of the same name on
+    # the remote just fetched, that no worktree has checked out, and that
+    # only lack commits of the server, move forward without a file being
+    # touched (pull only writes their reference, and only if it did not
+    # move meanwhile). A branch that follows a branch of another name, as a
+    # bookmark made from main does, is left where it is. Sets OB_lines (the
+    # words), OB_moves (the journal) and OB_n; with ONLY_LOOK, only says
+    # what pull would do.
+    local name up remote rref wt old new n
+    OB_lines=""; OB_moves=""; OB_n=0
+    stopped && return 0
+    # A push takes the commits of the server only for the branch it sends;
+    # the other branches are the business of pull.
+    [ "${IN_PUSH:-0}" -eq 1 ] && return 0
+    while IFS=$US read -r name up remote rref wt; do
+        [ -n "$name" ] && [ "$name" != "$R_branch" ] || continue
+        [ -n "$up" ] && [ "$remote" = "$R_up_remote" ] && [ "$rref" = "refs/heads/$name" ] && [ -z "$wt" ] || continue
+        old=$(g rev-parse -q --verify "refs/heads/$name^{commit}" 2>/dev/null)
+        new=$(g rev-parse -q --verify "$up^{commit}" 2>/dev/null)
+        [ -n "$old" ] && [ -n "$new" ] && [ "$old" != "$new" ] || continue
+        g merge-base --is-ancestor "$old" "$new" 2>/dev/null || continue
+        n=$(g rev-list --count "$old..$new" 2>/dev/null)
+        is_uint "$n" || continue
+        if [ "$ONLY_LOOK" -eq 1 ]; then
+            OB_lines="$OB_lines${OB_lines:+$NL}the branch $name lacks $(plural "$n" "new commit") of the server: pull will move it forward"
+        elif g update-ref -m "gh-batch pull: fast-forward" "refs/heads/$name" "$new" "$old" 2>/dev/null; then
+            OB_n=$(( OB_n + 1 ))
+            OB_lines="$OB_lines${OB_lines:+$NL}the branch $name also moved forward: $(plural "$n" "new commit")"
+            OB_moves="$OB_moves${OB_moves:+$NL}fast-forward:$name$US$old$US$new"
+        fi
+    done <<EOF
+$(g for-each-ref --format='%(refname:short)%1f%(upstream)%1f%(upstream:remotename)%1f%(upstream:remoteref)%1f%(worktreepath)' refs/heads 2>/dev/null)
+EOF
+    return 0
+}
+
 emit_update() {
     # Publish what level_with_server found.
     emit "$U_state" "$U_attn" "$U_msg"
     details "$U_details"
+    details "$U_extra"
+    emit_moves
+    return 0
+}
+
+emit_moves() {
+    # The journal lines of what moved, and what was kept aside.
+    local line
     if [ -n "$U_move" ]; then
         printf 'J%s%s\n' "$US" "$U_move"
     fi
+    while IFS= read -r line; do
+        [ -n "$line" ] && printf 'J%s%s\n' "$US" "$line"
+    done <<EOF
+$OB_moves
+EOF
+    record_kept "$U_kept"
     return 0
 }
 
@@ -2058,6 +3103,10 @@ do_pull() {
     repo_begin || return 0
     level_with_server
     emit_update
+    if [ "$ONLY_LOOK" -eq 1 ] && [ -s "$TMP/forks.list" ] && ! stopped; then
+        fork_gap "$(fork_parent "$(remote_slug "${R_up_remote:-origin}")")"
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -2780,7 +3829,7 @@ do_push() {
     # when the server has newer commits, take them as "pull" does and push
     # once more. A repository without a marker keeps the answer of the plan.
     local committed=0 note="" rc pushed mark nfiles=0 stays="" alert=0 made="" looked=0
-    local kind server=""
+    local kind server="" IN_PUSH=1
     if [ ! -e "$TMP/plan/$IDX.go" ]; then
         cat "$TMP/plan/$IDX.res"
         return 0
@@ -2843,11 +3892,19 @@ do_push() {
             level_with_server
             ONLY_LOOK=0
             case "$U_state" in
-                updated|rebased|merged)
-                    [ -n "$U_move" ] && printf 'J%s%s\n' "$US" "$U_move"
-                    note=" after taking $(plural "$U_behind" commit) from the server"
+                updated|rebased|merged|reset)
+                    emit_moves
+                    [ "$U_attn" -eq 1 ] && alert=1
+                    note=" after taking $(plural "$U_behind" commit) from the server$U_extra_msg"
                     inspect
                     push_target && count_to_push
+                    if [ "$P_ahead" -eq 0 ] && [ "$P_new" -eq 0 ]; then
+                        # The commits of the server left nothing to send.
+                        emit "$U_state" "$alert" "$U_msg; nothing is left to push$made"
+                        details "$U_details"
+                        details "$U_extra"
+                        return 0
+                    fi
                     pushed=$P_ahead
                     server=$(g rev-parse -q --verify "$P_ref^{commit}" 2>/dev/null)
                     push_once
@@ -2884,6 +3941,7 @@ do_push() {
             fi
             [ -n "$stays" ] && note="$note; $stays"
             emit pushed "$alert" "$note$mark"
+            details "$U_extra"
             # The journal keeps where the branch of the server was and the
             # commit that it received.
             record_move push "$server" "$(g rev-parse -q --verify HEAD 2>/dev/null)"
@@ -2932,6 +3990,7 @@ cmd_status() {
     no_repository && exit "$EX_OK"
     header "$(last_runs)"
     pool do_status status render
+    fork_section_seen
     finish
 }
 
@@ -2942,8 +4001,12 @@ cmd_pull() {
     begin_command change
     no_repository && exit "$EX_OK"
     header ""
+    # A look at the servers also says how far each fork stands from the
+    # repository it was forked from.
+    [ "$ONLY_LOOK" -eq 1 ] && forks_prepare
     pool do_pull pull render
     [ "$STOP" -eq 0 ] && [ "$ONLY_LOOK" -eq 0 ] && remember_run pull
+    [ "$ONLY_LOOK" -eq 1 ] && [ "$STOP" -eq 0 ] && fork_section
     finish
 }
 
@@ -3093,6 +4156,7 @@ reset_tally() {
     TOTAL=0
     SHOWN=0
     ATTENTION_LIST=""
+    KEPT_LIST=""
 }
 
 cmd_sync() {
@@ -3496,15 +4560,16 @@ drop_words() {
 }
 
 keep_backup() {
-    # Before the branch moves, its commit is kept under a reference of its
-    # own, refs/gh-batch/before-reset/BRANCH/DATE-TIME, outside the branches
-    # and the remote branches, which keeps the commit and its files from
-    # the garbage collection of git. A name taken already, by a run in the
-    # same second, gets a number. Sets B_ref; returns 1, with the words of
-    # git in B_why, when no reference can be written.
-    local name n=1
+    # keep_backup KIND: before the branch moves, its commit is kept under a
+    # reference of its own, refs/gh-batch/KIND/BRANCH/DATE-TIME (KIND is
+    # before-reset or before-pull), outside the branches and the remote
+    # branches, which keeps the commit and its files from the garbage
+    # collection of git. A name taken already, by a run in the same second,
+    # gets a number. Sets B_ref; returns 1, with the words of git in B_why,
+    # when no reference can be written.
+    local kind="$1" name n=1
     B_ref=""; B_why=""
-    name="refs/gh-batch/before-reset/$R_branch/$RESET_STAMP"
+    name="refs/gh-batch/$kind/$R_branch/$RUN_STAMP"
     while :; do
         # An empty old value makes git refuse a name that exists already.
         if g update-ref "$name" "$U_head" "" 2> "$W/backup.err"; then
@@ -3516,7 +4581,7 @@ keep_backup() {
             return 1
         fi
         n=$(( n + 1 ))
-        name="refs/gh-batch/before-reset/$R_branch/$RESET_STAMP-$n"
+        name="refs/gh-batch/$kind/$R_branch/$RUN_STAMP-$n"
     done
 }
 
@@ -3536,57 +4601,13 @@ restore_line() {
         "$(shell_path "$REPO")" "$(shell_word "$R_branch")" "$(shell_word "$B_ref")"
 }
 
-discard_local() {
-    # The branch has commits that the server lacks, and --discard-local
-    # lets them go: the branch and its files are set to the commit of the
-    # server, as a checkout sets them, so that git refuses to overwrite a
-    # file or a folder that it does not track, ignored or not, and nothing
-    # changes then. A file that only the dropped commits held leaves the
-    # working tree; the backup reference keeps it.
-    local before after now rc files
-    if ! lfs_prefetch; then
-        U_state="failed"; U_attn=1
-        U_msg="the large files of the server could not be downloaded: $(net_failure "$?")"
-        return 0
-    fi
-    before=$(snapshot)
-    mark_inflight
-    run_local reset "${GIT[@]}" -c gc.auto=0 -c maintenance.auto=false \
-        checkout --quiet --no-track --no-overwrite-ignore -B "$R_branch" "$U_up"
-    rc=$?
-    unmark_inflight
-    now=$(g rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)
-    if [ "$rc" -eq 0 ] && [ "$now" = "$U_up" ] &&
-        [ "$(g symbolic-ref -q HEAD 2>/dev/null)" = "refs/heads/$R_branch" ]; then
-        U_state="reset"
-        U_msg="dropped $(plural "$U_ahead" commit) that the server lacks"
-        [ "$U_behind" -gt 0 ] && U_msg="$U_msg, took $(plural "$U_behind" "new one")"
-        U_move="reset$US$U_head$US$U_up"
-        return 0
-    fi
-    after=$(snapshot)
-    if [ "$after" = "$before" ]; then
-        U_state="blocked"; U_attn=1
-        files=$(refused_files)
-        if [ -n "$files" ]; then
-            U_msg="the reset would overwrite what git does not track here, in $files: nothing was changed"
-        else
-            U_msg="git refused the reset ($(last_line "$ERR")): nothing was changed"
-        fi
-    else
-        U_state="halfupdated"; U_attn=1
-        U_msg="the reset stopped half-way from ${U_head:0:9} to ${U_up:0:9}: look at it with git status"
-    fi
-    return 0
-}
-
 do_reset_plan() {
     # The first pass of "reset": fetch, compare the branch with the one it
     # follows, decide. Nothing moves but the remote branches that the fetch
     # brings up to date. A repository with a move to make leaves a marker
     # for the second pass: the move, the branch, the two commits seen, the
     # two counts and whether the server rewrote its history.
-    local gap rewritten=0 kind text hint state
+    local gap rewritten=0 kind text hint state aside=""
     repo_begin || return 0
     if ! fetch_and_compare; then
         emit_update
@@ -3606,9 +4627,17 @@ do_reset_plan() {
         [ "$U_ahead" -gt 0 ] && details "$(incoming "$U_up" "$U_head" "$U_ahead")"
         return 0
     fi
+    # What git does not track and stands where the server puts a file is
+    # named: the move sets it aside, and keeps it.
+    files_in_way "$U_head" "$U_up"
+    if [ "$IW_n" -eq 1 ]; then
+        aside="; $IW_words, which git does not track here, will make way for the version of the server and be kept"
+    elif [ "$IW_n" -gt 1 ]; then
+        aside="; $IW_n files that git does not track here ($IW_words) will make way for those of the server and be kept"
+    fi
     if [ "$U_ahead" -eq 0 ]; then
         kind="fast-forward"
-        emit planned 0 "take $(plural "$U_behind" "new commit") from the server"
+        emit planned 0 "take $(plural "$U_behind" "new commit") from the server$aside"
         details "$(incoming "$U_head" "$U_up" "$U_behind")"
     elif [ "$DISCARD_LOCAL" -eq 0 ]; then
         if [ "$U_behind" -eq 0 ]; then
@@ -3625,7 +4654,7 @@ do_reset_plan() {
         kind="discard"
         text=$(drop_words)
         [ "$rewritten" -eq 1 ] && text="the history of the server was rewritten; $text"
-        emit planned 0 "$text"
+        emit planned 0 "$text$aside"
         details "$(incoming "$U_up" "$U_head" "$U_ahead")"
     fi
     printf '%s\n' "$kind$US$R_branch$US$U_head$US$U_up$US$U_ahead$US$U_behind$US$rewritten" > "$TMP/rplan/$IDX.go"
@@ -3708,13 +4737,14 @@ do_reset() {
     fi
     U_state=""; U_attn=0; U_msg=""; U_details=""; U_move=""
     U_head=$head; U_up=$up; U_ahead=$p_ahead; U_behind=$p_behind
-    if ! keep_backup; then
+    clear_extras
+    if ! keep_backup before-reset; then
         emit failed 1 "the commit could not be kept under refs/gh-batch ($B_why): nothing was changed"
         return 0
     fi
     net_setup
     if [ "$p_kind" = "discard" ]; then
-        discard_local
+        move_to_server
         if [ "$U_state" = "reset" ] && [ "$p_rewritten" = "1" ]; then
             U_msg="the history of the server was rewritten; $U_msg"
         fi
@@ -3737,7 +4767,6 @@ cmd_reset() {
     local i=0
     begin_command change
     no_repository && exit "$EX_OK"
-    RESET_STAMP=$(date '+%Y%m%d-%H%M%S')
     header ""
     PLAN_GO=0; PLAN_DROPS=0
     pool do_reset_plan rplan render_reset_plan
@@ -4787,7 +5816,7 @@ finding() {
 doctor_remotes() {
     # The remotes of the repository: an address that carries a password, one
     # that travels unencrypted, and what GitHub says of each.
-    local name url slug answer now archived seen="" authority k=0 fresh
+    local name url slug answer now archived seen="" authority k=0 fresh parent base
     while IFS= read -r name; do
         [ -n "$name" ] || continue
         url=$(g config --get "remote.$name.url" 2>/dev/null)
@@ -4813,10 +5842,15 @@ doctor_remotes() {
         seen="$seen $slug"
         k=$(( k + 1 ))
         spawn "github$k" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api "repos/$slug" \
-            --jq '[.full_name, (.archived|tostring)] | join("\u001f")'
+            --jq '[.full_name, (.archived|tostring), (.parent.full_name // ""), (.parent.default_branch // "")] | join("\u001f")'
         if await net 20; then
-            now=""; archived=""
-            IFS=$US read -r now archived < "$OUT" || true
+            now=""; archived=""; parent=""; base=""
+            IFS=$US read -r now archived parent base < "$OUT" || true
+            # The remote that the branch follows, when it is a fork, is
+            # compared with its original.
+            if [ -n "$parent" ] && [ "$name" = "${R_up_remote:-origin}" ]; then
+                fork_gap "$parent" "$base"
+            fi
             answer=$(printf '%s' "$now" | tr '[:upper:]' '[:lower:]')
             if [ -n "$answer" ] && [ "$answer" != "$slug" ]; then
                 case "$url" in
@@ -4892,6 +5926,7 @@ do_doctor() {
         if grep -qs 'filter=lfs' "$REPO/.gitattributes" && ! have git-lfs; then
             finding warning "it keeps large files with git-lfs, which is not installed"
         fi
+        doctor_leftovers
         doctor_remotes
     } > "$W/findings"
     if [ "$D_problems" -gt 0 ]; then
@@ -4950,6 +5985,9 @@ cmd_doctor() {
     begin_command read
     no_repository && exit "$EX_OK"
     header ""
+    if [ "$OFFLINE" -eq 0 ] && have gh; then
+        mkdir -p "$TMP/forkgap"
+    fi
     pool do_doctor doctor render
     AROUND=()
     doctor_around
@@ -4965,6 +6003,441 @@ cmd_doctor() {
         [ "$SHOWN" -eq 1 ] && put ""
         put_styled "GitHub was not asked: gh is not installed." "${C_DIM}GitHub was not asked: gh is not installed.$C_OFF"
         SHOWN=1
+    fi
+    [ "$STOP" -eq 0 ] && fork_section
+    finish
+}
+
+# ---------------------------------------------------------------------------
+# Forks: how far each one stands from the repository it was forked from
+# ---------------------------------------------------------------------------
+
+forks_wanted() {
+    # 0 when this run speaks of forks: GitHub may be asked, through gh.
+    [ "$OFFLINE" -eq 0 ] && have gh
+}
+
+forks_prepare() {
+    # Before the workers of "fetch": the forks of the owners met among the
+    # remotes, as GitHub lists them, one question per owner. They go to
+    # $TMP/forks.list, one per line: the fork in lower case and its
+    # original as GitHub spells it.
+    local i=0 url slug owner owners="" fork parent
+    mkdir -p "$TMP/forkgap"
+    : > "$TMP/forks.list"
+    forks_wanted || return 0
+    while [ "$i" -lt "${#REPOS[@]}" ]; do
+        url=$(git -C "${REPOS[$i]}" config --get remote.origin.url 2>/dev/null)
+        slug=$(github_slug "$url")
+        if [ -n "$slug" ]; then
+            owner=${slug%%/*}
+            case "$US$owners" in
+                *"$US$owner$US"*) ;;
+                *) owners="$owners$owner$US" ;;
+            esac
+        fi
+        i=$(( i + 1 ))
+    done
+    : > "$TMP/forks.raw"
+    while [ -n "$owners" ]; do
+        owner=${owners%%"$US"*}
+        owners=${owners#*"$US"}
+        progress_note "reading the forks of $owner"
+        GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh repo list "$owner" --fork --limit 4000 \
+            --json nameWithOwner,parent \
+            --jq '.[] | select(.parent != null) | [.nameWithOwner, (.parent.owner.login + "/" + .parent.name)] | join("\u001f")' \
+            >> "$TMP/forks.raw" 2>/dev/null
+        progress_clear
+    done
+    while IFS=$US read -r fork parent; do
+        [ -n "$fork" ] && [ -n "$parent" ] || continue
+        printf '%s%s%s\n' "$(lower "$fork")" "$US" "$parent" >> "$TMP/forks.list"
+    done < "$TMP/forks.raw"
+    return 0
+}
+
+fork_parent() {
+    # fork_parent SLUG -> the original of the fork SLUG (lower case), as
+    # forks_prepare found it, or nothing.
+    local fork parent
+    [ -n "$1" ] && [ -s "$TMP/forks.list" ] || return 0
+    while IFS=$US read -r fork parent; do
+        if [ "$fork" = "$1" ]; then
+            printf '%s' "$parent"
+            return 0
+        fi
+    done < "$TMP/forks.list"
+    return 0
+}
+
+fork_gap() {
+    # fork_gap PARENT [BASE]: in a worker, for a fork of PARENT, ask GitHub
+    # how far the branch that this clone follows stands from the default
+    # branch of the original (BASE, asked for when not given). The answer
+    # goes to $TMP/forkgap/INDEX for the section "Forks" of the report.
+    local parent="$1" base="${2:-}" slug owner branch ahead="" behind=""
+    [ -n "$parent" ] && [ -d "$TMP/forkgap" ] || return 0
+    [ -n "$R_up_rref" ] || return 0
+    slug=$(remote_slug "${R_up_remote:-origin}")
+    owner=${slug%%/*}
+    branch=${R_up_rref#refs/heads/}
+    [ -n "$owner" ] && [ -n "$branch" ] || return 0
+    if [ -z "$base" ]; then
+        spawn forkbase env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api "repos/$parent" --jq .default_branch
+        await net 20 || return 0
+        IFS= read -r base < "$OUT" || true
+        [ -n "$base" ] || return 0
+    fi
+    spawn forkgap env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api "repos/$parent/compare/$base...$owner:$branch" \
+        --jq '[(.ahead_by|tostring), (.behind_by|tostring)] | join("\u001f")'
+    await net 20 || return 0
+    IFS=$US read -r ahead behind < "$OUT" || true
+    { is_uint "$ahead" && is_uint "$behind"; } || return 0
+    printf '%s%s%s%s%s%s%s%s%s%s%s\n' "$parent" "$US" "$base" "$US" "$owner" "$US" "$branch" \
+        "$US" "$ahead" "$US" "$behind" > "$TMP/forkgap/$IDX"
+    return 0
+}
+
+fork_words() {
+    # fork_words PARENT OWNER BRANCH AHEAD BEHIND -> the gap between a fork
+    # and its original in words, with the command that offers the commits
+    # of the fork to the original; nothing when there is no gap.
+    local parent="$1" head="$2:$3" ahead="$4" behind="$5" text=""
+    if [ "$behind" -gt 0 ]; then
+        text="the original $parent has $(plural "$behind" commit) that this fork lacks"
+    fi
+    if [ "$ahead" -gt 0 ]; then
+        if [ -n "$text" ]; then
+            text="$text, and this fork has $ahead that the original lacks"
+        else
+            text="this fork has $(plural "$ahead" commit) that its original $parent lacks"
+        fi
+        text="$text; to offer $( [ "$ahead" -eq 1 ] && printf 'it' || printf 'them' ): gh pr create --repo $parent --head $head"
+    fi
+    printf '%s' "$text"
+}
+
+fork_section() {
+    # After the report of "fetch" or "doctor": the forks whose branch and
+    # original differ. The answers also go to the record that "status"
+    # reads, $STATE_DIR/forks.tsv.
+    local i=0 parent base owner branch ahead behind line lines=()
+    [ -d "$TMP/forkgap" ] || return 0
+    while [ "$i" -lt "${#REPOS[@]}" ]; do
+        if [ -f "$TMP/forkgap/$i" ]; then
+            IFS=$US read -r parent base owner branch ahead behind < "$TMP/forkgap/$i"
+            line=$(fork_words "$parent" "$owner" "$branch" "$ahead" "$behind")
+            [ -n "$line" ] && lines+=("${NAMES[$i]}: $line")
+        fi
+        i=$(( i + 1 ))
+    done
+    fork_record
+    [ "$PORCELAIN" -eq 0 ] && [ "${#lines[@]}" -gt 0 ] || return 0
+    [ "$SHOWN" -eq 1 ] && put ""
+    put_title "Forks:"
+    for line in "${lines[@]}"; do
+        put "  $line"
+    done
+    SHOWN=1
+    return 0
+}
+
+fork_record() {
+    # The record of the forks that "status" shows without the network: the
+    # lines of the repositories of this run are replaced by what GitHub
+    # answered now. One line per fork: path, original, owner:branch,
+    # commits of the fork that the original lacks, commits of the original
+    # that the fork lacks, date, separated by tabs.
+    local file="$STATE_DIR/forks.tsv" i path rest keep parent base owner branch ahead behind
+    [ -n "$STATE_DIR" ] || return 0
+    mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+    : > "$TMP/forks.tsv"
+    if [ -f "$file" ]; then
+        while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            rest=${path#*"$TAB"}
+            path=${path%%"$TAB"*}
+            keep=1
+            i=0
+            while [ "$i" -lt "${#REPOS[@]}" ]; do
+                if [ "${REPOS[$i]}" = "$path" ]; then
+                    keep=0
+                    break
+                fi
+                i=$(( i + 1 ))
+            done
+            [ "$keep" -eq 1 ] && printf '%s\t%s\n' "$path" "$rest" >> "$TMP/forks.tsv"
+        done < "$file"
+    fi
+    i=0
+    while [ "$i" -lt "${#REPOS[@]}" ]; do
+        if [ -f "$TMP/forkgap/$i" ]; then
+            IFS=$US read -r parent base owner branch ahead behind < "$TMP/forkgap/$i"
+            printf '%s\t%s\t%s:%s\t%s\t%s\t%s\n' "${REPOS[$i]}" "$parent" "$owner" "$branch" "$ahead" "$behind" "$TODAY" >> "$TMP/forks.tsv"
+        fi
+        i=$(( i + 1 ))
+    done
+    if [ -s "$TMP/forks.tsv" ]; then
+        cp "$TMP/forks.tsv" "$file.new" 2>/dev/null && mv -f "$file.new" "$file" 2>/dev/null
+    else
+        rm -f "$file"
+    fi
+    return 0
+}
+
+fork_section_seen() {
+    # For "status", which uses no network: the gaps of the forks as "fetch"
+    # or "doctor" last saw them, with the date.
+    local file="$STATE_DIR/forks.tsv" i=0 line path parent head ahead behind date words lines=()
+    [ "$PORCELAIN" -eq 0 ] && [ -n "$STATE_DIR" ] && [ -f "$file" ] || return 0
+    while [ "$i" -lt "${#REPOS[@]}" ]; do
+        while IFS= read -r line; do
+            path=${line%%"$TAB"*}
+            [ "$path" = "${REPOS[$i]}" ] || continue
+            IFS=$TAB read -r path parent head ahead behind date <<EOF
+$line
+EOF
+            { is_uint "$ahead" && is_uint "$behind"; } || continue
+            words=$(fork_words "$parent" "${head%%:*}" "${head#*:}" "$ahead" "$behind")
+            [ -n "$words" ] && lines+=("${NAMES[$i]}: $words (seen on $date)")
+        done < "$file"
+        i=$(( i + 1 ))
+    done
+    [ "${#lines[@]}" -gt 0 ] || return 0
+    [ "$SHOWN" -eq 1 ] && put ""
+    put_title "Forks, as fetch or doctor last saw them:"
+    for line in "${lines[@]}"; do
+        put "  $line"
+    done
+    SHOWN=1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# tidy: the backups and the kept files of past runs
+# ---------------------------------------------------------------------------
+
+days_ago() {
+    # days_ago N -> the date N days before now, as YYYYMMDD.
+    local s=$(( NOW - $1 * 86400 ))
+    date -d "@$s" '+%Y%m%d' 2>/dev/null || date -r "$s" '+%Y%m%d' 2>/dev/null
+}
+
+stamp_words() {
+    # stamp_words YYYYMMDD -> "17 November 2026"
+    local d="$1" m
+    case "${d:4:2}" in
+        01) m=January ;;   02) m=February ;; 03) m=March ;;     04) m=April ;;
+        05) m=May ;;       06) m=June ;;     07) m=July ;;      08) m=August ;;
+        09) m=September ;; 10) m=October ;;  11) m=November ;;  12) m=December ;;
+        *)  printf '%s' "$d"; return 0 ;;
+    esac
+    printf '%s %s %s' "$(( 10#${d:6:2} ))" "$m" "${d:0:4}"
+}
+
+leftovers() {
+    # leftovers [UNTIL] -> what this tool left in the repository: one line
+    # per backup reference ("ref<US>NAME<US>COMMIT<US>DAY") and per folder of
+    # kept files ("dir<US>PATH<US><US>DAY"), DAY being YYYYMMDD; with UNTIL,
+    # only those of that day or before.
+    local until="${1:-}" name oid day gitdir entry
+    while IFS=$US read -r name oid; do
+        [ -n "$name" ] || continue
+        day=${name##*/}
+        day=${day:0:8}
+        is_uint "$day" || continue
+        if [ -z "$until" ] || [ "$day" -le "$until" ]; then
+            printf 'ref%s%s%s%s%s%s\n' "$US" "$name" "$US" "$oid" "$US" "$day"
+        fi
+    done <<EOF
+$(g for-each-ref --format='%(refname)%1f%(objectname)' refs/gh-batch 2>/dev/null)
+EOF
+    gitdir=$(g rev-parse --absolute-git-dir 2>/dev/null)
+    [ -n "$gitdir" ] && [ -d "$gitdir/gh-batch/kept" ] || return 0
+    for entry in "$gitdir"/gh-batch/kept/*; do
+        [ -d "$entry" ] || continue
+        day=${entry##*/}
+        day=${day:0:8}
+        is_uint "$day" || continue
+        if [ -z "$until" ] || [ "$day" -le "$until" ]; then
+            printf 'dir%s%s%s%s%s\n' "$US" "$entry" "$US" "$US" "$day"
+        fi
+    done
+    return 0
+}
+
+leftover_words() {
+    # leftover_words FILE: LW_words, "2 backups and 1 folder of kept
+    # files", and LW_oldest, the day of the oldest.
+    local kind name oid day refs=0 dirs=0 text=""
+    LW_oldest=""; LW_words=""
+    while IFS=$US read -r kind name oid day; do
+        case "$kind" in
+            ref) refs=$(( refs + 1 )) ;;
+            dir) dirs=$(( dirs + 1 )) ;;
+            *)   continue ;;
+        esac
+        if [ -z "$LW_oldest" ] || [ "$day" -lt "$LW_oldest" ]; then
+            LW_oldest=$day
+        fi
+    done < "$1"
+    [ "$refs" -gt 0 ] && text=$(plural "$refs" backup)
+    if [ "$dirs" -gt 0 ]; then
+        text="$text${text:+ and }$dirs $( [ "$dirs" -eq 1 ] && printf 'folder' || printf 'folders' ) of kept files"
+    fi
+    LW_words=$text
+    return 0
+}
+
+doctor_leftovers() {
+    # A finding of "doctor": the backups and the kept files in this
+    # repository, a note while they are recent, a warning once the oldest
+    # is older than --days.
+    local limit
+    leftovers > "$W/leftovers"
+    [ -s "$W/leftovers" ] || return 0
+    leftover_words "$W/leftovers"
+    limit=$(days_ago "$DOCTOR_DAYS")
+    if is_uint "$limit" && is_uint "$LW_oldest" && [ "$LW_oldest" -le "$limit" ]; then
+        finding warning "$LW_words that $PROG keeps here, the oldest from $(stamp_words "$LW_oldest"): $PROG tidy removes those older than a month"
+    else
+        finding note "$LW_words that $PROG keeps here, the oldest from $(stamp_words "$LW_oldest")"
+    fi
+    return 0
+}
+
+do_tidy_plan() {
+    # The first pass of "tidy": what this tool left in the repository
+    # before the limit. Nothing is removed.
+    local kind name oid day text
+    repo_begin || return 0
+    leftovers "$TIDY_UNTIL" > "$TMP/tplan/$IDX.list"
+    if [ ! -s "$TMP/tplan/$IDX.list" ]; then
+        emit clean 0 ""
+        return 0
+    fi
+    leftover_words "$TMP/tplan/$IDX.list"
+    emit planned 0 "remove $LW_words, the oldest from $(stamp_words "$LW_oldest")"
+    while IFS=$US read -r kind name oid day; do
+        case "$kind" in
+            ref) text=${name#refs/gh-batch/} ;;
+            dir)
+                case "$name" in
+                    "$REPO"/*) text=${name#"$REPO"/} ;;
+                    *)         text=$(short_path "$name") ;;
+                esac
+                ;;
+            *)   continue ;;
+        esac
+        detail "$text"
+    done < "$TMP/tplan/$IDX.list"
+    : > "$TMP/tplan/$IDX.go"
+    printf 'P%s1\n' "$US"
+    return 0
+}
+
+render_tidy_plan() {
+    local kind
+    while IFS=$US read -r kind _; do
+        [ "$kind" = "P" ] && PLAN_GO=$(( PLAN_GO + 1 ))
+    done < "$2"
+    return 0
+}
+
+show_tidy_plan() {
+    local i=0 count="${#REPOS[@]}"
+    put_title "Plan:"
+    while [ "$i" -lt "$count" ]; do
+        if [ -f "$TMP/tplan/$i.res" ]; then
+            read_record "$TMP/tplan/$i.res"
+            [ "$REC_state" = "planned" ] && print_record "$i"
+        fi
+        i=$(( i + 1 ))
+    done
+    put ""
+    put_title "To do: remove what $PROG kept in $(plural "$PLAN_GO" repository), up to $(stamp_words "$TIDY_UNTIL")."
+    return 0
+}
+
+do_tidy() {
+    # The second pass of "tidy": each backup reference goes only if it still
+    # names the commit of the plan, each kept folder only if it lies in the
+    # folder of this tool inside the git folder.
+    local kind name oid day refs=0 dirs=0 failed=0 gitdir text
+    if [ ! -e "$TMP/tplan/$IDX.go" ]; then
+        cat "$TMP/tplan/$IDX.res"
+        return 0
+    fi
+    repo_begin || return 0
+    gitdir=$(g rev-parse --absolute-git-dir 2>/dev/null)
+    while IFS=$US read -r kind name oid day; do
+        case "$kind" in
+            ref)
+                if g update-ref -d "$name" "$oid" 2>/dev/null; then
+                    refs=$(( refs + 1 ))
+                else
+                    failed=$(( failed + 1 ))
+                fi
+                ;;
+            dir)
+                case "$name" in
+                    "$gitdir"/gh-batch/kept/?*)
+                        if rm -rf -- "$name" 2>/dev/null; then
+                            dirs=$(( dirs + 1 ))
+                        else
+                            failed=$(( failed + 1 ))
+                        fi
+                        ;;
+                    *)  failed=$(( failed + 1 )) ;;
+                esac
+                ;;
+        esac
+    done < "$TMP/tplan/$IDX.list"
+    [ -n "$gitdir" ] && rmdir "$gitdir/gh-batch/kept" "$gitdir/gh-batch" 2>/dev/null
+    text=""
+    [ "$refs" -gt 0 ] && text=$(plural "$refs" backup)
+    if [ "$dirs" -gt 0 ]; then
+        text="$text${text:+ and }$dirs $( [ "$dirs" -eq 1 ] && printf 'folder' || printf 'folders' ) of kept files"
+    fi
+    if [ "$failed" -gt 0 ]; then
+        emit failed 1 "removed ${text:-nothing}; $failed could not be removed (moved since the plan)"
+    else
+        emit tidied 0 "removed $text"
+    fi
+    return 0
+}
+
+cmd_tidy() {
+    local i=0
+    [ "$DAYS_GIVEN" -eq 1 ] || DOCTOR_DAYS=30
+    is_uint "$DOCTOR_DAYS" || die "$EX_USAGE" "--days takes a number of days, not '$DOCTOR_DAYS'"
+    begin_command change
+    no_repository && exit "$EX_OK"
+    TIDY_UNTIL=$(days_ago "$DOCTOR_DAYS")
+    is_uint "$TIDY_UNTIL" || die "$EX_ENV" "the date of $DOCTOR_DAYS days ago could not be computed"
+    header ""
+    PLAN_GO=0
+    pool do_tidy_plan tplan render_tidy_plan
+    if [ "$STOP" -eq 0 ] && [ "$PLAN_GO" -gt 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+        show_before_asking show_tidy_plan
+        if ! confirmed; then
+            put "Nothing was done."
+            exit "$EX_OK"
+        fi
+        if [ "$PORCELAIN" -eq 0 ]; then
+            put ""
+            put_title "Done:"
+        fi
+        pool do_tidy twork render
+        finish
+    fi
+    while [ "$i" -lt "${#REPOS[@]}" ]; do
+        [ -f "$TMP/tplan/$i.res" ] && render "$i" "$TMP/tplan/$i.res"
+        i=$(( i + 1 ))
+    done
+    if [ "$DRY_RUN" -eq 1 ] && [ "$PLAN_GO" -gt 0 ] && [ "$PORCELAIN" -eq 0 ] && [ "$STOP" -eq 0 ]; then
+        put ""
+        put_title "To do: remove what $PROG kept in $(plural "$PLAN_GO" repository), up to $(stamp_words "$TIDY_UNTIL"). Nothing was changed (dry run)."
     fi
     finish
 }
@@ -4982,13 +6455,14 @@ _gh_batch() {
     local cur prev words cword commands options
     cur=${COMP_WORDS[COMP_CWORD]}
     prev=${COMP_WORDS[COMP_CWORD-1]}
-    commands="pull push commit sync reset clone status fetch log exec doctor list config completion help"
+    commands="pull push commit sync reset tidy clone status fetch log exec doctor list config completion help"
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=($(compgen -W "$commands --help --version" -- "$cur"))
         return 0
     fi
     case "$prev" in
         --diverged) COMPREPLY=($(compgen -W "report rebase merge" -- "$cur")); return 0 ;;
+        --conflicts) COMPREPLY=($(compgen -W "report server" -- "$cur")); return 0 ;;
         --color|--colour) COMPREPLY=($(compgen -W "auto always never" -- "$cur")); return 0 ;;
         --into) COMPREPLY=($(compgen -d -- "$cur")); return 0 ;;
         --manifest) COMPREPLY=($(compgen -f -- "$cur")); return 0 ;;
@@ -4997,10 +6471,12 @@ _gh_batch() {
     esac
     options="--jobs --depth --only --except --dry-run --yes --verbose --quiet --porcelain --timeout --color --help"
     case "${COMP_WORDS[1]}" in
-        pull|fetch) options="$options --diverged --notify" ;;
-        push|sync)  options="$options --commit --no-commit --message --set-upstream --diverged --notify" ;;
+        pull)       options="$options --diverged --conflicts --notify" ;;
+        fetch)      options="$options --diverged --conflicts --offline --notify" ;;
+        push|sync)  options="$options --commit --no-commit --message --set-upstream --diverged --conflicts --notify" ;;
         commit)     options="$options --message --notify" ;;
         reset)      options="$options --discard-local --notify" ;;
+        tidy)       options="$options --days" ;;
         clone)      options="$options --into --manifest --update --since --no-forks --no-archived --orgs --no-orgs --flat --by-owner" ;;
         status)     options="$options --long" ;;
         log)        options="$options --since --until --author --all-authors --long" ;;
@@ -5035,6 +6511,7 @@ _gh_batch() {
         'commit:commit what is pending, and push afterwards when asked'
         'sync:pull, then push'
         'reset:set every branch to the one it follows on its server, safely'
+        'tidy:remove the backups and kept files older than a month'
         'clone:clone what is missing from an account or a layout file'
         'status:what is pending in every repository'
         'fetch:look at the servers and say what pull would do'
@@ -5065,6 +6542,8 @@ _gh_batch() {
                 '(-q --quiet)'{-q,--quiet}'[show only what needs you]' \
                 '--porcelain[one line per repository, fields separated by tabs]' \
                 '--diverged[what to do when both sides have commits]:how:(report rebase merge)' \
+                '--conflicts[what wins where both sides changed the same lines]:who:(report server)' \
+                '--days[an age in days]:days:' \
                 '--commit[commit pending changes before the push]' \
                 '--no-commit[push only what is committed already]' \
                 '(-m --message)'{-m,--message}'[the first line of the commits]:text:' \
@@ -5151,6 +6630,7 @@ cmd_config() {
     setting_row "jobs" "$JOBS" "$SRC_jobs"
     setting_row "timeout" "$TIMEOUT s" "$SRC_timeout"
     setting_row "diverged" "$DIVERGED" "$SRC_diverged"
+    setting_row "conflicts" "$CONFLICTS" "$SRC_conflicts"
     setting_row "commit" "$( [ "$COMMIT" -eq 1 ] && printf 'true' || printf 'false' )" "$SRC_commit"
     setting_row "confirm" "$( [ "$CONFIRM" -eq 1 ] && printf 'true' || printf 'false' )" "$SRC_confirm"
     setting_row "message" "$MESSAGE" "$SRC_message"
@@ -5202,6 +6682,8 @@ COMMANDS
   reset       set every branch to the one it follows on its server, safely:
               its commit is kept first, and commits that the server lacks
               are dropped only with --discard-local
+  tidy        remove the backups and the kept files of runs older than a
+              month
   clone       clone what is missing: a whole GitHub account with its
               organisations, or the entries of a layout file written by
               "list --manifest"
@@ -5241,6 +6723,7 @@ EXIT STATUS
 SETTINGS
   git config --global gh-batch.root ~/workspace    the folder searched by default
   git config --global gh-batch.diverged rebase     see: $PROG help pull
+  git config --global gh-batch.conflicts server    see: $PROG help pull
   git config --global gh-batch.commit true         see: $PROG help push
   The others are listed by "$PROG config". Inside a repository,
   "git config gh-batch.skip true" sets it aside and "git config
@@ -5257,28 +6740,57 @@ Fetch every repository and bring its branch forward. For each repository:
   nothing new on the server   it is up to date
   new commits on the server   the branch is moved forward (a fast-forward);
                               pending changes that the new commits do not
-                              touch stay as they are; if they would be
-                              touched, git refuses, nothing changes, and the
-                              repository is reported as blocked; a file
-                              deleted here that the new commits change comes
-                              back in its new version, and is named
+                              touch stay as they are; a file deleted here
+                              that the new commits change comes back in its
+                              new version, and is named
   new commits on both sides   following gh-batch.diverged:
                                 report  (default) nothing is tried
                                 rebase  your commits are replayed on top
                                 merge   the two histories are joined
                               a conflict is undone at once: the repository
                               is left exactly as it was and the files that
-                              conflict are named
+                              conflict are named, unless gh-batch.conflicts
+                              is server (see below)
 
-A replay is tried only when it is safe: no uncommitted change to a tracked
-file, no merge commit among your commits, none of them already on a server,
-the history of the server not rewritten, no signature to type.
+A file that git does not track here (untracked or ignored) and that stands
+where the new commits put a file makes way for the version of the server:
+it is moved, whole, into the git folder of the repository,
+.git/gh-batch/kept/DATE-TIME/, the report names it and gives the command
+that compares the two versions. An identical copy is simply dropped.
 
-A detached HEAD, an operation left in progress, a branch that left the
-server and a repository without remote are reported and left alone.
+Uncommitted changes that the new commits touch travel over the update in a
+stash of the tool's own when git tells beforehand that they still apply
+(git 2.40 or newer): they are back in the files afterwards. When they touch
+the same lines as the new commits, nothing changes and the repository is
+reported as blocked, or, with gh-batch.conflicts server, the version of the
+server is taken and the changes wait in the stash (git stash pop brings
+them back), which the report says.
+
+With gh-batch.conflicts server, a replay or a merge that conflicts is made
+again with the version of the server in the lines that both sides changed,
+and in a file changed on both sides that git cannot merge (a PDF rebuilt on
+two machines). Before that, the commit of the branch is kept under
+refs/gh-batch/before-pull/BRANCH/DATE-TIME and this machine's version of
+each of those files is copied into .git/gh-batch/kept/DATE-TIME/; the
+report names the files and prints the one command that restores the branch.
+A conflict that even this cannot settle (a file deleted on one side and
+changed on the other) is undone as above.
+
+A replay is tried only when it is safe: no merge commit among your commits,
+none of them already on a server, the history of the server not rewritten,
+no signature to type. When the server rewrote its history and every commit
+here that it lacks was once on it, nothing of this machine is at stake:
+the branch takes the new history, its commit kept first.
+
+The other local branches that only lack commits of the server are moved
+forward too, without a file being touched. A detached HEAD, an operation
+left in progress, a branch that left the server and a repository without
+remote are reported and left alone. What was kept aside is listed at the
+end of the report.
 
 OPTIONS
       --diverged HOW   report, rebase or merge, for this run
+      --conflicts WHO  report or server, for this run
   -n, --dry-run        fetch, then only say what would be done (as "fetch")
   and the common options, see: $PROG help
 EOF
@@ -5310,8 +6822,9 @@ shown, the public repositories marked PUBLIC when gh is installed, and one
 confirmation is asked. Without a terminal the run needs --yes.
 
 When the server has commits that this machine lacks, they are taken as
-"pull" would take them (see gh-batch.diverged) and the push is tried once
-more; a conflict there is undone and reported. With the default setting,
+"pull" would take them (see gh-batch.diverged and gh-batch.conflicts) and
+the push is tried once more; a conflict there is undone and reported, or
+settled with the version of the server first. With the default setting,
 report, a repository whose last fetch already showed such commits is
 neither committed nor pushed: pull first, or use "$PROG sync".
 
@@ -5421,8 +6934,9 @@ command that puts the branch and its files back. A repository with
 uncommitted changes to tracked files is left alone, and so are a detached
 HEAD, an operation in progress, a branch that follows nothing and a
 repository without remote. Untracked and ignored files are never deleted
-or overwritten: when one stands in the way, git refuses and nothing
-changes. Nothing is pushed.
+or overwritten: one that stands where the server has a file is moved,
+whole, into .git/gh-batch/kept/DATE-TIME/, and the report names it.
+Nothing is pushed.
 
 The command is made for a history rewritten on the server, a folder
 removed from every commit and the result pushed by force: the clones on
@@ -5434,6 +6948,25 @@ OPTIONS
   -y, --yes            do not ask before dropping commits
   -n, --dry-run        fetch, then only say what would be done
       --notify         send the report through the command of gh-batch.notify
+  and the common options, see: $PROG help
+EOF
+}
+
+help_tidy() {
+    cat <<EOF
+$PROG tidy [options] [folder ...]
+
+Remove what this tool kept in the repositories during earlier runs and that
+is older than a month: the backups of a branch made before it moved
+(refs/gh-batch/...), and the folders of files that made way for the
+version of the server (.git/gh-batch/kept/DATE-TIME/). The list is shown
+first, and one confirmation is asked. A backup is removed only if it still
+names the commit it was made for. Stashes are never touched.
+
+OPTIONS
+      --days N       remove what is older than N days (default 30)
+  -y, --yes          do not ask for the confirmation
+  -n, --dry-run      show the list and remove nothing
   and the common options, see: $PROG help
 EOF
 }
@@ -5505,7 +7038,8 @@ $PROG status [options] [folder ...]
 One line per repository that has something pending: files changed or new
 and since when, commits to push and since when, commits behind the last
 fetch, stashes, an operation left in progress. Nothing is fetched: the
-comparison with the server is the one of the last fetch or pull.
+comparison with the server is the one of the last fetch or pull, and the
+forks are shown as "fetch" or "doctor" last saw them, with the date.
 
 OPTIONS
   -l, --long      list the pending files of each repository
@@ -5519,11 +7053,18 @@ help_fetch() {
 $PROG fetch [options] [folder ...]
 
 Fetch every repository and say what "pull" would do, without touching a
-branch or a file: how many commits wait on the server, which repositories
-have diverged, which branch left the server.
+branch or a file: how many commits wait on the server, which files would be
+set aside, which repositories have diverged, which branch left the server.
+
+When gh is installed, the forks are compared with the repository they were
+forked from, one question to GitHub per owner and two per fork: a section
+"Forks" names the commits of the original that a fork lacks, and those of
+the fork that the original lacks, with the command that offers them to it
+(gh pr create). Nothing is opened, synced or pushed.
 
 OPTIONS
-  the common options, see: $PROG help
+      --offline   do not ask GitHub about the forks
+  and the common options, see: $PROG help
 EOF
 }
 
@@ -5596,10 +7137,12 @@ Health check. Nothing is changed. For each repository:
              or unpushed commits older than a week, stashes, a remote that
              was renamed or transferred on GitHub (with the command that
              corrects its address), an archived repository, git-lfs needed
-             and missing
+             and missing, backups and kept files of this tool older than
+             a week (a note while they are recent)
 
 And around the repositories: the folders of the workspace that hold no
-repository, the loose files, the leftovers of an interrupted clone.
+repository, the loose files, the leftovers of an interrupted clone. The
+forks are compared with their originals, as "fetch" does.
 
 GitHub is asked through gh, one question per repository; without gh, or
 with --offline, those checks are left out.
@@ -5648,7 +7191,8 @@ $PROG config
 
 Print the settings in force and where each comes from: the command line,
 the environment (GH_BATCH_ROOT, GH_BATCH_JOBS, GH_BATCH_DEPTH,
-GH_BATCH_TIMEOUT, GH_BATCH_DIVERGED, GH_BATCH_COMMIT, GH_BATCH_CONFIRM,
+GH_BATCH_TIMEOUT, GH_BATCH_DIVERGED, GH_BATCH_CONFLICTS, GH_BATCH_COMMIT,
+GH_BATCH_CONFIRM,
 GH_BATCH_ORGS, GH_BATCH_MESSAGE, GH_BATCH_MACHINE, GH_BATCH_MAX_FILE_SIZE,
 GH_BATCH_MAX_NEW_FILES, GH_BATCH_NOTIFY, GH_BATCH_NOTIFY_ON),
 "git config --global gh-batch.*", or the default. The settings of single
@@ -5664,6 +7208,7 @@ show_help() {
         commit)  help_commit ;;
         sync)    help_sync ;;
         reset)   help_reset ;;
+        tidy)    help_tidy ;;
         clone)   help_clone ;;
         status)  help_status ;;
         fetch)   help_fetch ;;
@@ -5697,6 +7242,8 @@ parse_options() {
             --timeout=*)    OPT_TIMEOUT=${1#*=}; shift ;;
             --diverged)     need_value "$@"; OPT_DIVERGED=$2; shift 2 ;;
             --diverged=*)   OPT_DIVERGED=${1#*=}; shift ;;
+            --conflicts)    need_value "$@"; OPT_CONFLICTS=$2; shift 2 ;;
+            --conflicts=*)  OPT_CONFLICTS=${1#*=}; shift ;;
             --only)         need_value "$@"; ONLY+=("$2"); shift 2 ;;
             --only=*)       ONLY+=("${1#*=}"); shift ;;
             --except)       need_value "$@"; EXCEPT+=("$2"); shift 2 ;;
@@ -5726,8 +7273,8 @@ parse_options() {
             --ahead)        F_AHEAD=1; shift ;;
             --behind)       F_BEHIND=1; shift ;;
             --offline)      OFFLINE=1; shift ;;
-            --days)         need_value "$@"; DOCTOR_DAYS=$2; shift 2 ;;
-            --days=*)       DOCTOR_DAYS=${1#*=}; shift ;;
+            --days)         need_value "$@"; DOCTOR_DAYS=$2; DAYS_GIVEN=1; shift 2 ;;
+            --days=*)       DOCTOR_DAYS=${1#*=}; DAYS_GIVEN=1; shift ;;
             --in)           need_value "$@"; ARGS+=("$2"); shift 2 ;;
             --in=*)         ARGS+=("${1#*=}"); shift ;;
             --orgs)         OPT_ORGS="true"; shift ;;
@@ -5804,7 +7351,7 @@ main() {
     COMMAND=$1
     shift
     case "$COMMAND" in
-        pull|push|commit|sync|reset|clone|status|fetch|log|exec|doctor|list|config|completion|help) ;;
+        pull|push|commit|sync|reset|tidy|clone|status|fetch|log|exec|doctor|list|config|completion|help) ;;
         *) die "$EX_USAGE" "no such command: $COMMAND (see $PROG help)" ;;
     esac
     parse_options "$@"
@@ -5822,6 +7369,7 @@ main() {
         commit)     cmd_commit ;;
         sync)       cmd_sync ;;
         reset)      cmd_reset ;;
+        tidy)       cmd_tidy ;;
         clone)      cmd_clone ;;
         log)        LOG_SINCE=$SINCE; cmd_log ;;
         exec)       cmd_exec ;;

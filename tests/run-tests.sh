@@ -169,6 +169,61 @@ operation_in_progress() {
     [ -d "$1/.git/rebase-merge" ] || [ -d "$1/.git/rebase-apply" ] || [ -f "$1/.git/MERGE_HEAD" ]
 }
 
+backups() {
+    # backups DIR -> the backup references of a repository, one per line:
+    # the commit, a space, the name
+    git -C "$1" for-each-ref --format='%(objectname) %(refname)' refs/gh-batch
+}
+
+restore_command() {
+    # restore_command -> the command that the last report gave to restore
+    printf '%s\n' "$OUTPUT" | sed -n 's/^ *to restore: //p'
+}
+
+backup_of() {
+    # backup_of DIR COMMIT -> 0 when DIR holds one backup reference, named
+    # after the branch main and the date and time, and it keeps COMMIT. The
+    # pattern is matched here, not inside a command substitution, where the
+    # bash 3.2 of macOS misreads the parenthesis of a case.
+    local list
+    list=$(backups "$1")
+    [ -n "$list" ] && [ "$(printf '%s\n' "$list" | wc -l | tr -d ' ')" = 1 ] || return 1
+    case "$list" in
+        "$2 refs/gh-batch/before-reset/main/"[0-9]*-[0-9]*) return 0 ;;
+    esac
+    return 1
+}
+
+kept_file() {
+    # kept_file DIR PATH -> what the kept folders of DIR hold at PATH, the
+    # copy that made way for the version of the server
+    local f
+    for f in "$1"/.git/gh-batch/kept/*/"$2"; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        cat "$f"
+        return 0
+    done
+    return 1
+}
+
+kept_count() {
+    # kept_count DIR -> the number of entries in the kept folders of DIR
+    local n=0 f
+    for f in "$1"/.git/gh-batch/kept/*/* "$1"/.git/gh-batch/kept/*/.[!.]*; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        n=$((n + 1))
+    done
+    printf '%s' "$n"
+}
+
+git_at_least() {
+    # git_at_least MAJOR MINOR -> 0 when the git of the machine is as new
+    local v major minor
+    v=$(git version); v=${v#git version }
+    major=${v%%.*}; v=${v#*.}; minor=${v%%.*}
+    [ "$major" -gt "$1" ] || { [ "$major" -eq "$1" ] && [ "$minor" -ge "$2" ]; }
+}
+
 # ---------------------------------------------------------------------------
 # Running the tool and reading its answer
 # ---------------------------------------------------------------------------
@@ -439,7 +494,7 @@ if describe "pull: up to date, fast-forward, ahead"; then
         "$( contains "$OUTPUT" "Add a third file" && contains "$OUTPUT" "1 updated" && contains "$OUTPUT" "1 up to date" && ! contains "$OUTPUT" "Needs you" && echo 0 || echo 1 )"
 fi
 
-if describe "pull: pending changes are kept or protect the repository"; then
+if describe "pull: pending changes are kept, or protect the repository, and files in the way make way"; then
     world
     repo apart
     repo overlap
@@ -466,11 +521,14 @@ if describe "pull: pending changes are kept or protect the repository"; then
         "$( [ "$(st apart)" = "updated" ] && [ "$(tail -n 1 "$A/apart/readme.txt")" = "my edit" ] && [ -f "$A/apart/other.txt" ] && echo 0 || echo 1 )"
     check "pull: an edit in the same file blocks, nothing changes" "got: $(st overlap) $(msg overlap)" \
         "$( [ "$(st overlap)" = "blocked" ] && [ "$(state_of "$A/overlap")" = "$s_overlap" ] && contains "$(msg overlap)" "readme.txt" && echo 0 || echo 1 )"
-    check "pull: an untracked file in the way blocks, nothing changes" "got: $(st untracked)" \
-        "$( [ "$(st untracked)" = "blocked" ] && [ "$(state_of "$A/untracked")" = "$s_untracked" ] && echo 0 || echo 1 )"
-    check "pull: an ignored file in the way is not overwritten" "got: $(st ignored), file: $(cat "$A/ignored/secret.cfg")" \
-        "$( [ "$(st ignored)" = "blocked" ] && [ "$(cat "$A/ignored/secret.cfg")" = "my secret" ] && [ "$(state_of "$A/ignored")" = "$s_ignored" ] && echo 0 || echo 1 )"
+    check "pull: an untracked file in the way makes way, and is kept" "got: $(st untracked) $(msg untracked)" \
+        "$( [ "$(st untracked)" = "updated" ] && [ "$(cat "$A/untracked/data.txt")" = "server data" ] && [ "$(kept_file "$A/untracked" data.txt)" = "my data" ] && contains "$(msg untracked)" "data.txt, which git did not track here, made way for the version of the server" && echo 0 || echo 1 )"
+    check "pull: an ignored file in the way is never overwritten: it is kept" "got: $(st ignored), file: $(cat "$A/ignored/secret.cfg"), kept: $(kept_file "$A/ignored" secret.cfg)" \
+        "$( [ "$(st ignored)" = "updated" ] && [ "$(cat "$A/ignored/secret.cfg")" = "server" ] && [ "$(kept_file "$A/ignored" secret.cfg)" = "my secret" ] && echo 0 || echo 1 )"
+    check "pull: the report says what was kept aside, and how to compare" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "${TAB}$A/ignored${TAB}" && ! contains "$OUTPUT" "Kept aside" && echo 0 || echo 1 )"
     check "pull: a blocked repository makes the exit status 1" "got rc=$RC" "$( [ "$RC" -eq 1 ] && echo 0 || echo 1 )"
+    : "$s_untracked" "$s_ignored"
 fi
 
 if describe "pull: a file deleted here, and merge commits among the new ones"; then
@@ -590,16 +648,32 @@ if describe "pull: the conditions of a safe rebase"; then
     s_dirty=$(state_of "$A/dirty"); s_merged=$(state_of "$A/merged"); s_else=$(state_of "$A/elsewhere")
     s_rewritten=$(state_of "$A/rewritten"); s_inway=$(state_of "$A/inway")
     gb pull --porcelain --diverged rebase "$A"
-    check "pull: no rebase over uncommitted changes" "got: $(st dirty) $(msg dirty)" \
-        "$( [ "$(st dirty)" = "diverged" ] && contains "$(msg dirty)" "uncommitted" && [ "$(state_of "$A/dirty")" = "$s_dirty" ] && echo 0 || echo 1 )"
+    if git_at_least 2 40; then
+        check "pull: uncommitted changes travel over the rebase" "got: $(st dirty) $(msg dirty)" \
+            "$( [ "$(st dirty)" = "rebased" ] && contains "$(msg dirty)" "your uncommitted changes were kept" && [ "$(tail -n 1 "$A/dirty/readme.txt")" = "pending" ] && [ -f "$A/dirty/server.txt" ] && [ -z "$(git -C "$A/dirty" stash list)" ] && echo 0 || echo 1 )"
+    else
+        check "pull: no rebase over uncommitted changes (git older than 2.40)" "got: $(st dirty) $(msg dirty)" \
+            "$( [ "$(st dirty)" = "diverged" ] && contains "$(msg dirty)" "uncommitted" && [ "$(state_of "$A/dirty")" = "$s_dirty" ] && echo 0 || echo 1 )"
+    fi
     check "pull: no rebase of merge commits" "got: $(st merged) $(msg merged)" \
         "$( [ "$(st merged)" = "diverged" ] && contains "$(msg merged)" "merge commits" && [ "$(state_of "$A/merged")" = "$s_merged" ] && echo 0 || echo 1 )"
     check "pull: no rebase of commits already on a server" "got: $(st elsewhere) $(msg elsewhere)" \
         "$( [ "$(st elsewhere)" = "diverged" ] && contains "$(msg elsewhere)" "already on a server" && [ "$(state_of "$A/elsewhere")" = "$s_else" ] && echo 0 || echo 1 )"
     check "pull: no rebase on a rewritten history" "got: $(st rewritten) $(msg rewritten)" \
         "$( [ "$(st rewritten)" = "diverged" ] && contains "$(msg rewritten)" "rewritten" && [ "$(state_of "$A/rewritten")" = "$s_rewritten" ] && echo 0 || echo 1 )"
-    check "pull: no rebase over an ignored file that the server added" "got: $(st inway) $(msg inway)" \
-        "$( [ "$(st inway)" = "diverged" ] && contains "$(msg inway)" "cache.dat" && [ "$(state_of "$A/inway")" = "$s_inway" ] && [ "$(cat "$A/inway/cache.dat")" = "my cache" ] && echo 0 || echo 1 )"
+    check "pull: a rebase over an ignored file that the server added keeps it aside" "got: $(st inway) $(msg inway)" \
+        "$( [ "$(st inway)" = "rebased" ] && contains "$(msg inway)" "cache.dat" && [ "$(cat "$A/inway/cache.dat")" = "server cache" ] && [ "$(kept_file "$A/inway" cache.dat)" = "my cache" ] && echo 0 || echo 1 )"
+    : "$s_inway"
+fi
+
+if describe "pull: without merge-tree, uncommitted changes still stop a rebase"; then
+    world
+    diverge dirty
+    printf 'pending\n' >> "$A/dirty/readme.txt"
+    s_dirty=$(state_of "$A/dirty")
+    GH_BATCH_HIDE=merge-tree gb pull --porcelain --diverged rebase "$A"
+    check "pull: no rebase over uncommitted changes when git cannot tell beforehand" "got: $(st dirty) $(msg dirty)" \
+        "$( [ "$(st dirty)" = "diverged" ] && contains "$(msg dirty)" "uncommitted" && [ "$(state_of "$A/dirty")" = "$s_dirty" ] && echo 0 || echo 1 )"
 fi
 
 if describe "pull: merge joins the histories or is undone"; then
@@ -612,6 +686,354 @@ if describe "pull: merge joins the histories or is undone"; then
         "$( [ "$(st split)" = "merged" ] && [ "$(git -C "$A/split" rev-list --merges --count HEAD)" = 1 ] && [ -f "$A/split/server.txt" ] && [ -f "$A/split/local.txt" ] && echo 0 || echo 1 )"
     check "pull: a conflicting merge is undone" "got: $(st fight)" \
         "$( [ "$(st fight)" = "conflict" ] && [ "$(state_of "$A/fight")" = "$before" ] && ! operation_in_progress "$A/fight" && echo 0 || echo 1 )"
+fi
+
+# --- pull: what git does not track, in the way of the server ------------------
+if describe "pull: an ignored file that the server starts to track makes way, and is kept"; then
+    # The case that made this behaviour: the other machine stops ignoring a
+    # file and commits its own version of it, while this machine holds
+    # another one, ignored.
+    world
+    server cv
+    clone_to "$A" cv
+    clone_to "$B" cv
+    printf 'CLAUDE.md\n' > "$B/cv/.gitignore"
+    git -C "$B/cv" add .gitignore
+    git -C "$B/cv" commit -q -m "Ignore the instructions"
+    publish "$B/cv"
+    git -C "$A/cv" pull -q --ff-only
+    printf 'the long version of this machine\n' > "$A/cv/CLAUDE.md"
+    printf 'the short version of the other machine\n' > "$B/cv/CLAUDE.md"
+    printf '' > "$B/cv/.gitignore"
+    git -C "$B/cv" add .gitignore CLAUDE.md
+    git -C "$B/cv" commit -q -m "A Regular Commit to Synchronise"
+    publish "$B/cv"
+    repo same
+    commit "$B/same" notes.md "the same notes" "Add the notes"
+    publish "$B/same"
+    printf 'the same notes\n' > "$A/same/notes.md"
+    gb pull "$A"
+    check "pull: the update goes through, without anything that needs you" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ "$(head_of "$A/cv")" = "$(head_of "$B/cv")" ] && ! contains "$OUTPUT" "Needs you" && echo 0 || echo 1 )"
+    check "pull: the version of the server is in place, the one of this machine kept" "file: $(cat "$A/cv/CLAUDE.md"), kept: $(kept_file "$A/cv" CLAUDE.md)" \
+        "$( [ "$(cat "$A/cv/CLAUDE.md")" = "the short version of the other machine" ] && [ "$(kept_file "$A/cv" CLAUDE.md)" = "the long version of this machine" ] && echo 0 || echo 1 )"
+    check "pull: the report names the file, the folder and how to compare" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "CLAUDE.md, which git did not track here, made way for the version of the server: this machine's copy is kept in .git/gh-batch/kept/" && contains "$OUTPUT" "to compare: git -C $A/cv diff --no-index -- .git/gh-batch/kept/" && contains "$OUTPUT" "to take it back: cp -Rp $A/cv/.git/gh-batch/kept/" && echo 0 || echo 1 )"
+    check "pull: the summary says what was kept aside" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "Kept aside: cv (CLAUDE.md)." && echo 0 || echo 1 )"
+    check "pull: an identical copy is not kept, and not mentioned" "got: $(kept_count "$A/same") $OUTPUT" \
+        "$( [ "$(cat "$A/same/notes.md")" = "the same notes" ] && [ ! -d "$A/same/.git/gh-batch" ] && ! contains "$OUTPUT" "same (" && echo 0 || echo 1 )"
+fi
+
+if describe "pull: folders, links and odd names in the way"; then
+    world
+    repo shapes
+    commit "$B/shapes" "notes/a.txt" "server a" "A file where a file of this machine is"
+    commit "$B/shapes" "link.txt" "server link" "A file where a link of this machine is"
+    commit "$B/shapes" "folder" "server folder file" "A file where a folder of this machine is"
+    commit "$B/shapes" "with space [1].txt" "server odd" "An odd name"
+    publish "$B/shapes"
+    printf 'my notes, a file\n' > "$A/shapes/notes"
+    ln -s readme.txt "$A/shapes/link.txt"
+    mkdir -p "$A/shapes/folder"
+    printf 'inside\n' > "$A/shapes/folder/inside.txt"
+    printf 'my odd\n' > "$A/shapes/with space [1].txt"
+    gb pull --porcelain "$A"
+    check "pull: a file where the server needs a folder, a link, a folder and an odd name make way" "got: $(st shapes) $(msg shapes)" \
+        "$( [ "$(st shapes)" = "updated" ] && [ "$(cat "$A/shapes/notes/a.txt")" = "server a" ] && [ "$(cat "$A/shapes/link.txt")" = "server link" ] && [ ! -L "$A/shapes/link.txt" ] && [ "$(cat "$A/shapes/folder")" = "server folder file" ] && [ "$(cat "$A/shapes/with space [1].txt")" = "server odd" ] && echo 0 || echo 1 )"
+    check "pull: each is kept as it was, the link as a link" "kept: $(kept_count "$A/shapes")" \
+        "$( [ "$(kept_file "$A/shapes" notes)" = "my notes, a file" ] && [ -L "$(printf '%s' "$A"/shapes/.git/gh-batch/kept/*/link.txt)" ] && [ "$(kept_file "$A/shapes" folder/inside.txt)" = "inside" ] && [ "$(kept_file "$A/shapes" "with space [1].txt")" = "my odd" ] && echo 0 || echo 1 )"
+    check "pull: the readme that the link pointed to is untouched" "readme: $(cat "$A/shapes/readme.txt")" \
+        "$( [ "$(cat "$A/shapes/readme.txt")" = "first line" ] && echo 0 || echo 1 )"
+fi
+
+if describe "pull: a refused update puts back what it set aside"; then
+    world
+    repo back
+    commit "$B/back" new.txt "server new" "Add a new file"
+    commit "$B/back" readme.txt "server readme" "Rewrite the readme"
+    publish "$B/back"
+    printf 'my new\n' > "$A/back/new.txt"
+    printf 'my edit\n' >> "$A/back/readme.txt"
+    before=$(state_of "$A/back")
+    gb pull --porcelain "$A"
+    check "pull: the clash with the uncommitted change blocks, and the file in the way is back" "got: $(st back) $(msg back)" \
+        "$( [ "$(st back)" = "blocked" ] && [ "$(cat "$A/back/new.txt")" = "my new" ] && [ "$(state_of "$A/back")" = "$before" ] && [ ! -d "$A/back/.git/gh-batch" ] && echo 0 || echo 1 )"
+    check "pull: the message names the clash" "got: $(msg back)" \
+        "$( contains "$(msg back)" "readme.txt" && contains "$(msg back)" "nothing was changed" && echo 0 || echo 1 )"
+fi
+
+if describe "pull: a merge never writes over an ignored file"; then
+    world
+    diverge joined
+    commit "$B/joined" cache.dat "server cache" "Add a cache file"
+    publish "$B/joined"
+    printf 'cache.dat\n' > "$A/joined/.git/info/exclude"
+    printf 'my cache\n' > "$A/joined/cache.dat"
+    gb pull --porcelain --diverged merge "$A"
+    check "pull: the merge goes through, the ignored file kept aside" "got: $(st joined) $(msg joined)" \
+        "$( [ "$(st joined)" = "merged" ] && [ "$(cat "$A/joined/cache.dat")" = "server cache" ] && [ "$(kept_file "$A/joined" cache.dat)" = "my cache" ] && echo 0 || echo 1 )"
+fi
+
+if describe "fetch: says which files pull would set aside"; then
+    world
+    repo look
+    commit "$B/look" data.txt "server data" "Add data"
+    publish "$B/look"
+    printf 'my data\n' > "$A/look/data.txt"
+    remember look
+    gb fetch --porcelain "$A"
+    check "fetch: the file in the way is named, and nothing moves" "got: $(st look) $(msg look)" \
+        "$( [ "$(st look)" = "behind" ] && contains "$(msg look)" "data.txt, which git does not track here, would make way for the version of the server and be kept" && untouched look && [ ! -d "$A/look/.git/gh-batch" ] && echo 0 || echo 1 )"
+fi
+
+if describe "pull: a marker left by a run cut short gives its notes"; then
+    world
+    repo calm
+    mkdir -p "$GH_BATCH_STATE_DIR"
+    printf '%s\nwhat it set aside is in %s\n' "$A/calm" "$A/calm/.git/gh-batch/kept/20200101-000000" > "$GH_BATCH_STATE_DIR/inflight.999999.0"
+    gb pull "$A"
+    check "pull: the warning names the repository and where its files are" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "cut short while it updated $A/calm" && contains "$OUTPUT" "what it set aside is in $A/calm/.git/gh-batch/kept/20200101-000000" && echo 0 || echo 1 )"
+fi
+
+# --- pull: the version of the server first -----------------------------------------
+if describe "pull: --conflicts server replays, the server winning the lines both changed"; then
+    world
+    clash fight
+    commit "$A/fight" local.txt "local" "Local work beside"
+    old=$(head_of "$A/fight")
+    gb pull --diverged rebase --conflicts server "$A"
+    check "pull: the replay goes through, linear, with the clean local work" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "rebased" && [ "$(git -C "$A/fight" rev-list --merges --count HEAD)" = 0 ] && [ -f "$A/fight/local.txt" ] && ! operation_in_progress "$A/fight" && echo 0 || echo 1 )"
+    check "pull: the line of the server won, this machine's version is kept" "readme: $(cat "$A/fight/readme.txt"), kept: $(kept_file "$A/fight" readme.txt)" \
+        "$( [ "$(cat "$A/fight/readme.txt")" = "server line" ] && [ "$(kept_file "$A/fight" readme.txt)" = "local line" ] && echo 0 || echo 1 )"
+    check "pull: the report says where the server won and where the commit is kept" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "the version of the server taken where both sides changed the same lines (readme.txt)" && contains "$OUTPUT" "refs/gh-batch/before-pull/main/" && contains "$OUTPUT" "left empty by the version of the server and dropped" && contains "$OUTPUT" "Kept aside: fight" && echo 0 || echo 1 )"
+    check "pull: one backup, under before-pull, keeps the commit of before" "refs: $(backups "$A/fight")" \
+        "$( [ "$(backups "$A/fight" | wc -l | tr -d ' ')" = 1 ] && contains "$(backups "$A/fight")" "$old refs/gh-batch/before-pull/main/" && echo 0 || echo 1 )"
+    restore=$(restore_command)
+    eval "$restore" >/dev/null 2>&1
+    check "pull: the printed command restores the branch and its files" "restore: $restore" \
+        "$( [ "$(head_of "$A/fight")" = "$old" ] && [ "$(cat "$A/fight/readme.txt")" = "local line" ] && echo 0 || echo 1 )"
+fi
+
+if describe "pull: --conflicts server with a merge, a binary file and two new files of one name"; then
+    world
+    clash joined
+    repo pdf
+    printf 'pdf\000base\n' > "$B/pdf/cv.pdf"
+    git -C "$B/pdf" add cv.pdf
+    git -C "$B/pdf" commit -q -m "Add the PDF"
+    publish "$B/pdf"
+    git -C "$A/pdf" pull -q --ff-only
+    printf 'pdf\000server\n' > "$B/pdf/cv.pdf"
+    git -C "$B/pdf" commit -q -am "Rebuild the PDF there"
+    commit "$B/pdf" notes.md "server notes" "Notes there"
+    publish "$B/pdf"
+    printf 'pdf\000local\n' > "$A/pdf/cv.pdf"
+    git -C "$A/pdf" commit -q -am "Rebuild the PDF here"
+    commit "$A/pdf" notes.md "local notes" "Notes here"
+    commit "$A/pdf" mine.txt "mine" "Work of this machine"
+    gb pull --porcelain --diverged merge --conflicts server --only joined "$A"
+    check "pull: a merge takes the line of the server" "got: $(st joined) $(msg joined)" \
+        "$( [ "$(st joined)" = "merged" ] && [ "$(cat "$A/joined/readme.txt")" = "server line" ] && [ "$(git -C "$A/joined" rev-list --merges --count HEAD)" = 1 ] && echo 0 || echo 1 )"
+    gb pull --porcelain --diverged rebase --conflicts server --only pdf "$A"
+    check "pull: a PDF rebuilt on both sides and a file added on both take the server's version" "got: $(st pdf) $(msg pdf)" \
+        "$( [ "$(st pdf)" = "rebased" ] && [ "$(tr -d '\000' < "$A/pdf/cv.pdf")" = "pdfserver" ] && [ "$(cat "$A/pdf/notes.md")" = "server notes" ] && [ "$(cat "$A/pdf/mine.txt")" = "mine" ] && echo 0 || echo 1 )"
+    check "pull: this machine's PDF and notes are kept" "kept notes: $(kept_file "$A/pdf" notes.md)" \
+        "$( [ "$(kept_file "$A/pdf" notes.md)" = "local notes" ] && [ "$(kept_file "$A/pdf" cv.pdf | tr -d '\000')" = "pdflocal" ] && echo 0 || echo 1 )"
+fi
+
+if describe "pull: what the version of the server cannot settle is undone"; then
+    world
+    repo gone
+    git -C "$B/gone" rm -q readme.txt
+    git -C "$B/gone" commit -q -m "Remove the readme"
+    publish "$B/gone"
+    commit "$A/gone" readme.txt "local edit" "Edit the readme"
+    before=$(state_of "$A/gone")
+    gb pull --porcelain --diverged rebase --conflicts server "$A"
+    check "pull: a file deleted there and changed here stays a conflict, nothing changes" "got: $(st gone) $(msg gone)" \
+        "$( [ "$(st gone)" = "conflict" ] && contains "$(msg gone)" "even with the version of the server first" && [ "$(state_of "$A/gone")" = "$before" ] && ! operation_in_progress "$A/gone" && echo 0 || echo 1 )"
+    check "pull: no backup and no kept file are left behind" "refs: $(backups "$A/gone")" \
+        "$( [ -z "$(backups "$A/gone")" ] && [ ! -d "$A/gone/.git/gh-batch" ] && echo 0 || echo 1 )"
+fi
+
+if describe "pull: the setting gh-batch.conflicts, the environment, and a bad value"; then
+    world
+    clash fight
+    gb pull --conflicts nobody "$A"
+    check "pull: a bad value is a bad invocation" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 2 ] && contains "$OUTPUT" "report and server" && echo 0 || echo 1 )"
+    gb fetch --porcelain --diverged rebase --conflicts server "$A"
+    check "fetch: says that the server would win the lines both changed" "got: $(msg fight)" \
+        "$( contains "$(msg fight)" "pull will try a rebase, the version of the server taken where both sides changed the same lines" && echo 0 || echo 1 )"
+    git config --global gh-batch.diverged rebase
+    git config --global gh-batch.conflicts server
+    gb config
+    check "config: the setting and its source" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "conflicts" && contains "$OUTPUT" "server" && echo 0 || echo 1 )"
+    GH_BATCH_CONFLICTS=report gb pull --porcelain "$A"
+    check "pull: the environment wins over the setting" "got: $(st fight)" \
+        "$( [ "$(st fight)" = "conflict" ] && echo 0 || echo 1 )"
+    gb pull --porcelain "$A"
+    check "pull: the setting is read" "got: $(st fight) $(msg fight)" \
+        "$( [ "$(st fight)" = "rebased" ] && [ "$(cat "$A/fight/readme.txt")" = "server line" ] && echo 0 || echo 1 )"
+fi
+
+if describe "push: the commits of the server are taken with their version first"; then
+    world
+    clash fight
+    commit "$A/fight" more.txt "more" "More local work"
+    clash empty
+    gb push --yes --porcelain --diverged rebase --conflicts server "$A"
+    check "push: pushed after a replay where the server won, and the server has it" "got: $(st fight) $(msg fight)" \
+        "$( [ "$(st fight)" = "pushed" ] && contains "$(msg fight)" "the version of the server taken where both sides changed the same lines" && [ "$(git --git-dir="$SRV/fight.git" rev-parse main)" = "$(head_of "$A/fight")" ] && [ -f "$A/fight/more.txt" ] && echo 0 || echo 1 )"
+    check "push: a commit left empty by the server leaves nothing to push, and says so" "got: $(st empty) $(msg empty)" \
+        "$( [ "$(st empty)" = "rebased" ] && contains "$(msg empty)" "nothing is left to push" && [ "$(head_of "$A/empty")" = "$(git --git-dir="$SRV/empty.git" rev-parse main)" ] && echo 0 || echo 1 )"
+fi
+
+# --- pull: uncommitted changes carried over -------------------------------------------
+lines20() {
+    # lines20 DIR: a readme of twenty lines on the server and in both clones
+    local i=1
+    : > "$B/$1/readme.txt"
+    while [ "$i" -le 20 ]; do
+        printf 'line %s\n' "$i" >> "$B/$1/readme.txt"
+        i=$((i + 1))
+    done
+    git -C "$B/$1" commit -q -am "Twenty lines"
+    publish "$B/$1"
+    git -C "$A/$1" pull -q --ff-only
+}
+
+if describe "pull: uncommitted changes travel over a fast-forward"; then
+    world
+    if git_at_least 2 40; then
+        for r in far staged near clash user; do
+            repo "$r"
+            lines20 "$r"
+        done
+        for r in far staged near clash user; do
+            sed 's/^line 2$/server line 2/' "$B/$r/readme.txt" > "$B/$r/x" && mv "$B/$r/x" "$B/$r/readme.txt"
+            git -C "$B/$r" commit -q -am "The server changes line 2"
+            publish "$B/$r"
+        done
+        sed 's/^line 18$/my line 18/' "$A/far/readme.txt" > "$A/far/x" && mv "$A/far/x" "$A/far/readme.txt"
+        sed 's/^line 18$/my staged line 18/' "$A/staged/readme.txt" > "$A/staged/x" && mv "$A/staged/x" "$A/staged/readme.txt"
+        git -C "$A/staged" add readme.txt
+        sed 's/^line 4$/my staged line 4/' "$A/near/readme.txt" > "$A/near/x" && mv "$A/near/x" "$A/near/readme.txt"
+        git -C "$A/near" add readme.txt
+        sed 's/^line 2$/my line 2/' "$A/clash/readme.txt" > "$A/clash/x" && mv "$A/clash/x" "$A/clash/readme.txt"
+        printf 'a stash of mine\n' > "$A/user/other.txt"
+        git -C "$A/user" add other.txt
+        git -C "$A/user" stash push -q -m "mine"
+        sed 's/^line 18$/my line 18/' "$A/user/readme.txt" > "$A/user/x" && mv "$A/user/x" "$A/user/readme.txt"
+        s_clash=$(state_of "$A/clash")
+        gb pull --porcelain "$A"
+        check "pull: an edit at another line of a file the server changed is carried over" "got: $(st far) $(msg far)" \
+            "$( [ "$(st far)" = "updated" ] && contains "$(msg far)" "your uncommitted changes were kept, merged with the new version of readme.txt" && [ "$(sed -n 2p "$A/far/readme.txt")" = "server line 2" ] && [ "$(sed -n 18p "$A/far/readme.txt")" = "my line 18" ] && [ -z "$(git -C "$A/far" stash list)" ] && echo 0 || echo 1 )"
+        check "pull: a staged change far from the server's stays staged" "status: $(git -C "$A/staged" status --porcelain)" \
+            "$( [ "$(st staged)" = "updated" ] && [ "$(git -C "$A/staged" status --porcelain)" = "M  readme.txt" ] && echo 0 || echo 1 )"
+        check "pull: a staged change close to the server's comes back unstaged" "got: $(msg near); status: $(git -C "$A/near" status --porcelain)" \
+            "$( [ "$(st near)" = "updated" ] && contains "$(msg near)" "no longer staged" && [ "$(git -C "$A/near" status --porcelain)" = " M readme.txt" ] && [ "$(sed -n 4p "$A/near/readme.txt")" = "my staged line 4" ] && echo 0 || echo 1 )"
+        check "pull: an edit of the same line blocks, nothing changes" "got: $(st clash) $(msg clash)" \
+            "$( [ "$(st clash)" = "blocked" ] && contains "$(msg clash)" "touch the same lines, in readme.txt" && [ "$(state_of "$A/clash")" = "$s_clash" ] && echo 0 || echo 1 )"
+        check "pull: a stash of the user is left as it was" "stashes: $(git -C "$A/user" stash list)" \
+            "$( [ "$(st user)" = "updated" ] && [ "$(git -C "$A/user" stash list | wc -l | tr -d ' ')" = 1 ] && contains "$(git -C "$A/user" stash list)" "mine" && [ "$(sed -n 18p "$A/user/readme.txt")" = "my line 18" ] && echo 0 || echo 1 )"
+        gb pull --porcelain --conflicts server --only clash "$A"
+        check "pull: with the server first, the edit of the same line waits in the stash" "got: $(st clash) $(msg clash) rc=$RC" \
+            "$( [ "$(st clash)" = "updated" ] && [ "$RC" -eq 1 ] && contains "$(msg clash)" "wait in the stash" && [ "$(sed -n 2p "$A/clash/readme.txt")" = "server line 2" ] && contains "$(git -C "$A/clash" stash list)" "gh-batch" && echo 0 || echo 1 )"
+        git -C "$A/clash" stash pop -q >/dev/null 2>&1
+        check "pull: the stash holds the edit" "readme: $(grep -c 'my line 2' "$A/clash/readme.txt")" \
+            "$( grep -q 'my line 2' "$A/clash/readme.txt" && echo 0 || echo 1 )"
+    else
+        ok "pull: uncommitted changes travel over a fast-forward (skipped: git older than 2.40)"
+    fi
+fi
+
+if describe "pull: changes that a stash would lose are never stashed"; then
+    world
+    if git_at_least 2 40; then
+        for r in added untracked; do
+            repo "$r"
+            commit "$B/$r" readme.txt "server version" "The server rewrites the readme"
+            publish "$B/$r"
+        done
+        printf 'new\n' > "$A/added/new.txt"
+        git -C "$A/added" add -N new.txt
+        printf 'my edit\n' >> "$A/added/readme.txt"
+        git -C "$A/untracked" rm -q --cached readme.txt
+        printf 'kept on the disk\n' >> "$A/untracked/readme.txt"
+        s_added=$(state_of "$A/added"); s_untracked=$(state_of "$A/untracked")
+        gb pull --porcelain "$A"
+        check "pull: a file added with --intent-to-add keeps today's answer" "got: $(st added) $(msg added)" \
+            "$( [ "$(st added)" = "blocked" ] && [ "$(state_of "$A/added")" = "$s_added" ] && echo 0 || echo 1 )"
+        check "pull: a file that git stopped tracking keeps today's answer, and its content" "got: $(st untracked) $(msg untracked)" \
+            "$( [ "$(st untracked)" = "blocked" ] && [ "$(state_of "$A/untracked")" = "$s_untracked" ] && [ "$(tail -n 1 "$A/untracked/readme.txt")" = "kept on the disk" ] && echo 0 || echo 1 )"
+    else
+        ok "pull: changes that a stash would lose are never stashed (skipped: git older than 2.40)"
+    fi
+fi
+
+# --- pull: a rewritten history, and the other branches ----------------------------
+if describe "pull: a rewritten history is followed when nothing here is new"; then
+    world
+    repo rewritten
+    commit "$B/rewritten" a.txt "a" "Server commit that will vanish"
+    publish "$B/rewritten"
+    git -C "$A/rewritten" pull -q --ff-only
+    git -C "$B/rewritten" reset -q --keep HEAD~1
+    commit "$B/rewritten" b.txt "b" "Server commit after the rewrite"
+    git -C "$B/rewritten" push -q --force-with-lease origin HEAD
+    old=$(head_of "$A/rewritten")
+    gb fetch --porcelain --diverged rebase "$A"
+    check "fetch: says that pull will take the new history" "got: $(msg rewritten)" \
+        "$( contains "$(msg rewritten)" "pull will take the new history, the old one kept under refs/gh-batch" && [ "$(head_of "$A/rewritten")" = "$old" ] && echo 0 || echo 1 )"
+    gb pull --porcelain --diverged rebase "$A"
+    check "pull: the branch takes the new history, the old commit kept" "got: $(st rewritten) $(msg rewritten)" \
+        "$( [ "$(st rewritten)" = "reset" ] && contains "$(msg rewritten)" "the history of the server was rewritten; this clone held only its old commits (1)" && [ "$(head_of "$A/rewritten")" = "$(head_of "$B/rewritten")" ] && [ ! -e "$A/rewritten/a.txt" ] && contains "$(backups "$A/rewritten")" "$old refs/gh-batch/before-pull/main/" && echo 0 || echo 1 )"
+    gb pull --porcelain "$A"
+    check "pull: afterwards the clone is level with the server" "got: $(st rewritten)" \
+        "$( [ "$(st rewritten)" = "uptodate" ] && echo 0 || echo 1 )"
+fi
+
+if describe "pull: the other branches that only lack commits of the server move forward"; then
+    world
+    repo branches
+    git -C "$B/branches" checkout -q -b side
+    commit "$B/branches" side.txt "side" "Side work"
+    git -C "$B/branches" push -q -u origin side
+    git -C "$A/branches" fetch -q
+    git -C "$A/branches" branch -q --track side origin/side
+    git -C "$A/branches" checkout -q -b busy origin/side
+    git -C "$A/branches" checkout -q -b bookmark origin/main
+    git -C "$A/branches" checkout -q main
+    git -C "$A/branches" branch -q -u origin/side busy
+    git -C "$A/branches" worktree add -q "$WORLD/busy" busy
+    git -C "$B/branches" checkout -q main
+    commit "$B/branches" news.txt "news" "News on main"
+    git -C "$B/branches" push -q origin main
+    git -C "$A/branches" pull -q --ff-only
+    git -C "$A/branches" branch -q -f bookmark HEAD~1
+    git -C "$A/branches" branch -q -u origin/main bookmark
+    git -C "$B/branches" checkout -q side
+    commit "$B/branches" more.txt "more" "More side work"
+    git -C "$B/branches" push -q origin side
+    side_before=$(git -C "$A/branches" rev-parse side)
+    busy_before=$(git -C "$A/branches" rev-parse busy)
+    bookmark_before=$(git -C "$A/branches" rev-parse bookmark)
+    gb fetch --porcelain "$A"
+    check "fetch: says which branch pull would move" "got: $(st branches) $(msg branches)" \
+        "$( [ "$(st branches)" = "behind" ] && contains "$(msg branches)" "the branch side lacks 1 new commit of the server: pull will move it forward" && [ "$(git -C "$A/branches" rev-parse side)" = "$side_before" ] && echo 0 || echo 1 )"
+    gb pull --porcelain "$A"
+    check "pull: the branch moves forward, the one of a worktree stays" "got: $(st branches) $(msg branches)" \
+        "$( [ "$(st branches)" = "updated" ] && contains "$(msg branches)" "the branch side also moved forward: 1 new commit" && [ "$(git -C "$A/branches" rev-parse side)" = "$(git -C "$B/branches" rev-parse side)" ] && [ "$(git -C "$A/branches" rev-parse busy)" = "$busy_before" ] && echo 0 || echo 1 )"
+    check "pull: the move is in the journal" "journal: $(cat "$GH_BATCH_STATE_DIR/journal.tsv" 2>/dev/null)" \
+        "$( contains "$(cat "$GH_BATCH_STATE_DIR/journal.tsv" 2>/dev/null)" "fast-forward:side" && echo 0 || echo 1 )"
+    check "pull: a bookmark that follows main under another name stays where it is" "bookmark: $(git -C "$A/branches" rev-parse bookmark) before: $bookmark_before" \
+        "$( [ "$(git -C "$A/branches" rev-parse bookmark)" = "$bookmark_before" ] && ! contains "$(msg branches)" "bookmark" && echo 0 || echo 1 )"
 fi
 
 # --- pull: states that are reported and left alone ---------------------------
@@ -1369,31 +1791,6 @@ if describe "sync: pull, then push"; then
 fi
 
 # --- reset ----------------------------------------------------------------------------
-backups() {
-    # backups DIR -> the backup references of a repository, one per line:
-    # the commit, a space, the name
-    git -C "$1" for-each-ref --format='%(objectname) %(refname)' refs/gh-batch
-}
-
-restore_command() {
-    # restore_command -> the command that the last report gave to restore
-    printf '%s\n' "$OUTPUT" | sed -n 's/^ *to restore: //p'
-}
-
-backup_of() {
-    # backup_of DIR COMMIT -> 0 when DIR holds one backup reference, named
-    # after the branch main and the date and time, and it keeps COMMIT. The
-    # pattern is matched here, not inside a command substitution, where the
-    # bash 3.2 of macOS misreads the parenthesis of a case.
-    local list
-    list=$(backups "$1")
-    [ -n "$list" ] && [ "$(printf '%s\n' "$list" | wc -l | tr -d ' ')" = 1 ] || return 1
-    case "$list" in
-        "$2 refs/gh-batch/before-reset/main/"[0-9]*-[0-9]*) return 0 ;;
-    esac
-    return 1
-}
-
 if describe "reset: level, behind, and commits here that the server lacks"; then
     world
     repo same
@@ -1506,7 +1903,7 @@ if describe "reset: what is left alone, and the files that git does not track"; 
     git -C "$A/detached" checkout -q --detach
     printf 'keep\n' > "$A/untracked/keep.txt"
     printf 'my news\n' > "$A/inway/news.txt"
-    remember edited staged nobranch detached inway
+    remember edited staged nobranch detached
     gb reset --porcelain "$A"
     check "reset: uncommitted changes, staged or not, leave a repository alone" "got: $(st edited) $(msg edited); $(st staged)" \
         "$( [ "$(st edited)" = "pending" ] && [ "$(st staged)" = "pending" ] && contains "$(msg edited)" "1 new commit on the server, and uncommitted changes to tracked files: left to you" && untouched edited staged && echo 0 || echo 1 )"
@@ -1514,8 +1911,8 @@ if describe "reset: what is left alone, and the files that git does not track"; 
         "$( [ "$(st nobranch)" = "noupstream" ] && [ "$(st detached)" = "detached" ] && untouched nobranch detached && echo 0 || echo 1 )"
     check "reset: untracked files are kept through the move" "got: $(st untracked) $(msg untracked)" \
         "$( [ "$(st untracked)" = "updated" ] && [ "$(cat "$A/untracked/keep.txt")" = "keep" ] && [ -f "$A/untracked/news.txt" ] && echo 0 || echo 1 )"
-    check "reset: an untracked file in the way stops the move, and no backup stays" "got: $(st inway) $(msg inway); refs: $(backups "$A/inway")" \
-        "$( [ "$(st inway)" = "blocked" ] && contains "$(msg inway)" "news.txt" && [ "$(cat "$A/inway/news.txt")" = "my news" ] && untouched inway && [ -z "$(backups "$A/inway")" ] && echo 0 || echo 1 )"
+    check "reset: an untracked file in the way makes way, and is kept" "got: $(st inway) $(msg inway); refs: $(backups "$A/inway")" \
+        "$( [ "$(st inway)" = "updated" ] && contains "$(msg inway)" "news.txt" && [ "$(cat "$A/inway/news.txt")" = "news" ] && [ "$(kept_file "$A/inway" news.txt)" = "my news" ] && [ -n "$(backups "$A/inway")" ] && echo 0 || echo 1 )"
     check "reset: no backup where nothing moved, and the exit status is 1" "got rc=$RC" \
         "$( [ "$RC" -eq 1 ] && [ -z "$(backups "$A/edited")$(backups "$A/staged")$(backups "$A/nobranch")$(backups "$A/detached")" ] && echo 0 || echo 1 )"
     repo ignored
@@ -1524,10 +1921,9 @@ if describe "reset: what is left alone, and the files that git does not track"; 
     publish "$B/ignored"
     printf 'cache.dat\n' > "$A/ignored/.git/info/exclude"
     printf 'my cache\n' > "$A/ignored/cache.dat"
-    remember ignored
     gb reset --discard-local --yes --porcelain --only ignored "$A"
-    check "reset --discard-local: an ignored file in the way is not overwritten, nothing changes" "got: $(st ignored) $(msg ignored)" \
-        "$( [ "$(st ignored)" = "blocked" ] && contains "$(msg ignored)" "cache.dat" && [ "$(cat "$A/ignored/cache.dat")" = "my cache" ] && untouched ignored && [ -z "$(backups "$A/ignored")" ] && echo 0 || echo 1 )"
+    check "reset --discard-local: an ignored file in the way is never overwritten: it is kept" "got: $(st ignored) $(msg ignored)" \
+        "$( [ "$(st ignored)" = "reset" ] && contains "$(msg ignored)" "cache.dat" && [ "$(cat "$A/ignored/cache.dat")" = "server cache" ] && [ "$(kept_file "$A/ignored" cache.dat)" = "my cache" ] && [ -n "$(backups "$A/ignored")" ] && echo 0 || echo 1 )"
 fi
 
 if describe "reset --dry-run: look, change nothing"; then
@@ -2214,6 +2610,68 @@ if describe "doctor: what GitHub says of the remotes"; then
     gb doctor --offline "$A"
     check "doctor --offline: GitHub is not asked" "calls: $(cat "$GH_STUB_DIR/calls")" \
         "$( [ ! -s "$GH_STUB_DIR/calls" ] && [ "$RC" -eq 0 ] && echo 0 || echo 1 )"
+fi
+
+# --- forks: the gap with the original ------------------------------------------------
+if describe "fetch, status and doctor: how far a fork stands from its original"; then
+    world
+    repo proj
+    repo level
+    as_github proj
+    as_github level
+    mkdir -p "$GH_STUB_DIR/forks" "$GH_STUB_DIR/compare/Up" "$GH_STUB_DIR/compare/Other" "$GH_STUB_DIR/base/Up" "$GH_STUB_DIR/base/Other" "$GH_STUB_DIR/repos/owner"
+    printf 'owner/proj\037Up/proj\nowner/level\037Other/level\n' > "$GH_STUB_DIR/forks/owner"
+    printf 'main\n' > "$GH_STUB_DIR/base/Up/proj"
+    printf 'main\n' > "$GH_STUB_DIR/base/Other/level"
+    printf '2\0373\n' > "$GH_STUB_DIR/compare/Up/proj"
+    printf '0\0370\n' > "$GH_STUB_DIR/compare/Other/level"
+    gb fetch "$A"
+    check "fetch: the section Forks names both gaps and the command that offers the commits" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "Forks:" && contains "$OUTPUT" "proj: the original Up/proj has 3 commits that this fork lacks, and this fork has 2 that the original lacks; to offer them: gh pr create --repo Up/proj --head owner:main" && ! contains "$OUTPUT" "level: " && echo 0 || echo 1 )"
+    check "fetch: GitHub was asked once for the forks of the owner" "calls: $(cat "$GH_STUB_DIR/calls")" \
+        "$( [ "$(grep -c 'repo list owner --fork' "$GH_STUB_DIR/calls")" = 1 ] && echo 0 || echo 1 )"
+    : > "$GH_STUB_DIR/calls"
+    gb status "$A"
+    check "status: the forks as fetch last saw them, without asking GitHub" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "Forks, as fetch or doctor last saw them:" && contains "$OUTPUT" "proj: the original Up/proj has 3 commits that this fork lacks" && contains "$OUTPUT" "(seen on " && [ ! -s "$GH_STUB_DIR/calls" ] && echo 0 || echo 1 )"
+    printf 'owner/proj\037false\037Up/proj\037main\n' > "$GH_STUB_DIR/repos/owner/proj"
+    printf 'owner/level\037false\n' > "$GH_STUB_DIR/repos/owner/level"
+    printf '1\0370\n' > "$GH_STUB_DIR/compare/Up/proj"
+    gb doctor "$A"
+    check "doctor: the fork is compared with its original" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "Forks:" && contains "$OUTPUT" "proj: this fork has 1 commit that its original Up/proj lacks; to offer it: gh pr create --repo Up/proj --head owner:main" && echo 0 || echo 1 )"
+    gb fetch --offline "$A"
+    check "fetch --offline: nothing is said of the forks" "got: $OUTPUT" \
+        "$( ! contains "$OUTPUT" "Forks:" && echo 0 || echo 1 )"
+fi
+
+# --- tidy: the backups and the kept files of past runs ------------------------------
+if describe "tidy: what is older than a month goes, after one confirmation"; then
+    world
+    repo old
+    git -C "$A/old" update-ref refs/gh-batch/before-pull/main/20200101-120000 HEAD
+    git -C "$A/old" update-ref refs/gh-batch/before-reset/main/20200102-120000 HEAD
+    mkdir -p "$A/old/.git/gh-batch/kept/20200101-120000"
+    printf 'old copy\n' > "$A/old/.git/gh-batch/kept/20200101-120000/notes.txt"
+    today=$(date '+%Y%m%d')
+    git -C "$A/old" update-ref "refs/gh-batch/before-pull/main/$today-120000" HEAD
+    mkdir -p "$A/old/.git/gh-batch/kept/$today-120000"
+    printf 'recent copy\n' > "$A/old/.git/gh-batch/kept/$today-120000/notes.txt"
+    gb doctor --offline "$A"
+    check "doctor: the backups and kept files are listed, with the oldest" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "3 backups and 2 folders of kept files that gh-batch keeps here, the oldest from 1 January 2020" && contains "$OUTPUT" "gh-batch tidy removes those older than a month" && echo 0 || echo 1 )"
+    gb tidy --dry-run "$A"
+    check "tidy --dry-run: the old ones are listed, nothing goes" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "remove 2 backups and 1 folder of kept files, the oldest from 1 January 2020" && contains "$OUTPUT" "before-pull/main/20200101-120000" && contains "$OUTPUT" "Nothing was changed (dry run)." && [ "$(backups "$A/old" | wc -l | tr -d ' ')" = 3 ] && [ -d "$A/old/.git/gh-batch/kept/20200101-120000" ] && echo 0 || echo 1 )"
+    gb tidy "$A" < /dev/null
+    check "tidy: without a terminal, the run needs --yes" "got rc=$RC" \
+        "$( [ "$RC" -eq 2 ] && [ "$(backups "$A/old" | wc -l | tr -d ' ')" = 3 ] && echo 0 || echo 1 )"
+    gb tidy --yes "$A"
+    check "tidy --yes: the old ones go, the recent ones stay" "got: $OUTPUT; refs: $(backups "$A/old")" \
+        "$( contains "$OUTPUT" "removed 2 backups and 1 folder of kept files" && [ "$(backups "$A/old" | wc -l | tr -d ' ')" = 1 ] && contains "$(backups "$A/old")" "before-pull/main/$today-120000" && [ ! -d "$A/old/.git/gh-batch/kept/20200101-120000" ] && [ "$(cat "$A/old/.git/gh-batch/kept/$today-120000/notes.txt")" = "recent copy" ] && echo 0 || echo 1 )"
+    gb tidy --yes --days 0 "$A"
+    check "tidy --days 0: everything that the tool kept goes" "refs: $(backups "$A/old")" \
+        "$( [ -z "$(backups "$A/old")" ] && [ ! -d "$A/old/.git/gh-batch" ] && echo 0 || echo 1 )"
 fi
 
 # --- completion and help ---------------------------------------------------------------

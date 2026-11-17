@@ -10,6 +10,10 @@
 #   repos/OWNER/NAME   the line answered by "gh api repos/OWNER/NAME"
 #   names/OWNER/NAME   its present name, answered when only .full_name is asked
 #   list/OWNER         the lines answered by "gh repo list OWNER"
+#   forks/OWNER        the lines answered by "gh repo list OWNER --fork"
+#   compare/OWNER/NAME the line answered by "gh api repos/OWNER/NAME/compare/..."
+#   base/OWNER/NAME    the default branch, answered by "gh api repos/OWNER/NAME
+#                      --jq .default_branch"
 #   orgs               the organisations of the account, one login per line
 #   orgs.refused       when present, GitHub refuses to list them, in these words
 #   titles/LOGIN       the name that the organisation LOGIN shows
@@ -38,10 +42,21 @@ case "$1 $2" in
         [ -f "$dir/titles/${2#orgs/}" ] && cat "$dir/titles/${2#orgs/}"
         exit 0
         ;;
+    "api repos/"*/compare/*)
+        what=${2#repos/}
+        what=${what%%/compare/*}
+        if [ -f "$dir/compare/$what" ]; then
+            cat "$dir/compare/$what"
+        else
+            echo "gh: Not Found (HTTP 404)" >&2
+            exit 1
+        fi
+        ;;
     "api repos/"*)
         kind=repos
         for arg in "$@"; do
             [ "$arg" = ".full_name" ] && kind=names
+            [ "$arg" = ".default_branch" ] && kind=base
         done
         if [ -f "$dir/$kind/${2#repos/}" ]; then
             cat "$dir/$kind/${2#repos/}"
@@ -55,6 +70,14 @@ case "$1 $2" in
         case "$owner" in
             ""|-*) owner=$(cat "$dir/user" 2>/dev/null) ;;
         esac
+        kind=list
+        for arg in "$@"; do
+            [ "$arg" = "--fork" ] && kind=forks
+        done
+        if [ "$kind" = "forks" ]; then
+            [ -f "$dir/forks/$owner" ] && cat "$dir/forks/$owner"
+            exit 0
+        fi
         if [ -f "$dir/list/$owner" ]; then
             cat "$dir/list/$owner"
         else
