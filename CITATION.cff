@@ -10,8 +10,8 @@ authors:
     orcid: "https://orcid.org/0000-0001-5247-2788"
 repository-code: "https://github.com/dutykh/gh-batch"
 license: LGPL-2.1-or-later
-version: 1.5.0
-date-released: "2026-11-17"
+version: 1.6.0
+date-released: "2026-11-24"
 keywords:
   - bash
   - git
@@ -23,8 +23,9 @@ keywords:
   - shell
 abstract: >-
   Bash program, also an extension of the GitHub CLI, that pulls, commits, pushes, resets and clones
-  every git repository under a folder, several at a time, with one line of report for each repository
-  that changed or needs attention. It never forces a push and never loses work: a conflict is undone
+  every git repository under a folder, or those named from any folder, several at a time and several
+  commands on one line, with one line of report for each repository that changed or needs attention.
+  It never forces a push and never loses work: a conflict is undone
   at once, or settled with the version of the server first if asked, a file in the way of the server
   is moved aside and kept, nothing is committed unless asked for, a push waits for one confirmation,
   and a reset keeps the previous commit under a reference of its own.

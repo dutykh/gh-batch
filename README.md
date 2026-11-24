@@ -2,7 +2,7 @@
 
 # gh-batch
 
-Whoever keeps their work in many git repositories, on more than one machine, repeats the same gestures every day: in the morning each project must be brought up to date, in the evening each one must be pushed, and a project created on one machine must be cloned on the others. The tool `gh-batch` does this for a whole folder of repositories with one command. It goes over the folders, finds the git repositories, handles several of them at a time, and prints one line for each repository that changed or that needs you.
+Whoever keeps their work in many git repositories, on more than one machine, repeats the same gestures every day: in the morning each project must be brought up to date, in the evening each one must be pushed, and a project created on one machine must be cloned on the others. The tool `gh-batch` does this for a whole folder of repositories with one command. It goes over the folders, finds the git repositories, handles several of them at a time, and prints one line for each repository that changed or that needs you. A few repositories can also be named, from any folder, and several commands can share one line: `gh-batch pull commit push thesis notes` brings those two up to date, commits what is pending in them and pushes.
 
 It is careful by construction. A conflict is never left inside a repository: the attempt is undone, the repository is exactly as it was, and you are told which files conflict; or, if you choose so, the version of the server wins the lines that both sides changed, and yours is kept beside it. A file of yours is never lost: one that stands where the server puts a file is moved aside, whole, and named in the report. A push is never forced. Nothing is committed unless you asked for it, and before the evening run commits or pushes anything it shows the full list and waits for one confirmation.
 
@@ -148,7 +148,7 @@ git config --global gh-batch.root ~/workspace
 gh-batch status
 ```
 
-Without that setting, every command works on the folders named on its command line, or on the current folder.
+Without that setting, every command works on the folders named on its command line, or on the current folder, where it also looks up the names of repositories.
 
 ## The commands
 
@@ -170,7 +170,24 @@ Without that setting, every command works on the folders named on its command li
 | `completion` | Print the completion script for bash or zsh. |
 | `help` | Print the help of one command: `gh-batch help push`. |
 
-Every command takes folders as arguments. A folder is searched for repositories three levels deep (`--depth N` changes that); a folder that holds `.git` is a repository and is not searched further, so a repository nested inside another one is left to its parent. Hidden folders and `node_modules` are not entered. The options common to all commands are these.
+Every command takes folders as arguments. A folder is searched for repositories three levels deep (`--depth N` changes that); a folder that holds `.git` is a repository and is not searched further, so a repository nested inside another one is left to its parent. Hidden folders and `node_modules` are not entered.
+
+A word that is not a folder where you stand is a name, looked up under the folders of `gh-batch.root`, so that it works from any folder. It takes the repository whose name in the report is that word (`teaching/exam-2026`), or whose last part is that word (`exam-2026`), or the repositories inside a folder of that name (`teaching`). A name may hold the wildcards of `--only`, quoted so that the shell leaves them alone (`'paper-*'`). A name that matches nothing stops the run before anything is done, and the message lists the names that contain the word; a part of a name is suggested, never taken. A folder of the same name in the current folder wins, and a path such as `./notes` or `~/papers` is always a folder.
+
+```text
+$ gh-batch status thesis exam-2026
+gh-batch status: 2 repositories under ~/workspace
+
+  pending       thesis              main     1 changed, 1 new (the oldest since 0 min)
+  pending       teaching/exam-2026  main     1 new (the oldest since 0 min)
+
+2 repositories: 2 with pending changes.
+
+$ gh-batch push thesis exam-2026 notes
+gh-batch: error: notes is neither a folder here nor the name of a repository under ~/workspace; the names that contain it: lecture-notes
+```
+
+The completion of bash and zsh offers these names. The options common to all commands are these.
 
 | Option | Meaning |
 |---|---|
@@ -267,11 +284,57 @@ Enter takes that sentence. A line that is typed replaces it. A minus sign alone,
 
 The four guards of the evening commit apply here too, and a refusal by a hook puts the staging area back as it was. A repository that sets `gh-batch.commit` to false, or `gh-batch.pullOnly`, is left alone. A detached HEAD is left alone. A repository without a remote is committed, and the report says that the commit stays on this machine. The evening push is unchanged: it still commits only when asked, and then under its own line, `Work in progress, DATE (MACHINE)`, unless `-m` or `gh-batch.message` says otherwise.
 
-The form `gh-batch commit push` runs the push once the commits are made. The push has its own list and its own confirmation, including the commits that were already waiting. Declining it leaves the new commits on this machine. The word `push` is that request. A folder that is itself named push is given as a path, for example `./push`.
+The form `gh-batch commit push` runs the push once the commits are made. The push has its own list and its own confirmation, including the commits that were already waiting. Declining it leaves the new commits on this machine. The word `push` is that request. A folder or a repository that is itself named push is given as a path, for example `./push`, or after `--`.
 
 ### sync
 
-The command `gh-batch sync` runs the pull, prints its summary, then runs the push with its list and its confirmation. It accepts the options of both.
+The command `gh-batch sync` runs the pull, prints its summary, then runs the push with its list and its confirmation. It accepts the options of both, and the line `gh-batch pull push` is the same.
+
+### Several commands on one line
+
+Commands can follow one another on one line, on the same repositories, each with its own report and its own question. They run in the order typed. Here the thesis is brought up to date, its pending changes are committed under the message asked for, and the commit is pushed:
+
+```text
+$ gh-batch pull commit push thesis
+gh-batch pull: 1 repository under ~/workspace
+
+  updated       thesis        main     1 new commit (your pending changes were kept)
+        c2bb6d4 Add two references
+
+1 repository: 1 updated.
+
+gh-batch commit: 1 repository under ~/workspace
+
+First, the commit:
+Plan:
+  to do         thesis        main     commit 2 files, then a push
+        changed  readme.txt
+        new      chapter2.tex
+
+To do: a commit in 1 repository. A push is asked afterwards.
+Commit message [A Regular Commit to Synchronise], or - to do nothing:
+
+Done:
+  committed     thesis        main     committed 2 files: A Regular Commit to Synchronise
+
+1 repository: 1 committed.
+
+Then, the push:
+Plan:
+  to do         thesis        main     push 1 commit
+
+To do: a push from 1 repository.
+Proceed? [Y/n]
+
+Done:
+  pushed        thesis        main     pushed 1 commit
+
+1 repository: 1 pushed.
+```
+
+A commit followed by a push is the form `commit push` above, and a pull followed by a push is `sync`. The command `fetch` changes no file: on a line it says what `pull` would do, and `pull` is the one that brings the repositories forward, while `push` itself takes the new commits of the server before it sends yours. When `clone` is on the line, it reads the whole account and its organisations, as it does without owners, and the folders or names of the line belong to the other commands: `gh-batch clone pull status` clones what is missing, then brings everything forward and shows what remains.
+
+A question answered no ends the line there: what was done stays done, and nothing after it starts. An interrupt ends it too. A repository that needs you in one command does not stop the next ones, since each repository is handled on its own, and the exit status is then 1. A name that matches nothing stops the line before its first command, the clone included. Each command comes once. The option `-u`, which means `--update` to clone and `--set-upstream` to the others, is written in full on such a line, and `--manifest` belongs to clone or to list alone. Every word that names a command is a command, so a folder or a repository named like one, such as `status` or `log`, is given as a path or after `--`.
 
 ### reset
 
@@ -451,7 +514,7 @@ gh-batch exec --dirty -- git status --short
 gh-batch exec --in ~/papers -- sh -c 'ls *.tex 2>/dev/null | wc -l'
 ```
 
-The options `--dirty`, `--clean`, `--ahead` and `--behind` keep only the repositories in that state. Because the command starts at the first plain word, a folder is given here with `--in DIR`. A repository where the command succeeded and wrote nothing is only counted, and the exit status is 1 when it failed somewhere.
+The options `--dirty`, `--clean`, `--ahead` and `--behind` keep only the repositories in that state. Because the command starts at the first plain word, a folder, or the name of a repository, is given here with `--in`. A repository where the command succeeded and wrote nothing is only counted, and the exit status is 1 when it failed somewhere.
 
 ### doctor
 
@@ -492,7 +555,7 @@ The settings live in git's own configuration, so there is no new file to learn. 
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `gh-batch.root` | the current folder | The folder searched when none is named; it may be given several times. |
+| `gh-batch.root` | the current folder | The folder searched when none is named, and where the names of repositories are looked up; it may be given several times. |
 | `gh-batch.depth` | 3 | Levels searched below each folder. |
 | `gh-batch.jobs` | 8 | Repositories handled at the same time. |
 | `gh-batch.timeout` | 300 | Seconds after which a silent server is given up. |

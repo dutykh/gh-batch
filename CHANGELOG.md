@@ -4,6 +4,16 @@
 
 The versions follow semantic versioning: a change that breaks a command line, a setting or the format of `--porcelain` raises the first number.
 
+## 1.6.0, 24 November 2026
+
+Repositories can be named, from any folder. A word of the command line that is not a folder where it was typed is a name, looked up under the folders of `gh-batch.root`: the name that the report shows (`teaching/exam-2026`), its last part (`exam-2026`), or a folder of the root that holds several repositories (`teaching`), with the wildcards of `--only` if wanted. So `gh-batch commit push obsidian notes` works from every folder, where it worked only from the one that held both. A name that matches nothing stops the run before anything is done, and the message lists the names that contain the word. A folder where the command is typed wins over a name, a path is always a folder, and `doctor` looks around the folders named as folders only, not around the root where a name was found.
+
+Several commands can share one line, in the order typed, on the same repositories: `gh-batch pull commit push thesis` brings the thesis up to date, commits under the message asked for, and pushes. Each command prints its own report and asks its own question; a commit followed by a push is the form `commit push`, and a pull followed by a push is `sync`. On such a line `clone` reads the account and its organisations, and the folders and names go to the other commands. A question answered no, an interrupt, or a command that cannot start ends the line, and a repository that needs you in one command does not stop the next. Each command comes once; `-u` is written in full there, and `--manifest` belongs to clone or to list alone.
+
+Every word that names a command is now a command, as `push` after `commit` already was, and the words after `--` are folders or names, never commands. A folder or a repository called like a command, such as `status` or `log`, is therefore given as a path or after `--`, and `gh-batch commit -- push` commits a repository named push instead of pushing.
+
+The completion of bash and zsh offers the names of the repositories, by their whole name and by their last part, and the other commands of a line, with the options of every command on it.
+
 ## 1.5.0, 17 November 2026
 
 A file that git does not track here, untracked or ignored, no longer stops an update when the new commits of the server put a file in its place. It makes way for the version of the server: it is moved, whole, into the git folder of the repository, `.git/gh-batch/kept/DATE-TIME/`, where nothing can be committed, and the report names it with the command that compares the two versions and the one that takes it back; a copy identical to the version of the server is simply dropped, and a line "Kept aside" at the end of the report lists what was kept. This holds for `pull`, `push`, `sync`, `clone --update` and `reset`. Until now a fast-forward stopped there, with a message that spoke of changes where `git status` showed none, and a `git pull` typed by hand then replaced the ignored file without asking. A merge, with `gh-batch.diverged merge`, replaced an ignored file in the way without a word, as git does; it no longer can.
