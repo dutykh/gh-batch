@@ -1937,6 +1937,14 @@ if describe "line: several commands, one after another"; then
     check "line: a command given twice, and the options that mean two things, are refused" "see above" "$all"
     check "line: nothing moved while they were refused" "beta moved" \
         "$( [ "$(state_of "$A/beta")" = "$s_b" ] && echo 0 || echo 1 )"
+    mkdir -p "$here/status"
+    gb_in "$here" pull status beta
+    check "line: a command that is also a folder here stops the run rather than guess" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 2 ] && contains "$OUTPUT" "status is a command and also a folder here: write ./status" && [ "$(state_of "$A/beta")" = "$s_b" ] && echo 0 || echo 1 )"
+    gb_in "$here" list ./status
+    check "line: written as a path, that folder is a folder" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ -z "$OUTPUT" ] && echo 0 || echo 1 )"
+    rmdir "$here/status"
     gb_in "$here" status -- status
     check "line: after -- a word is a name, even the name of a command" "got rc=$RC: $OUTPUT" \
         "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "gh-batch status: 1 repository" && echo 0 || echo 1 )"

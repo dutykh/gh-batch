@@ -6898,8 +6898,9 @@ USAGE
 
   Several commands run one after another, in the order given, each with
   its own report and its own question, on the same repositories; clone
-  then reads the whole account. A question answered no ends the line, and
-  a folder named like a command is given as a path, or after --.
+  then reads the whole account. A question answered no ends the line. A
+  folder named like a command is given as a path, or after --, and one
+  that stands here stops the run rather than guess.
 
     $PROG pull commit push thesis
     $PROG clone pull status
@@ -7605,8 +7606,19 @@ plan_steps() {
     # followed by a push is one step, the form "commit push", and a pull
     # followed by a push is "sync". Each command comes once; sync holds a
     # pull and a push.
-    local i=0 word part seen=" "
+    local i=1 word part seen=" "
     STEPS=()
+    # A word that names a command and also a folder where the line is typed
+    # could mean either: the run stops rather than guess, before anything
+    # is done. Until version 1.6 such a word was the folder.
+    while [ "$i" -lt "${#CHAIN[@]}" ]; do
+        word=${CHAIN[$i]}
+        if [ -d "$word" ]; then
+            die "$EX_USAGE" "$word is a command and also a folder here: write ./$word for the folder, or type the line in another folder"
+        fi
+        i=$(( i + 1 ))
+    done
+    i=0
     for word in ${CHAIN[@]+"${CHAIN[@]}"}; do
         for part in $( [ "$word" = "sync" ] && printf 'pull push' || printf '%s' "$word" ); do
             case "$seen" in
