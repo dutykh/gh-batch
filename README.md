@@ -95,6 +95,48 @@ Done:
 7 repositories: 2 committed, 5 clean.
 ```
 
+**For one project, or a few**, the repositories are named after the command, from whatever folder the terminal is in, and several commands can share the line, each with its own report and its own question. Here the thesis is brought up to date, its pending changes are committed under the message asked for, and the commit is pushed; no other repository is touched:
+
+```text
+$ gh-batch pull commit push thesis
+gh-batch pull: 1 repository under ~/workspace
+
+  updated       thesis        main     1 new commit (your pending changes were kept)
+        c2bb6d4 Add two references
+
+1 repository: 1 updated.
+
+gh-batch commit: 1 repository under ~/workspace
+
+First, the commit:
+Plan:
+  to do         thesis        main     commit 2 files, then a push
+        changed  readme.txt
+        new      chapter2.tex
+
+To do: a commit in 1 repository. A push is asked afterwards.
+Commit message [A Regular Commit to Synchronise], or - to do nothing:
+
+Done:
+  committed     thesis        main     committed 2 files: A Regular Commit to Synchronise
+
+1 repository: 1 committed.
+
+Then, the push:
+Plan:
+  to do         thesis        main     push 1 commit
+
+To do: a push from 1 repository.
+Proceed? [Y/n]
+
+Done:
+  pushed        thesis        main     pushed 1 commit
+
+1 repository: 1 pushed.
+```
+
+A name is the one that the report shows, or its last part, so `gh-batch push thesis exam-2026` finds `teaching/exam-2026` too. A misspelt name stops everything before anything is done, and a question answered no ends the line where it stands.
+
 **In the middle of the day**, before leaving one machine for another, `gh-batch sync` does both in one run. **On a new machine**, or the day after a project was created elsewhere, `gh-batch clone` brings what is missing:
 
 ```text
@@ -292,49 +334,18 @@ The command `gh-batch sync` runs the pull, prints its summary, then runs the pus
 
 ### Several commands on one line
 
-Commands can follow one another on one line, on the same repositories, each with its own report and its own question. They run in the order typed. Here the thesis is brought up to date, its pending changes are committed under the message asked for, and the commit is pushed:
+Commands can follow one another on one line, on the same repositories, each with its own report and its own question. They run in the order typed, as in the line `gh-batch pull commit push thesis` of the day above. Each command is the one described in its own section, with its plan, its guards and its confirmation: a line only spares the typing, never a question.
 
-```text
-$ gh-batch pull commit push thesis
-gh-batch pull: 1 repository under ~/workspace
-
-  updated       thesis        main     1 new commit (your pending changes were kept)
-        c2bb6d4 Add two references
-
-1 repository: 1 updated.
-
-gh-batch commit: 1 repository under ~/workspace
-
-First, the commit:
-Plan:
-  to do         thesis        main     commit 2 files, then a push
-        changed  readme.txt
-        new      chapter2.tex
-
-To do: a commit in 1 repository. A push is asked afterwards.
-Commit message [A Regular Commit to Synchronise], or - to do nothing:
-
-Done:
-  committed     thesis        main     committed 2 files: A Regular Commit to Synchronise
-
-1 repository: 1 committed.
-
-Then, the push:
-Plan:
-  to do         thesis        main     push 1 commit
-
-To do: a push from 1 repository.
-Proceed? [Y/n]
-
-Done:
-  pushed        thesis        main     pushed 1 commit
-
-1 repository: 1 pushed.
+```bash
+gh-batch pull commit push thesis notes   # bring both forward, commit with the message asked for, push
+gh-batch clone pull status               # clone what is missing, bring everything forward, show what remains
+gh-batch fetch status thesis             # look at the server and at what is pending, change no file
+gh-batch status log                      # what is pending, then what was done today
 ```
 
-A commit followed by a push is the form `commit push` above, and a pull followed by a push is `sync`. The command `fetch` changes no file: on a line it says what `pull` would do, and `pull` is the one that brings the repositories forward, while `push` itself takes the new commits of the server before it sends yours. When `clone` is on the line, it reads the whole account and its organisations, as it does without owners, and the folders or names of the line belong to the other commands: `gh-batch clone pull status` clones what is missing, then brings everything forward and shows what remains.
+A commit followed by a push is the form `commit push` of the section on commit, and a pull followed by a push is `sync`. The command `fetch` changes no file: on a line it says what `pull` would do, and `pull` is the one that brings the repositories forward, while `push` itself takes the new commits of the server before it sends yours. When `clone` is on the line, it reads the whole account and its organisations, as it does without owners, and the folders or names of the line belong to the other commands: `gh-batch clone pull status` clones what is missing, then brings everything forward and shows what remains.
 
-A question answered no ends the line there: what was done stays done, and nothing after it starts. An interrupt ends it too. A repository that needs you in one command does not stop the next ones, since each repository is handled on its own, and the exit status is then 1. A name that matches nothing stops the line before its first command, the clone included. Each command comes once. The option `-u`, which means `--update` to clone and `--set-upstream` to the others, is written in full on such a line, and `--manifest` belongs to clone or to list alone. Every word that names a command is a command, so a folder or a repository named like one, such as `status` or `log`, is given as a path or after `--`.
+A question answered no ends the line there: what was done stays done, and nothing after it starts. An interrupt ends it too. A repository that needs you in one command does not stop the next ones, since each repository is handled on its own, and the exit status is then 1. A name that matches nothing stops the line before its first command, the clone included. Each command comes once. The option `-u`, which means `--update` to clone and `--set-upstream` to the others, is written in full on such a line, and `--manifest` belongs to clone or to list alone. Every word that names a command is a command, so a folder or a repository named like one, such as `status` or `log`, is given as a path or after `--`. When such a word is also a folder where the line is typed, the run stops before anything is done rather than guess which was meant.
 
 ### reset
 
@@ -547,7 +558,7 @@ The command `list` prints the names of the repositories found, their full paths 
 
 ## What gh-batch never does
 
-It never forces a push, never deletes a branch, never cleans a working tree, never drops a stash of yours and never skips a hook; the only stash it applies is its own, the one that carried your changes over an update. It never deletes or overwrites a file that git does not track: one that stands where the server puts a file is moved, whole, into `.git/gh-batch/kept/`, and named. It never sets a branch back from commits that its server lacks, except in `reset --discard-local`, after one confirmation, and in `pull` when the server rewrote its history and every such commit was once on the server; both keep the commit under a reference of its own first and print the command that restores it. It never leaves a conflict, a half-finished rebase or a half-finished merge behind. It never commits unless the commit command, the option or the setting says so, and then never a repository that opted out. It never pushes a branch onto a branch of another name unless git itself was configured to do so. It never asks a question in the middle of a run: git is run so that a missing password is an error, not a prompt, and its own questions, the folder of an organisation met for the first time and the one confirmation, come before anything is changed. A test of the suite reads the source and fails if a forced push, a hard reset or a cleaning command ever appears in it; `reset` itself moves a branch with a checkout, which refuses to overwrite what git does not track.
+It never forces a push, never deletes a branch, never cleans a working tree, never drops a stash of yours and never skips a hook; the only stash it applies is its own, the one that carried your changes over an update. It never deletes or overwrites a file that git does not track: one that stands where the server puts a file is moved, whole, into `.git/gh-batch/kept/`, and named. It never sets a branch back from commits that its server lacks, except in `reset --discard-local`, after one confirmation, and in `pull` when the server rewrote its history and every such commit was once on the server; both keep the commit under a reference of its own first and print the command that restores it. It never leaves a conflict, a half-finished rebase or a half-finished merge behind. It never commits unless the commit command, the option or the setting says so, and then never a repository that opted out. It never pushes a branch onto a branch of another name unless git itself was configured to do so. It never asks a question in the middle of a run: git is run so that a missing password is an error, not a prompt, and its own questions, the folder of an organisation met for the first time and the one confirmation, come before anything is changed. A test of the suite reads the source and fails if a forced push, a hard reset or a cleaning command ever appears in it; `reset` itself moves a branch with a checkout, which refuses to overwrite what git does not track. It never guesses which repository is meant: a name that matches nothing stops the run before anything is done, a part of a name is suggested and never taken, and a word that names a command and also a folder where you stand is refused. A line of several commands never goes past a question answered no, an interrupt, or a command that could not start.
 
 ## Settings
 
@@ -671,7 +682,7 @@ One run at a time may change repositories; a second one is refused while the fir
 
 ## Limits
 
-Submodules are not updated: the repository that holds them is, and git then shows them as changed. A linked worktree is skipped, since its main repository is the one to handle. Only the branch that is checked out is reset and pushed; `pull` also moves forward the other branches that only lack the new commits of the branch of the same name on the server. A repository cloned without its full history is brought forward, but never rebased. The marks, the listing of an account and the remote part of the health check speak to GitHub only; everything else works with any git server. Windows was not tried.
+Submodules are not updated: the repository that holds them is, and git then shows them as changed. A linked worktree is skipped, since its main repository is the one to handle. Only the branch that is checked out is reset and pushed; `pull` also moves forward the other branches that only lack the new commits of the branch of the same name on the server. A repository cloned without its full history is brought forward, but never rebased. Names are looked up under the folders of `gh-batch.root`, as deep as the search goes, and a repository elsewhere is given by its path. The marks, the listing of an account and the remote part of the health check speak to GitHub only; everything else works with any git server. Windows was not tried.
 
 ## Tests
 
@@ -682,7 +693,7 @@ tests/run-tests.sh            # everything
 tests/run-tests.sh push       # the groups whose name holds "push"
 ```
 
-They check each situation named above, and wherever a repository must stay untouched they compare its commit, its branch, its staging area, its files, its references and its stashes before and after. They also run the tool against a server that never answers, send it interrupts in the middle of a fetch, of a checkout and of a clone, try it under git settings that would change the meaning of a pull, and read its source for commands that must never appear in it. The same suite runs on Ubuntu, on macOS and under the bash 3.2 of macOS at every change.
+They check each situation named above, and wherever a repository must stay untouched they compare its commit, its branch, its staging area, its files, its references and its stashes before and after. They also run the tool against a server that never answers, send it interrupts in the middle of a fetch, of a checkout and of a clone and in a line of several commands, type names and lines of commands from a folder outside the root, try it under git settings that would change the meaning of a pull, and read its source for commands that must never appear in it. The same suite runs on Ubuntu, on macOS and under the bash 3.2 of macOS at every change.
 
 ## Licence
 
