@@ -31,7 +31,7 @@ set -uo pipefail
 
 : "${HOME:=/}"
 
-GH_BATCH_VERSION="1.5.0"
+GH_BATCH_VERSION="1.6.0"
 PROG="gh-batch"
 
 TAB=$(printf '\t')
@@ -51,7 +51,19 @@ readonly EX_INTERRUPT=130 # stopped by a signal
 # ---------------------------------------------------------------------------
 
 COMMAND=""
-ARGS=()                   # folders named on the command line
+SELF=""                   # this program, which runs each command of a line
+CHAIN=()                  # the commands of the line, in the order typed
+STEPS=()                  # the same, a commit then a push, or a pull then a push, joined
+LINE_STOP=0               # a signal came while a line of commands was at work
+AFTER_DASHES=0            # a "--" was met: what follows names folders, never commands
+OPT_TOKENS=()             # the options as typed, given again to each command of a line
+DASH_U=0                  # -u was given, which means one thing to clone and another to push
+ARGS=()                   # folders and names given on the command line
+DEFAULT_ROOTS=()          # the folders searched when none is named, where names are looked up
+POOL_DONE=0               # the repositories under them were listed, for the names
+POOL_ROOTS=()
+POOL_PATHS=()
+POOL_NAMES=()
 ONLY=()                   # --only patterns
 EXCEPT=()                 # --except patterns
 
@@ -805,30 +817,177 @@ selected() {
     return 1
 }
 
-discover() {
-    local roots=() root abs i kept_repos=() kept_names=()
-    if [ "${#ARGS[@]}" -gt 0 ]; then
-        roots=("${ARGS[@]}")
-    elif [ -n "${GH_BATCH_ROOT:-}" ]; then
-        roots=("$(expand_tilde "$GH_BATCH_ROOT")")
+default_roots() {
+    # The folders searched when the command line names none, and those
+    # under which a name is looked up.
+    if [ -n "${GH_BATCH_ROOT:-}" ]; then
+        DEFAULT_ROOTS=("$(expand_tilde "$GH_BATCH_ROOT")")
     elif [ "${#CFG_ROOTS[@]}" -gt 0 ]; then
-        roots=("${CFG_ROOTS[@]}")
+        DEFAULT_ROOTS=("${CFG_ROOTS[@]}")
     else
-        roots=(".")
+        DEFAULT_ROOTS=(".")
     fi
-    ROOT_LABEL=""
-    ROOTS_ABS=()
-    for root in "${roots[@]}"; do
+}
+
+is_path_word() {
+    # is_path_word WORD -> 0 when the word is a folder seen from here, or is
+    # written as a path; any other word is the name of a repository.
+    case "$1" in
+        /*|./*|../*|"~"*|.|..) return 0 ;;
+    esac
+    [ -d "$1" ]
+}
+
+label_root() {
+    # label_root PATH: the folder joins the first line of the report, once.
+    local shown
+    shown=$(short_path "$1")
+    case ", $ROOT_LABEL, " in
+        *", $shown, "*) ;;
+        *) ROOT_LABEL="$ROOT_LABEL${ROOT_LABEL:+, }$shown" ;;
+    esac
+    return 0
+}
+
+search_folder() {
+    # search_folder FOLDER: a repository is taken alone, any other folder is
+    # searched.
+    local abs
+    [ -d "$1" ] || die "$EX_USAGE" "no such folder: $1"
+    abs=$(cd "$1" && pwd) || die "$EX_USAGE" "cannot enter $1"
+    ROOTS_ABS+=("$abs")
+    label_root "$abs"
+    if [ -e "$abs/.git" ]; then
+        add_repo "$abs" "${abs##*/}"
+    else
+        walk "${abs%/}" "$DEPTH" ""
+    fi
+}
+
+name_pool() {
+    # The repositories under the default folders, where the names given on
+    # the command line are looked up, listed once. The walk writes into
+    # REPOS, NAMES and SEEN, which are kept aside meanwhile.
+    local repos=() names=() seen=$SEEN root abs
+    [ "$POOL_DONE" -eq 1 ] && return 0
+    POOL_DONE=1
+    repos=(${REPOS[@]+"${REPOS[@]}"})
+    names=(${NAMES[@]+"${NAMES[@]}"})
+    REPOS=(); NAMES=(); SEEN=""
+    for root in "${DEFAULT_ROOTS[@]}"; do
         [ -d "$root" ] || die "$EX_USAGE" "no such folder: $root"
         abs=$(cd "$root" && pwd) || die "$EX_USAGE" "cannot enter $root"
-        ROOTS_ABS+=("$abs")
-        ROOT_LABEL="$ROOT_LABEL${ROOT_LABEL:+, }$(short_path "$abs")"
+        POOL_ROOTS+=("$abs")
         if [ -e "$abs/.git" ]; then
             add_repo "$abs" "${abs##*/}"
         else
             walk "${abs%/}" "$DEPTH" ""
         fi
     done
+    POOL_PATHS=(${REPOS[@]+"${REPOS[@]}"})
+    POOL_NAMES=(${NAMES[@]+"${NAMES[@]}"})
+    REPOS=(${repos[@]+"${repos[@]}"})
+    NAMES=(${names[@]+"${names[@]}"})
+    SEEN=$seen
+    return 0
+}
+
+named_by() {
+    # named_by NAME WORD -> 0 when the word names the repository: its whole
+    # name, the last part of it, or a folder that holds it. The word may
+    # hold the wildcards of --only.
+    # shellcheck disable=SC2254  # the word is meant to be matched as a glob
+    case "$1" in $2|$2/*) return 0 ;; esac
+    # shellcheck disable=SC2254
+    case "${1##*/}" in $2) return 0 ;; esac
+    return 1
+}
+
+unknown_name() {
+    # unknown_name WORD -> why the word names nothing, with the names that
+    # contain it, when there are some.
+    local word="$1" where="" root hits="" line n=0
+    for root in ${POOL_ROOTS[@]+"${POOL_ROOTS[@]}"}; do
+        where="$where${where:+, }$(short_path "$root")"
+    done
+    case "$word" in
+        *[*?[]*) ;;
+        *)
+            while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                n=$(( n + 1 ))
+                [ "$n" -le 5 ] || break
+                hits="$hits${hits:+$US}$line"
+            done <<EOF
+$(printf '%s\n' ${POOL_NAMES[@]+"${POOL_NAMES[@]}"} | grep -i -F -- "$word")
+EOF
+            ;;
+    esac
+    if [ "${#CHAIN[@]}" -gt 0 ]; then
+        case "$word" in
+            exec|list|config|completion|help)
+                printf '%s is neither a folder here nor the name of a repository under %s, and the command %s runs alone, not after another one' \
+                    "$word" "$where" "$word"
+                return 0 ;;
+        esac
+    fi
+    if [ -n "$hits" ]; then
+        local IFS=$US
+        # shellcheck disable=SC2086  # the names are split at the separator
+        printf '%s is neither a folder here nor the name of a repository under %s; the names that contain it: %s' \
+            "$word" "$where" "$(enumerate $hits)"
+    else
+        printf '%s is neither a folder here nor the name of a repository under %s (%s list prints the names)' \
+            "$word" "$where" "$PROG"
+    fi
+}
+
+take_named() {
+    # take_named WORD: the repositories that the word names under the
+    # default folders, in the order of the walk; a word that names none
+    # stops the run before anything is done.
+    local word="$1" i=0 n=0 root
+    while [ "${word%/}" != "$word" ] && [ -n "${word%/}" ]; do
+        word=${word%/}
+    done
+    name_pool
+    while [ "$i" -lt "${#POOL_PATHS[@]}" ]; do
+        if named_by "${POOL_NAMES[$i]}" "$word"; then
+            add_repo "${POOL_PATHS[$i]}" "${POOL_NAMES[$i]}"
+            n=$(( n + 1 ))
+        fi
+        i=$(( i + 1 ))
+    done
+    [ "$n" -gt 0 ] || die "$EX_USAGE" "$(unknown_name "$word")"
+    for root in ${POOL_ROOTS[@]+"${POOL_ROOTS[@]}"}; do
+        label_root "$root"
+    done
+    return 0
+}
+
+discover() {
+    # The repositories of the run: each word of the command line is a
+    # folder, when it is one here or is written as a path, or else the name
+    # of repositories under the default folders; without a word, the default
+    # folders are searched.
+    local word i kept_repos=() kept_names=()
+    REPOS=(); NAMES=(); SEEN=""
+    default_roots
+    ROOT_LABEL=""
+    ROOTS_ABS=()
+    if [ "${#ARGS[@]}" -eq 0 ]; then
+        for word in "${DEFAULT_ROOTS[@]}"; do
+            search_folder "$word"
+        done
+    else
+        for word in "${ARGS[@]}"; do
+            if is_path_word "$word"; then
+                search_folder "$word"
+            else
+                take_named "$word"
+            fi
+        done
+    fi
     ALL_REPOS=(${REPOS[@]+"${REPOS[@]}"})
     i=0
     while [ "$i" -lt "${#REPOS[@]}" ]; do
@@ -4143,6 +4302,7 @@ cmd_push() {
     header ""
     if ! push_phase; then
         put "Nothing was done."
+        declined
         exit "$EX_OK"
     fi
     finish
@@ -4178,6 +4338,7 @@ cmd_sync() {
     fi
     if ! push_phase; then
         put "Nothing was done."
+        declined
         exit "$EX_OK"
     fi
     finish
@@ -4241,6 +4402,7 @@ ask_commit_message() {
     if [ "$ended" -eq 1 ] || [ "$STOP" -eq 1 ]; then
         printf '\n' >&2
         put "Nothing was done."
+        declined
         exit "$EX_OK"
     fi
     trimmed=${answer#"${answer%%[![:space:]]*}"}
@@ -4389,6 +4551,7 @@ commit_phase() {
         show_before_asking show_commit_plan
         if ! ask_commit_message; then
             put "Nothing was done."
+            declined
             exit "$EX_OK"
         fi
         if [ "$PORCELAIN" -eq 0 ]; then
@@ -4455,6 +4618,7 @@ cmd_commit() {
             else
                 put "Nothing was done."
             fi
+            declined
             notify
             if [ "$ATTENTION" -eq 1 ]; then
                 exit "$EX_ATTENTION"
@@ -4777,6 +4941,7 @@ cmd_reset() {
             show_before_asking show_reset_plan
             if ! confirmed; then
                 put "Nothing was done."
+                declined
                 exit "$EX_OK"
             fi
             if [ "$PORCELAIN" -eq 0 ]; then
@@ -5037,6 +5202,7 @@ ask_folder() {
         if [ "$ended" -eq 1 ] || [ "$STOP" -eq 1 ]; then
             printf '\n' >&2
             put "Nothing was done."
+            declined
             exit "$EX_OK"
         fi
         answer=${answer#"${answer%%[![:space:]]*}"}
@@ -5539,6 +5705,7 @@ cmd_clone() {
             take_lock
             if ! confirmed; then
                 put "Nothing was done."
+                declined
                 exit "$EX_OK"
             fi
             [ "$PORCELAIN" -eq 0 ] && put ""
@@ -5784,7 +5951,7 @@ render_exec() {
 cmd_exec() {
     local name
     [ "${#EXEC_CMD[@]}" -gt 0 ] ||
-        die "$EX_USAGE" "exec needs a command: $PROG exec [options] [folder ...] -- COMMAND [ARGUMENT ...]"
+        die "$EX_USAGE" "exec needs a command: $PROG exec [options] [--in folder or name] -- COMMAND [ARGUMENT ...]"
     EXEC_LIMIT=${OPT_TIMEOUT:-0}
     EXEC_OUTPUT=1
     setup_colour
@@ -6422,6 +6589,7 @@ cmd_tidy() {
         show_before_asking show_tidy_plan
         if ! confirmed; then
             put "Nothing was done."
+            declined
             exit "$EX_OK"
         fi
         if [ "$PORCELAIN" -eq 0 ]; then
@@ -6451,11 +6619,24 @@ cmd_completion() {
         bash)
             cat <<'EOF'
 # bash completion for gh-batch
+_gh_batch_names() {
+    # The names of the repositories under gh-batch.root, one per line, and
+    # the last part of each longer one; none when no root is set, since the
+    # current folder may be anything.
+    local name
+    if [ -n "${GH_BATCH_ROOT:-}" ] || git config --global --includes --get gh-batch.root >/dev/null 2>&1; then
+        gh-batch list 2>/dev/null | while IFS= read -r name; do
+            printf '%s\n' "$name"
+            case "$name" in */*) printf '%s\n' "${name##*/}" ;; esac
+        done
+    fi
+}
 _gh_batch() {
-    local cur prev words cword commands options
+    local cur prev commands verbs options words word list
     cur=${COMP_WORDS[COMP_CWORD]}
     prev=${COMP_WORDS[COMP_CWORD-1]}
     commands="pull push commit sync reset tidy clone status fetch log exec doctor list config completion help"
+    verbs="pull push commit sync reset tidy clone status fetch log doctor"
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=($(compgen -W "$commands --help --version" -- "$cur"))
         return 0
@@ -6466,32 +6647,48 @@ _gh_batch() {
         --color|--colour) COMPREPLY=($(compgen -W "auto always never" -- "$cur")); return 0 ;;
         --into) COMPREPLY=($(compgen -d -- "$cur")); return 0 ;;
         --manifest) COMPREPLY=($(compgen -f -- "$cur")); return 0 ;;
+        --in)
+            list=$(_gh_batch_names)
+            local IFS=$'\n'
+            COMPREPLY=($(compgen -W "$list" -- "$cur"; compgen -d -- "$cur"))
+            return 0 ;;
         help) COMPREPLY=($(compgen -W "$commands" -- "$cur")); return 0 ;;
         completion) COMPREPLY=($(compgen -W "bash zsh" -- "$cur")); return 0 ;;
     esac
     options="--jobs --depth --only --except --dry-run --yes --verbose --quiet --porcelain --timeout --color --help"
-    case "${COMP_WORDS[1]}" in
-        pull)       options="$options --diverged --conflicts --notify" ;;
-        fetch)      options="$options --diverged --conflicts --offline --notify" ;;
-        push|sync)  options="$options --commit --no-commit --message --set-upstream --diverged --conflicts --notify" ;;
-        commit)     options="$options --message --notify" ;;
-        reset)      options="$options --discard-local --notify" ;;
-        tidy)       options="$options --days" ;;
-        clone)      options="$options --into --manifest --update --since --no-forks --no-archived --orgs --no-orgs --flat --by-owner" ;;
-        status)     options="$options --long" ;;
-        log)        options="$options --since --until --author --all-authors --long" ;;
-        exec)       options="$options --dirty --clean --ahead --behind" ;;
-        doctor)     options="$options --offline --days" ;;
-        list)       options="$options --absolute --manifest" ;;
+    # The options of every command on the line, when commands share it.
+    words=${COMP_WORDS[1]}
+    case " $verbs " in
+        *" ${COMP_WORDS[1]} "*) words="${COMP_WORDS[*]:1:COMP_CWORD-1}" ;;
     esac
+    for word in $words; do
+        case "$word" in
+            pull)       options="$options --diverged --conflicts --notify" ;;
+            fetch)      options="$options --diverged --conflicts --offline --notify" ;;
+            push|sync)  options="$options --commit --no-commit --message --set-upstream --diverged --conflicts --notify" ;;
+            commit)     options="$options --message --notify" ;;
+            reset)      options="$options --discard-local --notify" ;;
+            tidy)       options="$options --days" ;;
+            clone)      options="$options --into --manifest --update --since --no-forks --no-archived --orgs --no-orgs --flat --by-owner" ;;
+            status)     options="$options --long" ;;
+            log)        options="$options --since --until --author --all-authors --long" ;;
+            exec)       options="$options --in --dirty --clean --ahead --behind" ;;
+            doctor)     options="$options --offline --days" ;;
+            list)       options="$options --absolute --manifest" ;;
+        esac
+    done
     case "$cur" in
         -*) COMPREPLY=($(compgen -W "$options" -- "$cur")) ;;
         *)
-            if [ "${COMP_WORDS[1]}" = "commit" ]; then
-                COMPREPLY=($(compgen -W "push" -- "$cur"; compgen -d -- "$cur"))
-            else
-                COMPREPLY=($(compgen -d -- "$cur"))
-            fi
+            # The other commands of a line, the names of the repositories
+            # and the folders here.
+            list=""
+            case " $verbs " in
+                *" ${COMP_WORDS[1]} "*) list=$(printf '%s\n' $verbs; _gh_batch_names) ;;
+            esac
+            [ "${COMP_WORDS[1]}" = "list" ] && list=$(_gh_batch_names)
+            local IFS=$'\n'
+            COMPREPLY=($(compgen -W "$list" -- "$cur"; compgen -d -- "$cur"))
             ;;
     esac
     return 0
@@ -6552,9 +6749,29 @@ _gh_batch() {
                 '--orgs[clone the organisations too, whatever gh-batch.orgs says]' \
                 '--no-orgs[clone the account without its organisations]' \
                 '--manifest[a layout file]:file:_files' \
-                '*:folder:_files -/'
+                '*:folder or repository:_gh_batch_targets'
             ;;
     esac
+}
+_gh_batch_targets() {
+    # The other commands of a line, the names of the repositories under
+    # gh-batch.root, and the folders here.
+    local -a verbs names
+    verbs=(pull push commit sync reset tidy clone status fetch log doctor)
+    case "${words[2]}" in
+        pull|push|commit|sync|reset|tidy|clone|status|fetch|log|doctor) ;;
+        list) verbs=() ;;
+        *) _files -/; return ;;
+    esac
+    if [[ -n "${GH_BATCH_ROOT:-}" ]] || git config --global --includes --get gh-batch.root >/dev/null 2>&1; then
+        names=(${(f)"$(gh-batch list 2>/dev/null)"})
+        names=(${names:#} ${${names:#}:t})
+        names=(${(u)names})
+    fi
+    _alternative \
+        'commands:command:compadd -a verbs' \
+        'repositories:repository:compadd -a names' \
+        'folders:folder:_files -/'
 }
 _gh_batch "$@"
 EOF
@@ -6666,11 +6883,26 @@ usage() {
 $PROG $GH_BATCH_VERSION, one command for many git repositories.
 
 USAGE
-  $PROG <command> [options] [folder ...]
+  $PROG <command> [command ...] [options] [folder or name ...]
 
   A folder is searched for git repositories, three levels deep by default; a
   folder that is itself a repository is taken alone. Without a folder, the
   ones of "git config --global gh-batch.root" are used, else the current one.
+
+  A word that is not a folder here is a name, looked up under those folders
+  from wherever the command is typed: the name of a repository as the
+  report shows it, the last part of that name, or a folder holding several.
+  A name may hold the wildcards of --only.
+
+    $PROG commit push obsidian notes
+
+  Several commands run one after another, in the order given, each with
+  its own report and its own question, on the same repositories; clone
+  then reads the whole account. A question answered no ends the line, and
+  a folder named like a command is given as a path, or after --.
+
+    $PROG pull commit push thesis
+    $PROG clone pull status
 
 COMMANDS
   pull        fetch every repository and bring it forward (the morning command)
@@ -6733,7 +6965,7 @@ EOF
 
 help_pull() {
     cat <<EOF
-$PROG pull [options] [folder ...]
+$PROG pull [options] [folder or name ...]
 
 Fetch every repository and bring its branch forward. For each repository:
 
@@ -6798,7 +7030,7 @@ EOF
 
 help_push() {
     cat <<EOF
-$PROG push [options] [folder ...]
+$PROG push [options] [folder or name ...]
 
 Push every repository whose branch has commits that its server lacks. The
 push goes where "git push" would send the branch, is never forced, and uses
@@ -6857,7 +7089,7 @@ EOF
 
 help_commit() {
     cat <<EOF
-$PROG commit [push] [options] [folder ...]
+$PROG commit [push] [options] [folder or name ...]
 
 Commit the pending changes of every repository: files modified, deleted or
 new, the ignored ones excepted. The list is shown first. The first line of
@@ -6895,18 +7127,21 @@ OPTIONS
       --notify         send the report through the command of gh-batch.notify
   and the common options, see: $PROG help
 
-The word push asks for the push afterwards. A folder that is named push is
-given as a path, for example ./push.
+The word push asks for the push afterwards, and another command named on
+the line runs in its turn: "$PROG pull commit push" pulls first. A folder
+or a repository named push is given as a path, for example ./push, or
+after --.
 EOF
 }
 
 help_sync() {
     cat <<EOF
-$PROG sync [options] [folder ...]
+$PROG sync [options] [folder or name ...]
 
 Pull, then push, in one run: what "$PROG pull" does for every repository,
 then what "$PROG push" does, with its list and its confirmation. It is the
-command for a change of machine in the middle of the day.
+command for a change of machine in the middle of the day, and the line
+"$PROG pull push" is the same.
 
 OPTIONS
   those of pull and of push, see: $PROG help pull, $PROG help push
@@ -6915,7 +7150,7 @@ EOF
 
 help_reset() {
     cat <<EOF
-$PROG reset [options] [folder ...]
+$PROG reset [options] [folder or name ...]
 
 Set the branch of every repository to the branch it follows on its server,
 as a fetch and a hard reset onto that branch would, but without losing
@@ -6954,7 +7189,7 @@ EOF
 
 help_tidy() {
     cat <<EOF
-$PROG tidy [options] [folder ...]
+$PROG tidy [options] [folder or name ...]
 
 Remove what this tool kept in the repositories during earlier runs and that
 is older than a month: the backups of a branch made before it moved
@@ -6998,6 +7233,10 @@ In the second form the list is a layout file, as "$PROG list --manifest"
 writes it: each repository returns to the folder it had, on its branch. No
 gh is needed, and the servers may be any.
 
+When other commands follow on the line, as in "$PROG clone pull status",
+clone reads the account and its organisations, and the folders or names of
+the line belong to the commands that follow it.
+
 The list is shown with the sizes, one confirmation is asked, then four
 repositories are cloned at a time. Each clone is made under a temporary
 name and renamed when complete: an interrupted run leaves nothing half-made.
@@ -7033,7 +7272,7 @@ EOF
 
 help_status() {
     cat <<EOF
-$PROG status [options] [folder ...]
+$PROG status [options] [folder or name ...]
 
 One line per repository that has something pending: files changed or new
 and since when, commits to push and since when, commits behind the last
@@ -7050,7 +7289,7 @@ EOF
 
 help_fetch() {
     cat <<EOF
-$PROG fetch [options] [folder ...]
+$PROG fetch [options] [folder or name ...]
 
 Fetch every repository and say what "pull" would do, without touching a
 branch or a file: how many commits wait on the server, which files would be
@@ -7070,7 +7309,7 @@ EOF
 
 help_log() {
     cat <<EOF
-$PROG log [options] [folder ...]
+$PROG log [options] [folder or name ...]
 
 The commits of a period across all the repositories, each repository with
 its commits in the order they were made. Without an option: your commits of
@@ -7109,8 +7348,8 @@ is only counted.
   $PROG exec --in ~/papers -- sh -c 'ls *.tex 2>/dev/null | wc -l'
 
 OPTIONS
-      --in DIR       a folder to search, repeatable (a folder cannot be
-                     given as a plain word here: the command starts there)
+      --in DIR       a folder to search, or a name, repeatable (neither can
+                     be a plain word here: the command starts there)
       --dirty        only the repositories with pending changes
       --clean        only those without
       --ahead        only those with commits to push
@@ -7124,7 +7363,7 @@ EOF
 
 help_doctor() {
     cat <<EOF
-$PROG doctor [options] [folder ...]
+$PROG doctor [options] [folder or name ...]
 
 Health check. Nothing is changed. For each repository:
 
@@ -7173,7 +7412,7 @@ EOF
 
 help_list() {
     cat <<EOF
-$PROG list [options] [folder ...]
+$PROG list [options] [folder or name ...]
 
 Print the repositories found, one per line.
 
@@ -7231,7 +7470,9 @@ need_value() {
 }
 
 parse_options() {
+    local before first second
     while [ "$#" -gt 0 ]; do
+        before=$#; first=$1; second=${2-}
         case "$1" in
             -j|--jobs)      need_value "$@"; OPT_JOBS=$2; shift 2 ;;
             --jobs=*)       OPT_JOBS=${1#*=}; shift ;;
@@ -7255,6 +7496,7 @@ parse_options() {
             --message=*)    OPT_MESSAGE=${1#*=}; shift ;;
             -y|--yes)       YES=1; shift ;;
             -u)
+                DASH_U=1
                 if [ "$COMMAND" = "clone" ]; then UPDATE=1; else SET_UPSTREAM=1; fi
                 shift ;;
             --set-upstream) SET_UPSTREAM=1; shift ;;
@@ -7308,7 +7550,9 @@ parse_options() {
                     EXEC_CMD=("$@")
                     return 0
                 fi
-                while [ "$#" -gt 0 ]; do positional "$1"; shift; done ;;
+                AFTER_DASHES=1
+                while [ "$#" -gt 0 ]; do positional "$1"; shift; done
+                continue ;;
             -?*)            die "$EX_USAGE" "unknown option: $1 (see $PROG help${COMMAND:+ $COMMAND})" ;;
             *)
                 # The command of "exec" starts at its first word and keeps
@@ -7317,29 +7561,148 @@ parse_options() {
                     EXEC_CMD=("$@")
                     return 0
                 fi
-                positional "$1"; shift ;;
+                positional "$1"; shift
+                continue ;;
         esac
+        # The option as it was typed, with its value: each command of a line
+        # receives it again.
+        OPT_TOKENS+=("$first")
+        if [ $(( before - $# )) -ge 2 ]; then
+            OPT_TOKENS+=("$second")
+        fi
     done
 }
 
+chainable() {
+    # chainable WORD -> 0 for a command that may share its line with others
+    case "$1" in
+        pull|push|commit|sync|reset|tidy|clone|status|fetch|log|doctor) return 0 ;;
+    esac
+    return 1
+}
+
 positional() {
+    # A word that names a command joins the line of commands, wherever it
+    # stands, unless a "--" came before it: "commit push" asks for the push
+    # once the commits are made, and "pull commit push" adds a pull before.
+    # A folder or a repository named like a command is given as a path, or
+    # after "--".
+    if [ "$AFTER_DASHES" -eq 0 ] && chainable "$COMMAND" && chainable "$1"; then
+        CHAIN+=("$1")
+        return 0
+    fi
     case "$COMMAND" in
         help)   HELP_TOPIC=$1 ;;
         completion) SHELL_NAME=$1 ;;
         clone)  OWNERS+=("$1") ;;
         config) die "$EX_USAGE" "config takes no argument" ;;
-        commit)
-            # The word push is the request to push once the commits are
-            # made, not the name of a folder. A folder of that name is
-            # given as a path.
-            if [ "$1" = "push" ]; then
-                ALSO_PUSH=1
-            else
-                ARGS+=("$1")
-            fi
-            ;;
         *)      ARGS+=("$1") ;;
     esac
+}
+
+plan_steps() {
+    # The commands of the line, as steps run one after another. A commit
+    # followed by a push is one step, the form "commit push", and a pull
+    # followed by a push is "sync". Each command comes once; sync holds a
+    # pull and a push.
+    local i=0 word part seen=" "
+    STEPS=()
+    for word in ${CHAIN[@]+"${CHAIN[@]}"}; do
+        for part in $( [ "$word" = "sync" ] && printf 'pull push' || printf '%s' "$word" ); do
+            case "$seen" in
+                *" $part "*) die "$EX_USAGE" "$part comes twice on the line (sync is a pull and a push)" ;;
+            esac
+            seen="$seen$part "
+        done
+    done
+    while [ "$i" -lt "${#CHAIN[@]}" ]; do
+        word=${CHAIN[$i]}
+        case "$word ${CHAIN[$(( i + 1 ))]:-}" in
+            "commit push") STEPS+=("commit push"); i=$(( i + 2 )); continue ;;
+            "pull push")   STEPS+=("sync"); i=$(( i + 2 )); continue ;;
+        esac
+        STEPS+=("$word")
+        i=$(( i + 1 ))
+    done
+    if [ "${#STEPS[@]}" -eq 1 ]; then
+        case "${STEPS[0]}" in
+            "commit push") COMMAND="commit"; ALSO_PUSH=1 ;;
+            *)             COMMAND=${STEPS[0]} ;;
+        esac
+    elif [ "${#STEPS[@]}" -gt 1 ]; then
+        # On a line of several commands the words are folders or names for
+        # all of them; clone then reads the account and its organisations.
+        ARGS+=(${OWNERS[@]+"${OWNERS[@]}"})
+        OWNERS=()
+    fi
+    return 0
+}
+
+in_line() {
+    # in_line COMMAND -> 0 when the line holds that command
+    local word
+    for word in ${CHAIN[@]+"${CHAIN[@]}"}; do
+        [ "$word" = "$1" ] && return 0
+        [ "$word" = "sync" ] && { [ "$1" = "pull" ] || [ "$1" = "push" ]; } && return 0
+    done
+    return 1
+}
+
+declined() {
+    # A question answered no ends a line of several commands there: the
+    # command that asked leaves this mark, and the line starts nothing more.
+    if [ -n "${GH_BATCH_DECLINED:-}" ]; then
+        : > "$GH_BATCH_DECLINED" 2>/dev/null
+    fi
+    return 0
+}
+
+run_line() {
+    # Several commands on one line. Each runs as a gh-batch of its own, in
+    # the order typed, with the options of the line and its folders or
+    # names, and prints its own report. A question answered no, a command
+    # that cannot start and a signal end the line; a repository that needs
+    # the user does not, since each repository is handled on its own.
+    local step rc worst="$EX_OK" n=0
+    [ "$DASH_U" -eq 1 ] &&
+        die "$EX_USAGE" "-u means --update to clone and --set-upstream to the others: on a line of several commands, write the long option"
+    if [ "$MANIFEST_OUT" -eq 1 ] || [ -n "$MANIFEST_IN" ]; then
+        die "$EX_USAGE" "--manifest belongs to clone or to list alone, not to a line of several commands"
+    fi
+    if [ -n "$SINCE" ] && in_line clone && in_line log; then
+        die "$EX_USAGE" "--since means one thing to clone and another to log: run them apart"
+    fi
+    # A word that names nothing stops the line before anything is done.
+    [ "${#ARGS[@]}" -gt 0 ] && discover
+    TMP=$(mktemp -d "${TMPDIR:-/tmp}/gh-batch.XXXXXX") ||
+        die "$EX_ENV" "cannot create a temporary directory"
+    trap cleanup EXIT
+    # The command at work receives the signal too and ends in its own way;
+    # the line only learns that it must stop.
+    trap 'LINE_STOP=1' INT TERM HUP
+    for step in "${STEPS[@]}"; do
+        if [ "$n" -gt 0 ] && [ "$PORCELAIN" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+            printf '\n'
+        fi
+        n=$(( n + 1 ))
+        # shellcheck disable=SC2086  # a step is one or two words
+        set -- $step
+        if [ "$1" = "clone" ]; then
+            GH_BATCH_DECLINED="$TMP/declined" "$BASH" "$SELF" "$@" ${OPT_TOKENS[@]+"${OPT_TOKENS[@]}"}
+        else
+            GH_BATCH_DECLINED="$TMP/declined" "$BASH" "$SELF" "$@" ${OPT_TOKENS[@]+"${OPT_TOKENS[@]}"} \
+                -- ${ARGS[@]+"${ARGS[@]}"}
+        fi
+        rc=$?
+        [ "$LINE_STOP" -eq 1 ] && exit "$EX_INTERRUPT"
+        case "$rc" in
+            "$EX_OK") ;;
+            "$EX_ATTENTION") worst=$EX_ATTENTION ;;
+            *) exit "$rc" ;;
+        esac
+        [ -e "$TMP/declined" ] && exit "$worst"
+    done
+    exit "$worst"
 }
 
 main() {
@@ -7354,15 +7717,19 @@ main() {
         pull|push|commit|sync|reset|tidy|clone|status|fetch|log|exec|doctor|list|config|completion|help) ;;
         *) die "$EX_USAGE" "no such command: $COMMAND (see $PROG help)" ;;
     esac
+    SELF=$0
+    chainable "$COMMAND" && CHAIN=("$COMMAND")
     parse_options "$@"
     if [ "$COMMAND" = "help" ]; then
         show_help "$HELP_TOPIC"
         exit "$EX_OK"
     fi
     [ "$COMMAND" = "completion" ] && cmd_completion
+    plan_steps
     check_git
     load_settings
     resolve_settings
+    [ "${#STEPS[@]}" -gt 1 ] && run_line
     case "$COMMAND" in
         pull|fetch) cmd_pull ;;
         push)       cmd_push ;;

@@ -429,6 +429,106 @@ if describe "discovery: odd names and an inherited GIT_DIR"; then
         "$( [ "$RC" -eq 0 ] && [ "$(st "with space")" = "updated" ] && [ "$(st "-dash")" = "updated" ] && [ "$(st plain)" = "updated" ] && echo 0 || echo 1 )"
 fi
 
+gb_in() {
+    # gb_in DIR ARGS...: the tool typed in the folder DIR
+    local dir="$1"
+    shift
+    OUTPUT=$(cd "$dir" && "$GB" "$@" 2>&1)
+    RC=$?
+    return 0
+}
+
+asked_in() {
+    # asked_in DIR ANSWERS ARGS...: the same, with somebody at the keyboard
+    local dir="$1" answers="$2"
+    shift 2
+    printf '%b' "$answers" > "$WORLD/answers"
+    OUTPUT=$(cd "$dir" && GH_BATCH_TTY=1 "$GB" "$@" 2>&1 < "$WORLD/answers")
+    RC=$?
+    return 0
+}
+
+if describe "discovery: names of repositories, from any folder"; then
+    world
+    repo alpha
+    repo beta
+    server gamma
+    server delta
+    server notes
+    mkdir -p "$A/group" "$A/drafts" "$WORLD/here/beta"
+    clone_to "$A" gamma "group/gamma"
+    clone_to "$A" delta "group/delta"
+    clone_to "$A" notes "paper-notes"
+    printf 'idea\n' > "$A/drafts/idea.txt"
+    git config --global gh-batch.root "$A"
+    here="$WORLD/here"
+    gb_in "$here" list alpha group/gamma
+    check "names: two names, from a folder outside the root, in the order typed" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ "$OUTPUT" = "alpha
+group/gamma" ] && echo 0 || echo 1 )"
+    gb_in "$here" list delta
+    check "names: the last part of a longer name" "got: $OUTPUT" \
+        "$( [ "$OUTPUT" = "group/delta" ] && echo 0 || echo 1 )"
+    gb_in "$here" list group
+    check "names: a folder of the root takes the repositories it holds" "got: $OUTPUT" \
+        "$( [ "$OUTPUT" = "group/delta
+group/gamma" ] && echo 0 || echo 1 )"
+    gb_in "$here" list 'paper-*'
+    check "names: the wildcards of --only" "got: $OUTPUT" \
+        "$( [ "$OUTPUT" = "paper-notes" ] && echo 0 || echo 1 )"
+    gb_in "$here" list alpha/ alpha "$A/alpha"
+    check "names: a repository named twice, by name and by path, is taken once" "got: $OUTPUT" \
+        "$( [ "$OUTPUT" = "alpha" ] && echo 0 || echo 1 )"
+    gb_in "$here" list --absolute "$B" alpha
+    check "names: a folder and a name on one line" "got: $OUTPUT" \
+        "$( [ "$OUTPUT" = "$B/alpha
+$B/beta
+$A/alpha" ] && echo 0 || echo 1 )"
+    gb_in "$here" list --absolute beta
+    check "names: a folder of that name here wins over the name" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ -z "$OUTPUT" ] && echo 0 || echo 1 )"
+    gb_in "$WORLD" list --absolute beta
+    check "names: without such a folder here, the name is looked up" "got: $OUTPUT" \
+        "$( [ "$OUTPUT" = "$A/beta" ] && echo 0 || echo 1 )"
+    gb_in "$here" list alpah
+    check "names: a misspelt name is a usage error that says where it was looked for" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 2 ] && contains "$OUTPUT" "alpah is neither a folder here nor the name of a repository under $A" && contains "$OUTPUT" "gh-batch list prints the names" && echo 0 || echo 1 )"
+    gb_in "$here" list notes
+    check "names: a part of a name is suggested, never taken" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 2 ] && contains "$OUTPUT" "the names that contain it: paper-notes" && echo 0 || echo 1 )"
+    commit "$B/alpha" news.txt "news" "News"
+    publish "$B/alpha"
+    s_a=$(state_of "$A/alpha")
+    gb_in "$here" pull alpha alpah
+    check "names: one misspelt name stops the run before anything is done" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 2 ] && [ "$(state_of "$A/alpha")" = "$s_a" ] && echo 0 || echo 1 )"
+    OUTPUT=$(cd "$here" && GH_BATCH_ROOT="$B" "$GB" list --absolute alpha 2>&1)
+    check "names: GH_BATCH_ROOT wins over the setting" "got: $OUTPUT" \
+        "$( [ "$OUTPUT" = "$B/alpha" ] && echo 0 || echo 1 )"
+    gb_in "$here" status alpha gamma
+    check "names: the report says where the names were found" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "gh-batch status: 2 repositories under $A" && echo 0 || echo 1 )"
+    gb_in "$here" exec --in gamma -- pwd
+    check "names: exec takes a name with --in" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "$A/group/gamma" && ! contains "$OUTPUT" "$A/alpha" && echo 0 || echo 1 )"
+    gb_in "$here" doctor --offline
+    around=$OUTPUT
+    gb_in "$here" doctor --offline alpha
+    check "names: doctor looks around the folders named, not around the root of a name" "got: $OUTPUT" \
+        "$( contains "$around" "drafts holds no git repository" && ! contains "$OUTPUT" "drafts" && echo 0 || echo 1 )"
+    srv_b=$(git -C "$SRV/beta.git" rev-parse main)
+    printf 'mine\n' >> "$A/alpha/readme.txt"
+    printf 'theirs\n' >> "$A/beta/readme.txt"
+    s_b=$(state_of "$A/beta")
+    asked_in "$here" '\nY\n' commit push --diverged rebase alpha
+    check "names: commit push of one name commits and pushes it, and only it" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ "$(git -C "$A/alpha" log -1 --format=%s)" = "A Regular Commit to Synchronise" ] && [ "$(git -C "$SRV/alpha.git" rev-parse main)" = "$(head_of "$A/alpha")" ] && [ "$(state_of "$A/beta")" = "$s_b" ] && [ "$(git -C "$SRV/beta.git" rev-parse main)" = "$srv_b" ] && echo 0 || echo 1 )"
+    git config --global --unset gh-batch.root
+    gb_in "$A" list delta
+    check "names: without a root, a name is looked up under the current folder" "got: $OUTPUT" \
+        "$( [ "$OUTPUT" = "group/delta" ] && echo 0 || echo 1 )"
+fi
+
 # --- status ----------------------------------------------------------------
 if describe "status: what is pending"; then
     world
@@ -1790,6 +1890,85 @@ if describe "sync: pull, then push"; then
         "$( [ "$(state_of "$A/behind")" = "$s_b" ] && [ "$(git -C "$SRV/ahead.git" rev-parse main)" = "$srv_a" ] && contains "$OUTPUT" "dry run" && echo 0 || echo 1 )"
 fi
 
+# --- several commands on one line ---------------------------------------------------
+if describe "line: several commands, one after another"; then
+    world
+    repo alpha
+    repo beta
+    diverge apart
+    server status
+    clone_to "$A" status
+    mkdir -p "$WORLD/here"
+    here="$WORLD/here"
+    git config --global gh-batch.root "$A"
+    commit "$B/alpha" news.txt "news" "News from the other machine"
+    publish "$B/alpha"
+    printf 'mine\n' >> "$A/alpha/readme.txt"
+    s_b=$(state_of "$A/beta")
+    asked_in "$here" '\nY\n' pull commit push alpha
+    check "line: pull, then commit with its question, then push with its own" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "gh-batch pull: 1 repository" && contains "$OUTPUT" "gh-batch commit: 1 repository" && contains "$OUTPUT" "Then, the push:" && [ "$(git -C "$A/alpha" log -2 --format=%s | tr '\n' '|')" = "A Regular Commit to Synchronise|News from the other machine|" ] && [ "$(git -C "$SRV/alpha.git" rev-parse main)" = "$(head_of "$A/alpha")" ] && [ "$(state_of "$A/beta")" = "$s_b" ] && echo 0 || echo 1 )"
+    gb_in "$here" pull push --yes alpha
+    check "line: a pull then a push is sync" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "gh-batch sync: 1 repository" && contains "$OUTPUT" "First, the pull:" && echo 0 || echo 1 )"
+    printf 'more\n' >> "$A/alpha/readme.txt"
+    s_a=$(state_of "$A/alpha")
+    asked_in "$here" '-\n' commit status alpha
+    check "line: a minus sign at the commit message ends the line there" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "Nothing was done." && ! contains "$OUTPUT" "gh-batch status:" && [ "$(state_of "$A/alpha")" = "$s_a" ] && echo 0 || echo 1 )"
+    gb_in "$here" fetch status apart alpha
+    check "line: a repository that needs the user does not stop the next command" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 1 ] && contains "$OUTPUT" "Needs you: apart (diverged)" && contains "$OUTPUT" "gh-batch status: 2 repositories" && echo 0 || echo 1 )"
+    commit "$B/beta" news.txt "news" "News for beta"
+    publish "$B/beta"
+    s_b=$(state_of "$A/beta")
+    gb_in "$here" pull status beta betta
+    check "line: a misspelt name stops the line before its first command" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 2 ] && ! contains "$OUTPUT" "gh-batch pull:" && [ "$(state_of "$A/beta")" = "$s_b" ] && echo 0 || echo 1 )"
+    all=0
+    for line in "pull pull beta" "sync push beta" "commit commit beta" "clone push -u beta" "pull status --manifest x beta" "clone log --since 2026-01-01"; do
+        # shellcheck disable=SC2086  # each case is a list of words
+        gb_in "$here" $line
+        if [ "$RC" -ne 2 ]; then
+            all=1
+            printf '     %s gave rc=%s: %s\n' "$line" "$RC" "$OUTPUT"
+        fi
+    done
+    check "line: a command given twice, and the options that mean two things, are refused" "see above" "$all"
+    check "line: nothing moved while they were refused" "beta moved" \
+        "$( [ "$(state_of "$A/beta")" = "$s_b" ] && echo 0 || echo 1 )"
+    gb_in "$here" status -- status
+    check "line: after -- a word is a name, even the name of a command" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "gh-batch status: 1 repository" && echo 0 || echo 1 )"
+    gb_in "$here" list status
+    check "line: list keeps its words as folders or names" "got: $OUTPUT" \
+        "$( [ "$OUTPUT" = "status" ] && echo 0 || echo 1 )"
+    gb_in "$here" pull exec git gc
+    check "line: exec after another command is refused, and the message says why" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 2 ] && contains "$OUTPUT" "the command exec runs alone" && echo 0 || echo 1 )"
+    gb_in "$here" commit push --dry-run alpha
+    check "line: commit push stays one command, with one report" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "commit 1 file, then a push" && [ "$(printf '%s\n' "$OUTPUT" | grep -c '^gh-batch commit:')" -eq 1 ] && echo 0 || echo 1 )"
+fi
+
+if describe "line: an interrupt ends the line"; then
+    world
+    repo hang
+    git -C "$A/hang" remote set-url origin "ssh://nowhere.invalid/hang.git"
+    export GIT_SSH_COMMAND="$ROOT/tests/stub/hanging-ssh"
+    start_bg fetch status "$A/hang"
+    sleep 1.5
+    kill -INT -- "-$BG_PID" 2>/dev/null
+    ended=1
+    wait_bg 10 && ended=0
+    unset GIT_SSH_COMMAND
+    check "line: SIGINT ends the line with status 130, and the next command never starts" "ended=$ended rc=$RC: $OUTPUT" \
+        "$( [ "$ended" -eq 0 ] && [ "$RC" -eq 130 ] && contains "$OUTPUT" "gh-batch fetch:" && ! contains "$OUTPUT" "gh-batch status:" && echo 0 || echo 1 )"
+    sleep 0.3
+    check "line: after the interrupt no child survives and the scratch folders are gone" "leftovers found" \
+        "$( ! pgrep -f "$ROOT/tests/stub/hanging-ssh" >/dev/null 2>&1 && ! contains " $(entries "${TMPDIR:-/tmp}")" " gh-batch." && echo 0 || echo 1 )"
+fi
+
 # --- reset ----------------------------------------------------------------------------
 if describe "reset: level, behind, and commits here that the server lacks"; then
     world
@@ -2428,6 +2607,26 @@ if describe "clone: an organisation that GitHub does not give"; then
         "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "warning: GitHub did not give the organisations of me" && [ "$(entries "$B")" = "mine " ] && echo 0 || echo 1 )"
 fi
 
+if describe "line: clone reads the whole account, the names go to the others"; then
+    world
+    account me
+    listed me alpha
+    listed me gamma
+    git clone -q "https://github.com/me/alpha" "$A/alpha"
+    git config --global gh-batch.root "$A"
+    printf 'mine\n' >> "$A/alpha/readme.txt"
+    gb_in "$WORLD" clone status --yes alpha
+    check "line: clone brings what is missing, then status looks at the name alone" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && [ -f "$A/gamma/readme.txt" ] && contains "$OUTPUT" "1 cloned" && contains "$OUTPUT" "gh-batch status: 1 repository" && contains "$OUTPUT" "alpha" && echo 0 || echo 1 )"
+    listed me delta
+    gb_in "$WORLD" clone status --yes alpah
+    check "line: a misspelt name stops the line before the clone" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 2 ] && [ ! -e "$A/delta" ] && echo 0 || echo 1 )"
+    asked_in "$WORLD" 'n\n' clone status alpha
+    check "line: a clone declined ends the line" "got rc=$RC: $OUTPUT" \
+        "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "Nothing was done." && ! contains "$OUTPUT" "gh-batch status:" && [ ! -e "$A/delta" ] && echo 0 || echo 1 )"
+fi
+
 # --- list --manifest and clone --manifest ----------------------------------------------
 if describe "manifest: the layout of one machine is rebuilt on another"; then
     world
@@ -2681,9 +2880,33 @@ if describe "completion: scripts for bash and zsh, help for every command"; then
     printf '%s\n' "$OUTPUT" > "$WORLD/completion.bash"
     check "completion bash: a script that bash accepts" "got rc=$RC" \
         "$( [ "$RC" -eq 0 ] && bash -n "$WORLD/completion.bash" && contains "$OUTPUT" "complete -o filenames -F _gh_batch gh-batch" && echo 0 || echo 1 )"
+    repo alpha
+    server gamma
+    mkdir -p "$A/group" "$WORLD/bin"
+    clone_to "$A" gamma "group/gamma"
+    ln -s "$GB" "$WORLD/bin/gh-batch"
+    git config --global gh-batch.root "$A"
+    offered() {
+        # offered WORD...: what the bash completion offers for the line
+        # "gh-batch WORD...", typed in an empty folder
+        (cd "$WORLD" && PATH="$WORLD/bin:$PATH" bash -c '. "$1"; shift; COMP_WORDS=(gh-batch "$@"); COMP_CWORD=$#; _gh_batch; printf "%s\n" "${COMPREPLY[@]}"' _ "$WORLD/completion.bash" "$@" 2>&1)
+    }
+    check "completion bash: after the commands, the names of the repositories" "got: $(offered pull commit push al)" \
+        "$( [ "$(offered pull commit push al)" = "alpha" ] && echo 0 || echo 1 )"
+    check "completion bash: a longer name is offered by its last part too" "got: $(offered status ga)" \
+        "$( [ "$(offered status ga)" = "gamma" ] && echo 0 || echo 1 )"
+    check "completion bash: the other commands of a line" "got: $(offered commit pu | tr '\n' ' ')" \
+        "$( [ "$(offered commit pu | sort | tr '\n' ' ')" = "pull push " ] && echo 0 || echo 1 )"
+    check "completion bash: the options of every command of the line" "got: $(offered pull commit --me)" \
+        "$( contains "$(offered pull commit --me)" "--message" && echo 0 || echo 1 )"
     gb completion zsh
     check "completion zsh: a compdef script" "got rc=$RC" \
         "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "#compdef gh-batch" && echo 0 || echo 1 )"
+    if command -v zsh >/dev/null 2>&1; then
+        printf '%s\n' "$OUTPUT" > "$WORLD/completion.zsh"
+        check "completion zsh: a script that zsh reads" "zsh -n refused it" \
+            "$( zsh -n "$WORLD/completion.zsh" && echo 0 || echo 1 )"
+    fi
     gb completion fish
     check "completion: another shell is a usage error" "got rc=$RC" "$( [ "$RC" -eq 2 ] && echo 0 || echo 1 )"
     all=0
