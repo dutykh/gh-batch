@@ -4,7 +4,7 @@
 
 The versions follow semantic versioning: a change that breaks a command line, a setting or the format of `--porcelain` raises the first number.
 
-## 1.7.0, 25 November 2026
+## 1.7.0, 26 November 2026
 
 The reports are laid out anew, for the eye. On a terminal the first line opens with the program and its command in a blue band, the titles of the parts of a report are blue, the branches magenta and the commands to type cyan after a faint label, and the details of a repository (its new commits, its files, the commands that compare or restore) hang under its name behind a faint vertical line. A long message is cut at a space to the width of the terminal and goes on under its column, instead of running back to the left edge; a command stays whole, so that it can be copied. The colours are still the sixteen of the terminal, chosen so that blue, magenta, cyan, green, yellow and red play their parts of Tokyo Night Moon, and the band, made of the blue of the theme and of its background, reads on a light theme as well.
 

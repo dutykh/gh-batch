@@ -11,7 +11,7 @@ authors:
 repository-code: "https://github.com/dutykh/gh-batch"
 license: LGPL-2.1-or-later
 version: 1.7.0
-date-released: "2026-11-25"
+date-released: "2026-11-26"
 keywords:
   - bash
   - git
