@@ -10,8 +10,8 @@ authors:
     orcid: "https://orcid.org/0000-0001-5247-2788"
 repository-code: "https://github.com/dutykh/gh-batch"
 license: LGPL-2.1-or-later
-version: 1.6.0
-date-released: "2026-11-24"
+version: 1.7.0
+date-released: "2026-11-25"
 keywords:
   - bash
   - git

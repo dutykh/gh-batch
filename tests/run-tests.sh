@@ -17,6 +17,7 @@ FILTER="${1:-}"
 PASS=0; FAIL=0; SKIP=0
 FAILED_NAMES=""
 TAB=$(printf '\t')
+nl=$(printf '\n_'); nl=${nl%_}
 
 SANDBOX=$(mktemp -d "${TMPDIR:-/tmp}/gh-batch-tests.XXXXXX")
 SANDBOX=$(cd "$SANDBOX" && pwd -P)
@@ -29,7 +30,7 @@ done
 for var in $(git rev-parse --local-env-vars 2>/dev/null); do
     unset "$var"
 done
-unset GIT_SSH_COMMAND GIT_SSH SSH_ASKPASS GIT_ASKPASS NO_COLOR 2>/dev/null || true
+unset GIT_SSH_COMMAND GIT_SSH SSH_ASKPASS GIT_ASKPASS NO_COLOR COLUMNS 2>/dev/null || true
 export HOME="$SANDBOX/home"
 export XDG_CONFIG_HOME="$SANDBOX/home/.config"
 export XDG_STATE_HOME="$SANDBOX/home/.local/state"
@@ -1575,7 +1576,7 @@ if describe "push: a gap seen at the last fetch, under the default setting"; the
     check "push: under report a repository that has diverged is named, nothing is pushed" "got rc=$RC: $OUTPUT" \
         "$( [ "$(st split)" = "diverged" ] && contains "$(msg split)" "left to you" && [ "$(git -C "$SRV/split.git" rev-parse main)" = "$server_split" ] && untouched split && [ "$RC" -eq 1 ] && echo 0 || echo 1 )"
     check "push: under report nothing is committed where the server has new commits" "got: $(st late) $(msg late)" \
-        "$( [ "$(st late)" = "behind" ] && contains "$(msg late)" "pull them first" && contains "$(msg late)" "1 new: not committed" && untouched late && echo 0 || echo 1 )"
+        "$( [ "$(st late)" = "behind" ] && contains "$(msg late)" "1 new commit on the server: pull it first" && contains "$(msg late)" "1 new: not committed" && untouched late && echo 0 || echo 1 )"
     gb sync --porcelain --yes --commit --only late "$A"
     check "push: sync takes the commits of the server, then commits and pushes" "got rc=$RC: $OUTPUT" \
         "$( [ "$RC" -eq 0 ] && [ -f "$A/late/theirs.txt" ] && [ -z "$(git -C "$A/late" status --porcelain)" ] && [ "$(git -C "$SRV/late.git" rev-parse main)" = "$(head_of "$A/late")" ] && echo 0 || echo 1 )"
@@ -2775,7 +2776,7 @@ if describe "doctor: what is wrong in the repositories"; then
     remember healthy midmerge stashed secret topic aged lonely
     gb doctor --offline "$A"
     check "doctor: problems are an unfinished merge and a password in an address" "got rc=$RC: $OUTPUT" \
-        "$( [ "$RC" -eq 1 ] && contains "$OUTPUT" "problem: a merge is in progress" && contains "$OUTPUT" "problem: the address of the remote origin holds a password" && contains "$OUTPUT" "Needs you: midmerge (problem), secret (problem)" && echo 0 || echo 1 )"
+        "$( [ "$RC" -eq 1 ] && contains "$OUTPUT" "problem: a merge is in progress" && contains "$OUTPUT" "problem: the address of the remote origin holds a password" && contains "$OUTPUT" "Needs you:${nl}  - midmerge (problem)${nl}  - secret (problem)" && echo 0 || echo 1 )"
     check "doctor: the password itself is never printed" "it was printed" \
         "$( ! contains "$OUTPUT" "hunter2secret" && echo 0 || echo 1 )"
     check "doctor: warnings for a stash, a branch that follows nothing, old pending work, no remote" "got: $OUTPUT" \
@@ -2834,19 +2835,25 @@ if describe "fetch, status and doctor: how far a fork stands from its original";
     printf '0\0370\n' > "$GH_STUB_DIR/compare/Other/level"
     gb fetch "$A"
     check "fetch: the section Forks names both gaps and the command that offers the commits" "got: $OUTPUT" \
-        "$( contains "$OUTPUT" "Forks:" && contains "$OUTPUT" "proj: the original Up/proj has 3 commits that this fork lacks, and this fork has 2 that the original lacks; to offer them: gh pr create --repo Up/proj --head owner:main" && ! contains "$OUTPUT" "level: " && echo 0 || echo 1 )"
+        "$( contains "$OUTPUT" "Forks:${nl}  - proj: the original Up/proj has 3 commits that this fork lacks, and this fork has 2 that the original lacks${nl}      to offer them: gh pr create --repo Up/proj --head owner:main" && ! contains "$OUTPUT" "level: " && echo 0 || echo 1 )"
     check "fetch: GitHub was asked once for the forks of the owner" "calls: $(cat "$GH_STUB_DIR/calls")" \
         "$( [ "$(grep -c 'repo list owner --fork' "$GH_STUB_DIR/calls")" = 1 ] && echo 0 || echo 1 )"
     : > "$GH_STUB_DIR/calls"
     gb status "$A"
     check "status: the forks as fetch last saw them, without asking GitHub" "got: $OUTPUT" \
-        "$( contains "$OUTPUT" "Forks, as fetch or doctor last saw them:" && contains "$OUTPUT" "proj: the original Up/proj has 3 commits that this fork lacks" && contains "$OUTPUT" "(seen on " && [ ! -s "$GH_STUB_DIR/calls" ] && echo 0 || echo 1 )"
+        "$( contains "$OUTPUT" "Forks, as fetch or doctor saw them today:${nl}  - proj: the original Up/proj has 3 commits that this fork lacks" && ! contains "$OUTPUT" "(seen " && [ ! -s "$GH_STUB_DIR/calls" ] && echo 0 || echo 1 )"
+    cp "$GH_BATCH_STATE_DIR/forks.tsv" "$WORLD/forks.saved"
+    printf '%s\tOther/level\towner:main\t0\t5\t2026-01-02\n' "$A/level" >> "$GH_BATCH_STATE_DIR/forks.tsv"
+    gb status "$A"
+    check "status: forks seen on different days, each with its day" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "Forks, as fetch or doctor last saw them:" && contains "$OUTPUT" "this fork lacks, and this fork has 2 that the original lacks (seen today)" && contains "$OUTPUT" "level: the original Other/level has 5 commits that this fork lacks (seen on 2 January 2026)" && echo 0 || echo 1 )"
+    cp "$WORLD/forks.saved" "$GH_BATCH_STATE_DIR/forks.tsv"
     printf 'owner/proj\037false\037Up/proj\037main\n' > "$GH_STUB_DIR/repos/owner/proj"
     printf 'owner/level\037false\n' > "$GH_STUB_DIR/repos/owner/level"
     printf '1\0370\n' > "$GH_STUB_DIR/compare/Up/proj"
     gb doctor "$A"
     check "doctor: the fork is compared with its original" "got: $OUTPUT" \
-        "$( contains "$OUTPUT" "Forks:" && contains "$OUTPUT" "proj: this fork has 1 commit that its original Up/proj lacks; to offer it: gh pr create --repo Up/proj --head owner:main" && echo 0 || echo 1 )"
+        "$( contains "$OUTPUT" "Forks:${nl}  - proj: this fork has 1 commit that its original Up/proj lacks${nl}      to offer it: gh pr create --repo Up/proj --head owner:main" && echo 0 || echo 1 )"
     gb fetch --offline "$A"
     check "fetch --offline: nothing is said of the forks" "got: $OUTPUT" \
         "$( ! contains "$OUTPUT" "Forks:" && echo 0 || echo 1 )"
@@ -3016,6 +3023,23 @@ if describe "output: quiet, verbose and colour"; then
     gb doctor --offline --only same "$A"
     check "output: the same for the health check" "got: $OUTPUT" \
         "$( contains "$OUTPUT" "1 healthy" && ! contains "$OUTPUT" "$nl$nl$nl" && echo 0 || echo 1 )"
+    gb status "$A"
+    check "output: status says when the last pull was made" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "status: 3 repositories under $A${nl}last pull today at " && echo 0 || echo 1 )"
+    gb fetch --verbose "$A"
+    check "output: several states are a list, and what needs the user stands apart" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "3 repositories:${nl}  - 1 up to date${nl}  - 1 behind${nl}  - 1 diverged${nl}${nl}Needs you: fight (diverged)." && echo 0 || echo 1 )"
+    OUTPUT=$(COLUMNS=60 "$GB" fetch --color always "$A" 2>&1); RC=$?
+    plain=$(printf '%s\n' "$OUTPUT" | sed "s/${esc}\[[0-9;]*m//g")
+    longest=$(printf '%s\n' "$plain" | grep -v 'repositories under' | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')
+    check "output: on a terminal a long message goes on under its column" "longest line $longest: $plain" \
+        "$( [ "$longest" -le 60 ] && contains "$plain" "x diverged" && echo 0 || echo 1 )"
+    check "output: the first line opens with the program and its command in a band" "got: $OUTPUT" \
+        "$( contains "$OUTPUT" "${esc}[1;7;34m gh-batch fetch ${esc}[0m 3 repositories under" && echo 0 || echo 1 )"
+    OUTPUT=$(COLUMNS=60 "$GB" fetch "$A" 2>&1); RC=$?
+    longest=$(printf '%s\n' "$OUTPUT" | awk '/fight/ { if (length($0) > m) m = length($0) } END { print m + 0 }')
+    check "output: a pipe gets whole lines, whatever COLUMNS says" "longest line of fight $longest: $OUTPUT" \
+        "$( [ "$longest" -gt 60 ] && echo 0 || echo 1 )"
     gb config
     check "config: the settings and their source" "got: $OUTPUT" \
         "$( [ "$RC" -eq 0 ] && contains "$OUTPUT" "diverged" && contains "$OUTPUT" "default" && echo 0 || echo 1 )"

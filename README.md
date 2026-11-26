@@ -35,9 +35,19 @@ gh-batch pull: 7 repositories under ~/workspace
   ahead         wave-solver         main     1 commit to push
   conflict      website             main     1 commit here and 1 on the server, and they conflict in notes.txt: nothing was changed, the rebase is yours (git pull --rebase)
 
-7 repositories: 2 updated, 1 rebased, 1 up to date, 1 with commits to push, 1 in conflict, 1 blocked.
+7 repositories:
+  • 2 updated
+  • 1 rebased
+  • 1 up to date
+  • 1 with commits to push
+  • 1 in conflict
+  • 1 blocked
+
 Kept aside: teaching/exam-2026 (CLAUDE.md).
-Needs you: paper-solitons (blocked), website (conflict).
+
+Needs you:
+  • paper-solitons (blocked)
+  • website (conflict)
 ```
 
 With the setting `gh-batch.conflicts` set to `server`, the two that need you would have been brought forward too: the version of the server taken in the lines of `notes.txt` that both sides changed, and the version of this machine kept beside it.
@@ -68,7 +78,12 @@ Done:
   pushed        thesis              main     committed 3 files, pushed 1 commit
   pushed        wave-solver         main     pushed 2 commits  [PUBLIC]
 
-7 repositories: 3 pushed, 2 with nothing to push, 1 without remote, 1 not committed.
+7 repositories:
+  • 3 pushed
+  • 2 with nothing to push
+  • 1 without remote
+  • 1 not committed
+
 Needs you: lecture-notes (not committed).
 ```
 
@@ -85,6 +100,7 @@ Plan:
         changed  notes.txt
         new      abstract.tex
         new      figures/energy.pdf
+
 To do: a commit in 2 repositories.
 Commit message [A Regular Commit to Synchronise], or - to do nothing:
 
@@ -92,7 +108,9 @@ Done:
   committed     teaching/exam-2026  main     committed 1 file: A Regular Commit to Synchronise
   committed     thesis              main     committed 3 files: A Regular Commit to Synchronise
 
-7 repositories: 2 committed, 5 clean.
+7 repositories:
+  • 2 committed
+  • 5 clean
 ```
 
 **For one project, or a few**, the repositories are named after the command, from whatever folder the terminal is in, and several commands can share the line, each with its own report and its own question. Here the thesis is brought up to date, its pending changes are committed under the message asked for, and the commit is pushed; no other repository is touched:
@@ -414,7 +432,9 @@ Proceed? [Y/n]
 Done:
   tidied        thesis        main     removed 2 backups and 1 folder of kept files
 
-7 repositories: 1 tidied, 6 clean.
+7 repositories:
+  • 1 tidied
+  • 6 clean
 ```
 
 ### clone
@@ -473,6 +493,7 @@ The command `status` uses no network. It shows what is pending and since when: f
 ```text
 $ gh-batch status
 gh-batch status: 7 repositories under ~/workspace
+last pull today at 08:15, last push yesterday at 18:40
 
   pending       lecture-notes       main     1 changed, 1 new (the oldest since 0 min)
   local only    scratch             main     no remote: it exists on this machine only
@@ -480,7 +501,11 @@ gh-batch status: 7 repositories under ~/workspace
   pending       thesis              main     1 changed, 2 new (the oldest since 0 min)
   ahead         wave-solver         main     2 commits to push (the oldest since 0 min)
 
-7 repositories: 2 clean, 3 with pending changes, 1 with commits to push, 1 without remote.
+7 repositories:
+  • 2 clean
+  • 3 with pending changes
+  • 1 with commits to push
+  • 1 without remote
 ```
 
 The command `fetch` asks the servers and says what `pull` would do, without touching a branch or a file: how many commits wait, which files would be set aside, which branches would move, which repositories have diverged.
@@ -489,8 +514,9 @@ A fork is compared with the repository it was forked from. When `gh` is installe
 
 ```text
 Forks:
-  lanyon: the original poole/lanyon has 70 commits that this fork lacks
-  NEOLAB: this fork has 2 commits that its original FlorianGallois/NEOLAB lacks; to offer them: gh pr create --repo FlorianGallois/NEOLAB --head dutykh:main
+  • lanyon: the original poole/lanyon has 70 commits that this fork lacks
+  • NEOLAB: this fork has 2 commits that its original FlorianGallois/NEOLAB lacks
+      to offer them: gh pr create --repo FlorianGallois/NEOLAB --head dutykh:main
 ```
 
 ### log
@@ -499,6 +525,8 @@ The command `log` answers the question of the evening, or of the weekly report: 
 
 ```text
 $ gh-batch log
+gh-batch log: 7 repositories under ~/workspace
+
   commits       scratch             main     1 commit
         13:42  d27d145  First try
   commits       teaching/exam-2026  main     2 commits
@@ -510,7 +538,7 @@ $ gh-batch log
         13:42  386a3db  Add the time stepper
         13:42  4ff7be0  Test the time stepper
 
-6 commits in 4 repositories today (7 searched under ~/workspace).
+6 commits in 4 repositories today.
 ```
 
 The period is set with `--since` and `--until`, in any form git reads (`yesterday`, `monday`, `"2 weeks ago"`, `2026-11-01`). "Yours" means the address that git uses in each repository (`user.email`); `--author TEXT` selects another author and `--all-authors` everybody. A long first line is cut at 100 characters and a repository shows at most 50 commits, unless `--long` is given. With `--porcelain` each commit is one line: the time in seconds, the path, the short hash, the author and the subject.
@@ -602,7 +630,7 @@ The command line wins over the environment, which wins over the configuration. T
 
 ## Reading the report
 
-A report has one line per repository that changed or needs you, in the order of the folders, then one summary line, then the line "Kept aside" with what made way for the version of the server, then the list of those that need you. The repositories where nothing happened are only counted; `--verbose` shows them, and `--quiet` shows nothing but what needs you.
+A report opens with a line that names the command and the folders searched, and under it `status` says when the last pull and the last push were made. Then comes one line per repository that changed or needs you, in the order of the folders, with its details under it (the new commits, the files, the commands that compare or restore), and the count at the end: one line when every repository is in the same state, a list with one line per state otherwise. After the count come what made way for the version of the server ("Kept aside") and the repositories that need you, on one line for one repository and as a list for more. The repositories where nothing happened are only counted; `--verbose` shows them, and `--quiet` shows nothing but what needs you.
 
 | Word | Meaning |
 |---|---|
@@ -621,7 +649,7 @@ A report has one line per repository that changed or needs you, in the order of 
 | `unfinished`, `busy` | An operation is in progress; another git process holds the index. |
 | `skipped`, `unreadable` | Set aside by a setting; git cannot read the folder. |
 
-On a terminal every line carries a sign and a colour: a green tick for what was done, a faint dot for nothing to do, yellow arrows and dots for what waits (commits to push, commits to pull, pending changes), a red cross for what needs you; the names are in bold, the branches in cyan, the commits in the yellow of git, and a run of some length says how long it took. The colours are the sixteen of the terminal, so they follow its theme. A report written to a pipe or handed to a command stays plain, `--color never` and the variable `NO_COLOR` turn the colours off, and a terminal that is not UTF-8 gets letters in place of the signs.
+On a terminal the report is drawn for the eye. Its first line opens with the program and its command in a blue band, and the titles of its parts (the plan, the forks, the count) are blue. Every repository carries a sign and a colour: a green tick for what was done, a faint dot for nothing to do, yellow arrows and dots for what waits (commits to push, commits to pull, pending changes), a red cross for what needs you. The names are in bold, the branches in magenta, the commits in the yellow of git, the commands to type in cyan after a faint label, and the details of a repository hang under its name behind a faint vertical line. A long message is cut at a space and goes on under its column instead of running back to the left edge, while a command stays whole, so that it can be copied, and a run of some length says how long it took. The colours are the sixteen of the terminal, so they follow its theme: the report was drawn for Tokyo Night Moon, whose blue, magenta, cyan, green, yellow and red play these parts, and the band, made of the blue of the theme and of its background, reads on a light theme as well. A report written to a pipe or handed to a command keeps whole lines, without signs or colours, its lists marked with bullets; `--color never` and the variable `NO_COLOR` turn the colours off, and a terminal that is not UTF-8 gets letters in place of the signs and a dash in place of the bullet.
 
 The exit status is 0 when nothing needs you, 1 when at least one repository needs you, 2 for a bad invocation, 3 when git or `gh` is missing or another `gh-batch` is at work, and 130 when the run was stopped by a signal. With `--porcelain` each repository is one line of four fields separated by tabs: the state, the path, the branch and the message.
 
